@@ -1,12 +1,12 @@
-
 """
 app/routes/tickets.py
 
-GET /tickets/                       → paginated list  (TicketBriefResponse)
-GET /tickets/source/{source_system} → filtered by CRM (TicketBriefResponse)
-GET /tickets/{id}                   → full detail      (TicketDetailResponse)
+GET /tickets/         → paginated list   (TicketBriefResponse)
+GET /tickets/filter   → filtered list    (TicketBriefResponse)
+GET /tickets/{id}     → full detail      (TicketDetailResponse)
 
-Filters available on list endpoints:
+Filter query params on /filter:
+  ?source=zammad|espocrm
   ?status=open|pending|closed
   ?priority=low|normal|high|urgent
   ?include_deleted=true
@@ -17,7 +17,8 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import status as http_status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,8 +43,8 @@ router = APIRouter(prefix="/tickets", tags=["Tickets"])
 def _to_brief(ticket) -> dict:
     return TicketBriefResponse(
         id=ticket.id,
-        source_system=ticket.source_system.system_name,
         title=ticket.title,
+        source_system=ticket.source_system.system_name,
         status=ticket.status.status_name,
         priority=ticket.priority.priority_name if ticket.priority else None,
         agent_id=ticket.agent_id,
@@ -118,38 +119,91 @@ async def list_tickets(
 
 
 # ---------------------------------------------------------------------------
-# GET /tickets/source/{source_system_name}
+# GET /tickets/filter
 # IMPORTANT: must be defined BEFORE /{ticket_id} so FastAPI does not
-# try to parse the literal string "source" as a UUID
+# try to parse the literal string "filter" as a UUID
 # ---------------------------------------------------------------------------
 
-@router.get("/filters", summary="List tickets by filters")
-async def list_tickets_by_source(
-    source_system_name: str,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    include_deleted: bool = Query(default=False),
+@router.get("/filter", summary="Filter tickets by source, status, or priority")
+async def filter_tickets(
+    page: int = Query(default=1, ge=1, description="Page number starting from 1"),
+    page_size: int = Query(default=20, ge=1, le=100, description="Items per page (max 100)"),
+    include_deleted: bool = Query(default=False, description="Include soft-deleted tickets"),
+    source: str | None = Query(default=None, description="CRM source: zammad, espocrm"),
+    status: str | None = Query(default=None, description="Ticket status: open, pending, closed"),
+    priority: str | None = Query(default=None, description="Ticket priority: low, normal, high, urgent"),
+    db: AsyncSession = Depends(get_db),
+):
+    offset = (page - 1) * page_size
+
+    # If source filter provided, resolve it to a source_system_id
+    if source:
+        result = await db.execute(
+            select(SourceSystem).where(SourceSystem.system_name == source.lower())
+        )
+        source_obj = result.scalars().first()
+        if not source_obj:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail=f"Source system '{source}' not found. Valid values: zammad, espocrm",
+            )
+        tickets, total = await TicketRepository(db).get_by_source_system(
+            source_system_id=source_obj.id,
+            include_deleted=include_deleted,
+            status=status,
+            priority=priority,
+            offset=offset,
+            limit=page_size,
+        )
+    else:
+        tickets, total = await TicketRepository(db).get_all(
+            include_deleted=include_deleted,
+            status=status,
+            priority=priority,
+            offset=offset,
+            limit=page_size,
+        )
+
+    logger.debug("filter_tickets: source=%s status=%s priority=%s returned %d of %d",
+                 source, status, priority, len(tickets), total)
+    return paginated(
+        items=[_to_brief(t) for t in tickets],
+        total=total,
+        page=page,
+        page_size=page_size,
+        message="Tickets fetched successfully",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /tickets/by-agent/{agent_id}
+# IMPORTANT: must be defined BEFORE /{ticket_id}
+# ---------------------------------------------------------------------------
+
+@router.get("/by-agent/{agent_id}", summary="List tickets assigned to a specific agent")
+async def list_tickets_by_agent(
+    agent_id: uuid.UUID,
+    page: int = Query(default=1, ge=1, description="Page number starting from 1"),
+    page_size: int = Query(default=20, ge=1, le=100, description="Items per page (max 100)"),
+    include_deleted: bool = Query(default=False, description="Include soft-deleted tickets"),
     status: str | None = Query(default=None, description="Filter by status: open, pending, closed"),
     priority: str | None = Query(default=None, description="Filter by priority: low, normal, high, urgent"),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(SourceSystem).where(
-            SourceSystem.system_name == source_system_name.lower()
-        )
-    )
-    source = result.scalars().first()
+    from app.models.agent import Agent
 
-    if not source:
-        logger.warning("list_tickets_by_source: unknown source '%s'", source_system_name)
+    # Verify agent exists
+    agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
+    agent = agent_result.scalars().first()
+    if not agent:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Source system '{source_system_name}' not found. Valid values: zammad, espocrm",
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Agent {agent_id} not found",
         )
 
     offset = (page - 1) * page_size
-    tickets, total = await TicketRepository(db).get_by_source_system(
-        source_system_id=source.id,
+    tickets, total = await TicketRepository(db).get_by_agent(
+        agent_id=agent_id,
         include_deleted=include_deleted,
         status=status,
         priority=priority,
@@ -157,15 +211,15 @@ async def list_tickets_by_source(
         limit=page_size,
     )
     logger.debug(
-        "list_tickets_by_source: source=%s returned %d of %d",
-        source_system_name, len(tickets), total,
+        "list_tickets_by_agent: agent=%s status=%s priority=%s returned %d of %d",
+        agent_id, status, priority, len(tickets), total,
     )
     return paginated(
         items=[_to_brief(t) for t in tickets],
         total=total,
         page=page,
         page_size=page_size,
-        message=f"Tickets for '{source_system_name}' fetched successfully",
+        message=f"Tickets for agent '{agent.name}' fetched successfully",
     )
 
 
@@ -183,7 +237,7 @@ async def get_ticket(
     if not ticket:
         logger.warning("get_ticket: ticket %s not found", ticket_id)
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Ticket {ticket_id} not found",
         )
 
