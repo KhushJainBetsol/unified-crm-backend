@@ -1,0 +1,39 @@
+# app/integrations/normalizer/config/espo_mappings.toml
+#
+# EspoCRM → UnifiedCRM field value mappings
+#
+# Rules:
+#   - Keys are EspoCRM raw values (lowercase)
+#   - Values are your internal standard values
+#   - Unknown keys fall back to the [fallbacks] section
+#   - Add new mappings here without touching any Python code
+
+# ---------------------------------------------------------------------------
+# Status
+# EspoCRM Case status values (stored Title Case, matched lowercase)
+# ---------------------------------------------------------------------------
+[status]
+"new"        = "open"
+"assigned"   = "open"
+"in process" = "pending"
+"pending"    = "pending"
+"closed"     = "closed"
+"rejected"   = "closed"
+"duplicate"  = "closed"
+
+# ---------------------------------------------------------------------------
+# Priority
+# EspoCRM uses plain strings (stored Title Case, matched lowercase)
+# ---------------------------------------------------------------------------
+[priority]
+"low"    = "low"
+"normal" = "normal"
+"high"   = "high"
+"urgent" = "urgent"
+
+# ---------------------------------------------------------------------------
+# Fallback values when a raw value is not found in the maps above
+# ---------------------------------------------------------------------------
+[fallbacks]
+status   = "open"
+priority = ""       # empty string = NULL in DB

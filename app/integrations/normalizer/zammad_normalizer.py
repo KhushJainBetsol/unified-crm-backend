@@ -3,10 +3,11 @@ app/integrations/normalizer/zammad_normalizer.py
 
 Converts raw Zammad API ticket payload → NormalizedTicket.
 
-Zammad priority quirk:
-  The ticket list endpoint returns `priority_id` (int) not `priority`.
-  The single ticket endpoint may return `priority` as string or int.
-  Both are handled below.
+All status and priority mappings live in:
+  config/zammad_mappings.toml
+
+To add a new Zammad state or priority — edit the TOML file only.
+No Python changes needed.
 """
 
 from __future__ import annotations
@@ -14,41 +15,11 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from app.integrations.normalizer.config.loader import get_zammad_mappings
 from app.integrations.normalizer.schema import NormalizedTicket
 
 logger = logging.getLogger(__name__)
 
-ZAMMAD_STATUS_MAP: dict[str, str] = {
-    "new": "open",
-    "open": "open",
-    "pending reminder": "pending",
-    "pending close": "pending",
-    "closed": "closed",
-    "merged": "closed",
-    "removed": "closed",
-}
-
-# Integer ID → standard priority (used when field is priority_id or int)
-ZAMMAD_PRIORITY_ID_MAP: dict[int, str] = {
-    1: "low",
-    2: "normal",
-    3: "high",
-    4: "urgent",
-}
-
-# String → standard priority (used when field is a string)
-ZAMMAD_PRIORITY_NAME_MAP: dict[str, str] = {
-    "1 low": "low",
-    "2 normal": "normal",
-    "3 high": "high",
-    "4 urgent": "urgent",
-    "low": "low",
-    "normal": "normal",
-    "high": "high",
-    "urgent": "urgent",
-}
-
-DEFAULT_STATUS = "open"
 DEFAULT_TITLE = "No Title"
 
 
@@ -66,54 +37,64 @@ def _resolve_priority(raw: dict) -> str | None:
     """
     Resolve priority from Zammad ticket dict.
 
-    Zammad list endpoint returns:  priority_id = 2  (integer)
+    Zammad list endpoint returns:   priority_id = 2  (integer)
     Zammad single endpoint returns: priority = "2 normal" or priority = 2
 
-    We check both keys so either endpoint works correctly.
+    Checks priority_id first, then falls back to priority string.
+    All mappings loaded from zammad_mappings.toml.
     """
-    # --- try priority_id first (list endpoint returns this) ---
+    cfg = get_zammad_mappings()
+
+    # Format 1 — integer ID from list endpoint (priority_id field)
     priority_id = raw.get("priority_id")
     if priority_id is not None:
         try:
-            result = ZAMMAD_PRIORITY_ID_MAP.get(int(priority_id))
+            result = cfg.priority_id.get(int(priority_id))
             if result:
                 return result
         except (ValueError, TypeError):
             pass
 
-    # --- try priority field (single ticket endpoint) ---
+    # Format 2 & 3 — string from single ticket endpoint (priority field)
     priority = raw.get("priority")
     if priority is None:
-        return None
+        return cfg.fallback_priority
 
     if isinstance(priority, int):
-        return ZAMMAD_PRIORITY_ID_MAP.get(priority)
+        return cfg.priority_id.get(priority, cfg.fallback_priority)
 
     if isinstance(priority, str):
-        result = ZAMMAD_PRIORITY_NAME_MAP.get(priority.lower().strip())
+        result = cfg.priority_name.get(priority.lower().strip())
         if result:
             return result
         # last attempt — extract numeric prefix e.g. "2 normal" → 2
         parts = priority.strip().split()
         if parts and parts[0].isdigit():
-            return ZAMMAD_PRIORITY_ID_MAP.get(int(parts[0]))
+            result = cfg.priority_id.get(int(parts[0]))
+            if result:
+                return result
 
-    logger.warning("Could not resolve Zammad priority from raw: %r", raw.get("priority_id") or raw.get("priority"))
-    return None
+    logger.warning(
+        "Could not resolve Zammad priority from raw value: priority_id=%r priority=%r",
+        raw.get("priority_id"), raw.get("priority"),
+    )
+    return cfg.fallback_priority
 
 
 def normalize_zammad_ticket(raw: dict) -> NormalizedTicket:
-    crm_ticket_id = str(raw["id"])
-    created_at = datetime.fromisoformat(raw["created_at"])
-    updated_at = datetime.fromisoformat(raw["updated_at"])
+    cfg = get_zammad_mappings()
 
-    # ---- status ----
+    crm_ticket_id = str(raw["id"])
+    created_at    = datetime.fromisoformat(raw["created_at"])
+    updated_at    = datetime.fromisoformat(raw["updated_at"])
+
+    # status — read from config
     raw_state = str(raw.get("state", "")).lower().strip()
-    status = ZAMMAD_STATUS_MAP.get(raw_state, DEFAULT_STATUS)
-    if raw_state and raw_state not in ZAMMAD_STATUS_MAP:
+    status = cfg.status.get(raw_state, cfg.fallback_status)
+    if raw_state and raw_state not in cfg.status:
         logger.warning(
-            "Unknown Zammad state %r for ticket %s — defaulting to %r",
-            raw_state, crm_ticket_id, DEFAULT_STATUS,
+            "Unknown Zammad state %r for ticket %s — using fallback %r",
+            raw_state, crm_ticket_id, cfg.fallback_status,
         )
 
     return NormalizedTicket(
@@ -138,5 +119,8 @@ def normalize_zammad_tickets(raw_list: list[dict]) -> list[NormalizedTicket]:
         try:
             results.append(normalize_zammad_ticket(raw))
         except (KeyError, ValueError) as exc:
-            logger.error("Failed to normalize Zammad ticket id=%r: %s", raw.get("id"), exc)
+            logger.error(
+                "Failed to normalize Zammad ticket id=%r: %s",
+                raw.get("id"), exc,
+            )
     return results

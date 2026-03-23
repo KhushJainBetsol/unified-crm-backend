@@ -1,0 +1,52 @@
+# app/integrations/normalizer/config/zammad_mappings.toml
+#
+# Zammad → UnifiedCRM field value mappings
+#
+# Rules:
+#   - Keys are Zammad raw values (lowercase)
+#   - Values are your internal standard values
+#   - Unknown keys fall back to the [fallbacks] section
+#   - Add new mappings here without touching any Python code
+
+# ---------------------------------------------------------------------------
+# Status
+# Zammad calls this "state"
+# ---------------------------------------------------------------------------
+[status]
+"new"              = "open"
+"open"             = "open"
+"pending reminder" = "pending"
+"pending close"    = "pending"
+"closed"           = "closed"
+"merged"           = "closed"
+"removed"          = "closed"
+
+# ---------------------------------------------------------------------------
+# Priority — string format ("1 low", "2 normal" etc.)
+# ---------------------------------------------------------------------------
+[priority_name]
+"1 low"    = "low"
+"2 normal" = "normal"
+"3 high"   = "high"
+"4 urgent" = "urgent"
+"low"      = "low"
+"normal"   = "normal"
+"high"     = "high"
+"urgent"   = "urgent"
+
+# ---------------------------------------------------------------------------
+# Priority — integer ID format (returned by list endpoint)
+# Keys must be strings in TOML — cast to int in code
+# ---------------------------------------------------------------------------
+[priority_id]
+"1" = "low"
+"2" = "normal"
+"3" = "high"
+"4" = "urgent"
+
+# ---------------------------------------------------------------------------
+# Fallback values when a raw value is not found in the maps above
+# ---------------------------------------------------------------------------
+[fallbacks]
+status   = "open"
+priority = ""       # empty string = NULL in DB

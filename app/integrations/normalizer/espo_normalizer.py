@@ -3,19 +3,11 @@ app/integrations/normalizer/espo_normalizer.py
 
 Converts raw EspoCRM API Case payload → NormalizedTicket.
 
-EspoCRM quirks handled:
-  - "name"             → title       (EspoCRM calls it "name" not "title")
-  - "modifiedAt"       → updated_at  (not "updated_at")
-  - "assignedUserId"   → crm_agent_id
-  - "contactId"        → crm_customer_id
-  - "accountId"        → crm_company_id
-  - "id" is a string UUID in EspoCRM
-  - status values are Title Case ("New", "In Process") — normalised here
-  - no dedicated close timestamp — derived from status
+All status and priority mappings live in:
+  config/espo_mappings.toml
 
-EspoCRM API reference:
-  GET /api/v1/Case/:id
-  GET /api/v1/Case  (with pagination via offset/maxSize)
+To add a new EspoCRM status or priority — edit the TOML file only.
+No Python changes needed.
 """
 
 from __future__ import annotations
@@ -23,44 +15,15 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from app.integrations.normalizer.config.loader import get_espo_mappings
 from app.integrations.normalizer.schema import NormalizedTicket
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Status mapping
-# EspoCRM case status → your standard status value
-# ---------------------------------------------------------------------------
-ESPO_STATUS_MAP: dict[str, str] = {
-    "new": "open",
-    "assigned": "open",
-    "in process": "pending",
-    "pending": "pending",
-    "closed": "closed",
-    "rejected": "closed",
-    "duplicate": "closed",
-}
-
-# ---------------------------------------------------------------------------
-# Priority mapping
-# EspoCRM uses Title Case — normalise to lowercase first before lookup
-# ---------------------------------------------------------------------------
-ESPO_PRIORITY_MAP: dict[str, str] = {
-    "low": "low",
-    "normal": "normal",
-    "high": "high",
-    "urgent": "urgent",
-}
-
-DEFAULT_STATUS = "open"
 DEFAULT_TITLE = "No Title"
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
-    """
-    Safely parse an ISO 8601 datetime string.
-    Returns None instead of raising if value is missing or malformed.
-    """
     if not value:
         return None
     try:
@@ -72,50 +35,35 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 def _derive_closed_at(status: str, modified_at: datetime) -> datetime | None:
     """
-    EspoCRM Cases don't have a dedicated close timestamp.
-    If the status is 'closed' we use the last modified timestamp as a proxy.
+    EspoCRM Cases have no dedicated close timestamp.
+    Use modifiedAt as a proxy when status is closed.
     """
     return modified_at if status == "closed" else None
 
 
 def normalize_espo_ticket(raw: dict) -> NormalizedTicket:
-    """
-    Convert a single raw EspoCRM Case dict into a NormalizedTicket.
+    cfg = get_espo_mappings()
 
-    Args:
-        raw: Raw case dict from the EspoCRM REST API.
-
-    Returns:
-        NormalizedTicket with all fields normalised to your standard format.
-
-    Raises:
-        KeyError:  if required fields (id, createdAt, modifiedAt) are missing.
-        ValueError: if datetime parsing fails for required timestamp fields.
-    """
-    # ---- required fields ----
     crm_ticket_id = str(raw["id"])
-    created_at = datetime.fromisoformat(raw["createdAt"])
-    updated_at = datetime.fromisoformat(raw["modifiedAt"])
+    created_at    = datetime.fromisoformat(raw["createdAt"])
+    updated_at    = datetime.fromisoformat(raw["modifiedAt"])
 
-    # ---- status ----
+    # status — read from config
     raw_status = str(raw.get("status", "")).lower().strip()
-    status = ESPO_STATUS_MAP.get(raw_status, DEFAULT_STATUS)
-    if raw_status and raw_status not in ESPO_STATUS_MAP:
+    status = cfg.status.get(raw_status, cfg.fallback_status)
+    if raw_status and raw_status not in cfg.status:
         logger.warning(
-            "Unknown EspoCRM status %r for case %s — defaulting to %r",
-            raw_status,
-            crm_ticket_id,
-            DEFAULT_STATUS,
+            "Unknown EspoCRM status %r for case %s — using fallback %r",
+            raw_status, crm_ticket_id, cfg.fallback_status,
         )
 
-    # ---- priority ----
+    # priority — read from config
     raw_priority = str(raw.get("priority", "")).lower().strip()
-    priority = ESPO_PRIORITY_MAP.get(raw_priority)
-    if raw_priority and priority is None:
+    priority = cfg.priority.get(raw_priority, cfg.fallback_priority) or None
+    if raw_priority and raw_priority not in cfg.priority:
         logger.warning(
-            "Unknown EspoCRM priority %r for case %s — setting to None",
-            raw_priority,
-            crm_ticket_id,
+            "Unknown EspoCRM priority %r for case %s — using fallback",
+            raw_priority, crm_ticket_id,
         )
 
     return NormalizedTicket(
@@ -135,10 +83,6 @@ def normalize_espo_ticket(raw: dict) -> NormalizedTicket:
 
 
 def normalize_espo_tickets(raw_list: list[dict]) -> list[NormalizedTicket]:
-    """
-    Normalise a list of raw EspoCRM case dicts.
-    Skips any case that fails normalisation and logs the error.
-    """
     results: list[NormalizedTicket] = []
     for raw in raw_list:
         try:
@@ -146,7 +90,6 @@ def normalize_espo_tickets(raw_list: list[dict]) -> list[NormalizedTicket]:
         except (KeyError, ValueError) as exc:
             logger.error(
                 "Failed to normalize EspoCRM case id=%r: %s",
-                raw.get("id"),
-                exc,
+                raw.get("id"), exc,
             )
     return results
