@@ -68,7 +68,7 @@ def _crm_error_to_http(exc: Exception) -> HTTPException:
 # ZAMMAD
 # ===========================================================================
 
-@router.post("/zammad/entities", summary="Sync Zammad agents, customers, companies")
+@router.post("/zammad/sync-entities", summary="Sync Zammad agents, customers, companies")
 async def sync_zammad_entities(db: AsyncSession = Depends(get_db)):
     """Step 1 — run BEFORE ticket sync. Populates agents, customers, companies."""
     source_system_id = await _get_source_system_id("zammad", db)
@@ -97,7 +97,7 @@ async def sync_zammad_entities(db: AsyncSession = Depends(get_db)):
     })
 
 
-@router.post("/zammad", summary="Sync Zammad tickets")
+@router.post("/zammad/sync-tickets", summary="Sync Zammad tickets")
 async def sync_zammad_tickets(db: AsyncSession = Depends(get_db)):
     """Step 2 — run AFTER /sync/zammad/entities."""
     try:
@@ -127,7 +127,7 @@ async def sync_zammad_tickets(db: AsyncSession = Depends(get_db)):
     })
 
 
-@router.post("/zammad/full", summary="Full Zammad sync — entities then tickets")
+@router.post("/zammad/full-sync", summary="Full Zammad sync — entities then tickets")
 async def sync_zammad_full(db: AsyncSession = Depends(get_db)):
     """Runs entity sync then ticket sync in one call."""
     source_system_id = await _get_source_system_id("zammad", db)
@@ -168,7 +168,7 @@ async def sync_zammad_full(db: AsyncSession = Depends(get_db)):
 # ESPOCRM
 # ===========================================================================
 
-@router.post("/espocrm/entities", summary="Sync EspoCRM agents, customers, companies")
+@router.post("/espocrm/sync-entities", summary="Sync EspoCRM agents, customers, companies")
 async def sync_espocrm_entities(db: AsyncSession = Depends(get_db)):
     """Step 1 — run BEFORE ticket sync."""
     source_system_id = await _get_source_system_id("espocrm", db)
@@ -197,7 +197,7 @@ async def sync_espocrm_entities(db: AsyncSession = Depends(get_db)):
     })
 
 
-@router.post("/espocrm", summary="Sync EspoCRM tickets")
+@router.post("/espocrm/sync-tickets", summary="Sync EspoCRM tickets")
 async def sync_espocrm_tickets(db: AsyncSession = Depends(get_db)):
     """Step 2 — run AFTER /sync/espocrm/entities."""
     try:
@@ -227,7 +227,7 @@ async def sync_espocrm_tickets(db: AsyncSession = Depends(get_db)):
     })
 
 
-@router.post("/espocrm/full", summary="Full EspoCRM sync — entities then tickets")
+@router.post("/espocrm/full-sync", summary="Full EspoCRM sync — entities then tickets")
 async def sync_espocrm_full(db: AsyncSession = Depends(get_db)):
     """Runs entity sync then ticket sync in one call."""
     source_system_id = await _get_source_system_id("espocrm", db)
