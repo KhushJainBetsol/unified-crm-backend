@@ -155,6 +155,7 @@ class TicketDetailResponse(BaseModel):
 # ---------------------------------------------------------------------------
 class TicketBriefResponse(BaseModel):
     id: UUID
+    source_system: str
     title: str
     status: str                  # e.g. "open"
     priority: str | None         # e.g. "high"
