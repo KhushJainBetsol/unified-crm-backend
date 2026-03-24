@@ -175,59 +175,6 @@ async def filter_tickets(
     )
 
 
-# ---------------------------------------------------------------------------
-# GET /tickets/by-agent/{agent_id}
-# IMPORTANT: must be defined BEFORE /{ticket_id}
-# ---------------------------------------------------------------------------
-
-@router.get("/by-agent/{agent_id}", summary="List tickets assigned to a specific agent")
-async def list_tickets_by_agent(
-    agent_id: uuid.UUID,
-    page: int = Query(default=1, ge=1, description="Page number starting from 1"),
-    page_size: int = Query(default=20, ge=1, le=100, description="Items per page (max 100)"),
-    include_deleted: bool = Query(default=False, description="Include soft-deleted tickets"),
-    status: str | None = Query(default=None, description="Filter by status: open, pending, closed"),
-    priority: str | None = Query(default=None, description="Filter by priority: low, normal, high, urgent"),
-    db: AsyncSession = Depends(get_db),
-):
-    from app.models.agent import Agent
-
-    # Verify agent exists
-    agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
-    agent = agent_result.scalars().first()
-    if not agent:
-        raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND,
-            detail=f"Agent {agent_id} not found",
-        )
-
-    offset = (page - 1) * page_size
-    tickets, total = await TicketRepository(db).get_by_agent(
-        agent_id=agent_id,
-        include_deleted=include_deleted,
-        status=status,
-        priority=priority,
-        offset=offset,
-        limit=page_size,
-    )
-    logger.debug(
-        "list_tickets_by_agent: agent=%s status=%s priority=%s returned %d of %d",
-        agent_id, status, priority, len(tickets), total,
-    )
-    return paginated(
-        items=[_to_brief(t) for t in tickets],
-        total=total,
-        page=page,
-        page_size=page_size,
-        message=f"Tickets for agent '{agent.name}' fetched successfully",
-    )
-
-
-# ---------------------------------------------------------------------------
-# GET /tickets/{ticket_id}
-# ---------------------------------------------------------------------------
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +232,111 @@ async def get_ticket_stats(db: AsyncSession = Depends(get_db)):
         "by_priority": by_priority,
     })
     
+@router.get("/stats/agent/{agent_id}", summary="Get ticket stats for a specific agent")
+async def get_agent_ticket_stats(
+    agent_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    from sqlalchemy import func, case
+    from app.models.ticket import Ticket
+    from app.models.ticket_status import TicketStatus
+    from app.models.ticket_priority import TicketPriority
+    from app.models.agent import Agent
+
+    # Verify agent exists
+    agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
+    agent = agent_result.scalars().first()
+    if not agent:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Agent {agent_id} not found",
+        )
+
+    base = select(func.count(Ticket.id)).where(
+        Ticket.agent_id == agent_id,
+        Ticket.is_deleted == False,  # noqa: E712
+    )
+
+    total_result = await db.execute(base)
+    total = total_result.scalar_one()
+
+    # count per status
+    status_result = await db.execute(
+        select(TicketStatus.status_name, func.count(Ticket.id).label("count"))
+        .join(Ticket, Ticket.status_id == TicketStatus.id)
+        .where(Ticket.agent_id == agent_id, Ticket.is_deleted == False)  # noqa: E712
+        .group_by(TicketStatus.status_name)
+    )
+    by_status = {r.status_name: r.count for r in status_result}
+
+    # count per priority
+    priority_result = await db.execute(
+        select(TicketPriority.priority_name, func.count(Ticket.id).label("count"))
+        .join(Ticket, Ticket.priority_id == TicketPriority.id)
+        .where(Ticket.agent_id == agent_id, Ticket.is_deleted == False)  # noqa: E712
+        .group_by(TicketPriority.priority_name)
+    )
+    by_priority = {r.priority_name: r.count for r in priority_result}
+
+    return success("Agent stats fetched successfully", {
+        "total":         total,
+        "open":          by_status.get("open",    0),
+        "closed":        by_status.get("closed",  0),
+        "pending":       by_status.get("pending", 0),
+        "high_priority": (by_priority.get("high", 0) + by_priority.get("urgent", 0)),
+        "by_status":     by_status,
+        "by_priority":   by_priority,
+    })
+    
+ # ---------------------------------------------------------------------------
+# GET /tickets/by-agent/{agent_id}
+# IMPORTANT: must be defined BEFORE /{ticket_id}
+# ---------------------------------------------------------------------------
+
+    
+@router.get("/by-agent/{agent_id}", summary="List tickets assigned to a specific agent")
+async def list_tickets_by_agent(
+    agent_id: uuid.UUID,
+    page: int = Query(default=1, ge=1, description="Page number starting from 1"),
+    page_size: int = Query(default=20, ge=1, le=100, description="Items per page (max 100)"),
+    include_deleted: bool = Query(default=False, description="Include soft-deleted tickets"),
+    status: str | None = Query(default=None, description="Filter by status: open, pending, closed"),
+    priority: str | None = Query(default=None, description="Filter by priority: low, normal, high, urgent"),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.models.agent import Agent
+
+    # Verify agent exists
+    agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
+    agent = agent_result.scalars().first()
+    if not agent:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Agent {agent_id} not found",
+        )
+
+    offset = (page - 1) * page_size
+    tickets, total = await TicketRepository(db).get_by_agent(
+        agent_id=agent_id,
+        include_deleted=include_deleted,
+        status=status,
+        priority=priority,
+        offset=offset,
+        limit=page_size,
+    )
+    logger.debug(
+        "list_tickets_by_agent: agent=%s status=%s priority=%s returned %d of %d",
+        agent_id, status, priority, len(tickets), total,
+    )
+    return paginated(
+        items=[_to_brief(t) for t in tickets],
+        total=total,
+        page=page,
+        page_size=page_size,
+        message=f"Tickets for agent '{agent.name}' fetched successfully",
+    )
+    
+
 @router.get("/{ticket_id}", summary="Get ticket by ID")
 async def get_ticket(
     ticket_id: uuid.UUID,
