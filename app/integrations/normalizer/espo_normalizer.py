@@ -74,7 +74,7 @@ def normalize_espo_ticket(raw: dict) -> NormalizedTicket:
         status=status,
         priority=priority,
         crm_agent_id=raw.get("assignedUserId") or None,
-        crm_customer_id=raw.get("contactId") or None,
+        crm_customer_id=raw.get("createdById") or None,
         crm_company_id=raw.get("accountId") or None,
         created_at=created_at,
         updated_at=updated_at,
