@@ -1,9 +1,9 @@
 """
 app/routes/companies.py
 
-GET /companies/                        → paginated list   (CompanyResponse)
-GET /companies/source/{source_system}  → filtered by CRM  (CompanyResponse)
-GET /companies/{id}                    → full detail       (CompanyResponse)
+GET /companies/        → paginated list
+GET /companies/filter  → filtered list (?source)
+GET /companies/{id}    → full detail
 """
 
 from __future__ import annotations
@@ -11,24 +11,18 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db
-from app.models.source_system import SourceSystem
-from app.repositories.company_repository import CompanyRepository
 from app.schemas.company import CompanyResponse
+from app.services.company_service import CompanyService
 from app.utils.response import paginated, success
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/companies", tags=["Companies"])
 
-
-# ---------------------------------------------------------------------------
-# Mapper — ORM object → Pydantic schema dict
-# ---------------------------------------------------------------------------
 
 def _to_response(company) -> dict:
     return CompanyResponse(
@@ -42,32 +36,19 @@ def _to_response(company) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Helper — resolve source system name → DB row
-# ---------------------------------------------------------------------------
-
-async def _get_source_system(name: str, db: AsyncSession):
-    result = await db.execute(
-        select(SourceSystem).where(SourceSystem.system_name == name.lower())
-    )
-    return result.scalars().first()
-
-
-# ---------------------------------------------------------------------------
 # GET /companies/
 # ---------------------------------------------------------------------------
 
 @router.get("/", summary="List all companies")
 async def list_companies(
-    page: int = Query(default=1, ge=1, description="Page number starting from 1"),
-    page_size: int = Query(default=20, ge=1, le=100, description="Items per page (max 100)"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    offset = (page - 1) * page_size
-    companies, total = await CompanyRepository(db).get_all(
-        offset=offset,
-        limit=page_size,
+    companies, total = await CompanyService(db).get_companies(
+        page=page,
+        page_size=page_size,
     )
-    logger.debug("list_companies: returned %d of %d total", len(companies), total)
     return paginated(
         items=[_to_response(c) for c in companies],
         total=total,
@@ -78,43 +59,28 @@ async def list_companies(
 
 
 # ---------------------------------------------------------------------------
-# GET /companies/source/{source_system_name}
-# IMPORTANT: must be defined BEFORE /{company_id} so FastAPI does not
-# try to parse the literal string "source" as a UUID
+# GET /companies/filter
+# NOTE: defined before /{company_id} so "filter" is not parsed as a UUID
 # ---------------------------------------------------------------------------
 
-@router.get("/source/{source_system_name}", summary="List companies by CRM source")
-async def list_companies_by_source(
-    source_system_name: str,
+@router.get("/filter", summary="Filter companies by source system")
+async def filter_companies(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    source: str | None = Query(default=None, description="CRM source: zammad, espocrm"),
     db: AsyncSession = Depends(get_db),
 ):
-    source = await _get_source_system(source_system_name, db)
-
-    if not source:
-        logger.warning("list_companies_by_source: unknown source '%s'", source_system_name)
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Source system '{source_system_name}' not found. Valid values: zammad, espocrm",
-        )
-
-    offset = (page - 1) * page_size
-    companies, total = await CompanyRepository(db).get_by_source_system(
-        source_system_id=source.id,
-        offset=offset,
-        limit=page_size,
-    )
-    logger.debug(
-        "list_companies_by_source: source=%s returned %d of %d",
-        source_system_name, len(companies), total,
+    companies, total = await CompanyService(db).filter_companies(
+        page=page,
+        page_size=page_size,
+        source=source,
     )
     return paginated(
         items=[_to_response(c) for c in companies],
         total=total,
         page=page,
         page_size=page_size,
-        message=f"Companies for '{source_system_name}' fetched successfully",
+        message="Companies fetched successfully",
     )
 
 
@@ -127,13 +93,5 @@ async def get_company(
     company_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    company = await CompanyRepository(db).get_by_id(company_id)
-
-    if not company:
-        logger.warning("get_company: company %s not found", company_id)
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Company {company_id} not found",
-        )
-
+    company = await CompanyService(db).get_company_or_404(company_id)
     return success("Company fetched successfully", _to_response(company))

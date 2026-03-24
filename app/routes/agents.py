@@ -1,9 +1,9 @@
 """
 app/routes/agents.py
 
-GET /agents/                        → paginated list   (AgentResponse)
-GET /agents/source/{source_system}  → filtered by CRM  (AgentResponse)
-GET /agents/{id}                    → full detail       (AgentResponse)
+GET /agents/         → paginated list
+GET /agents/filter   → filtered list (?source ?include_inactive)
+GET /agents/{id}     → full detail
 """
 
 from __future__ import annotations
@@ -11,24 +11,18 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db
-from app.models.source_system import SourceSystem
-from app.repositories.agent_repository import AgentRepository
 from app.schemas.agent import AgentResponse
+from app.services.agent_service import AgentService
 from app.utils.response import paginated, success
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
 
-
-# ---------------------------------------------------------------------------
-# Mapper — ORM object → Pydantic schema dict
-# ---------------------------------------------------------------------------
 
 def _to_response(agent) -> dict:
     return AgentResponse(
@@ -42,34 +36,21 @@ def _to_response(agent) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Helper — resolve source system name → DB row
-# ---------------------------------------------------------------------------
-
-async def _get_source_system(name: str, db: AsyncSession):
-    result = await db.execute(
-        select(SourceSystem).where(SourceSystem.system_name == name.lower())
-    )
-    return result.scalars().first()
-
-
-# ---------------------------------------------------------------------------
 # GET /agents/
 # ---------------------------------------------------------------------------
 
 @router.get("/", summary="List all agents")
 async def list_agents(
-    page: int = Query(default=1, ge=1, description="Page number starting from 1"),
-    page_size: int = Query(default=20, ge=1, le=100, description="Items per page (max 100)"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     include_inactive: bool = Query(default=False, description="Include inactive agents"),
     db: AsyncSession = Depends(get_db),
 ):
-    offset = (page - 1) * page_size
-    agents, total = await AgentRepository(db).get_all(
+    agents, total = await AgentService(db).get_agents(
+        page=page,
+        page_size=page_size,
         include_inactive=include_inactive,
-        offset=offset,
-        limit=page_size,
     )
-    logger.debug("list_agents: returned %d of %d total", len(agents), total)
     return paginated(
         items=[_to_response(a) for a in agents],
         total=total,
@@ -80,45 +61,30 @@ async def list_agents(
 
 
 # ---------------------------------------------------------------------------
-# GET /agents/source/{source_system_name}
-# IMPORTANT: must be defined BEFORE /{agent_id} so FastAPI does not
-# try to parse the literal string "source" as a UUID
+# GET /agents/filter
+# NOTE: defined before /{agent_id} so "filter" is not parsed as a UUID
 # ---------------------------------------------------------------------------
 
-@router.get("/source/{source_system_name}", summary="List agents by CRM source")
-async def list_agents_by_source(
-    source_system_name: str,
+@router.get("/filter", summary="Filter agents by source or active status")
+async def filter_agents(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     include_inactive: bool = Query(default=False),
+    source: str | None = Query(default=None, description="CRM source: zammad, espocrm"),
     db: AsyncSession = Depends(get_db),
 ):
-    source = await _get_source_system(source_system_name, db)
-
-    if not source:
-        logger.warning("list_agents_by_source: unknown source '%s'", source_system_name)
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Source system '{source_system_name}' not found. Valid values: zammad, espocrm",
-        )
-
-    offset = (page - 1) * page_size
-    agents, total = await AgentRepository(db).get_by_source_system(
-        source_system_id=source.id,
+    agents, total = await AgentService(db).filter_agents(
+        page=page,
+        page_size=page_size,
         include_inactive=include_inactive,
-        offset=offset,
-        limit=page_size,
-    )
-    logger.debug(
-        "list_agents_by_source: source=%s returned %d of %d",
-        source_system_name, len(agents), total,
+        source=source,
     )
     return paginated(
         items=[_to_response(a) for a in agents],
         total=total,
         page=page,
         page_size=page_size,
-        message=f"Agents for '{source_system_name}' fetched successfully",
+        message="Agents fetched successfully",
     )
 
 
@@ -131,13 +97,5 @@ async def get_agent(
     agent_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    agent = await AgentRepository(db).get_by_id(agent_id)
-
-    if not agent:
-        logger.warning("get_agent: agent %s not found", agent_id)
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent {agent_id} not found",
-        )
-
+    agent = await AgentService(db).get_agent_or_404(agent_id)
     return success("Agent fetched successfully", _to_response(agent))
