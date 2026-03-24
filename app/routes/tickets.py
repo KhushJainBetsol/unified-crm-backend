@@ -227,6 +227,64 @@ async def list_tickets_by_agent(
 # GET /tickets/{ticket_id}
 # ---------------------------------------------------------------------------
 
+
+
+
+# ---------------------------------------------------------------------------
+# GET /tickets/stats
+# ---------------------------------------------------------------------------
+@router.get("/stats", summary="Get ticket stats for dashboard")
+async def get_ticket_stats(db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import func, case
+    from app.models.ticket import Ticket
+    from app.models.ticket_status import TicketStatus
+    from app.models.ticket_priority import TicketPriority
+
+    # ── Totals ──────────────────────────────────────────────────────────────
+    result = await db.execute(
+        select(
+            func.count(Ticket.id).label("total"),
+            func.sum(case((Ticket.is_deleted == False, 1), else_=0)).label("active"),  # noqa: E712
+            func.sum(case((Ticket.is_deleted == True,  1), else_=0)).label("deleted"),  # noqa: E712
+        )
+    )
+    row = result.first()
+
+    # ── Count per status (active tickets only) ───────────────────────────────
+    status_result = await db.execute(
+        select(TicketStatus.status_name, func.count(Ticket.id).label("count"))
+        .join(Ticket, Ticket.status_id == TicketStatus.id)
+        .where(Ticket.is_deleted == False)  # noqa: E712
+        .group_by(TicketStatus.status_name)
+    )
+    by_status = {r.status_name: r.count for r in status_result}
+
+    # ── Count per priority (active tickets only) ─────────────────────────────
+    priority_result = await db.execute(
+        select(TicketPriority.priority_name, func.count(Ticket.id).label("count"))
+        .join(Ticket, Ticket.priority_id == TicketPriority.id)
+        .where(Ticket.is_deleted == False)  # noqa: E712
+        .group_by(TicketPriority.priority_name)
+    )
+    by_priority = {r.priority_name: r.count for r in priority_result}
+
+    return success("Stats fetched successfully", {
+        # totals
+        "total":         row.total   or 0,
+        "active":        row.active  or 0,
+        "deleted":       row.deleted or 0,
+
+        # widget-ready shortcuts
+        "open":          by_status.get("open",    0),
+        "closed":        by_status.get("closed",  0),
+        "pending":       by_status.get("pending", 0),
+        "high_priority": (by_priority.get("high", 0) + by_priority.get("urgent", 0)),
+
+        # full breakdowns for charts
+        "by_status":   by_status,
+        "by_priority": by_priority,
+    })
+    
 @router.get("/{ticket_id}", summary="Get ticket by ID")
 async def get_ticket(
     ticket_id: uuid.UUID,
@@ -242,39 +300,3 @@ async def get_ticket(
         )
 
     return success("Ticket fetched successfully", _to_detail(ticket))
-
-
-# ---------------------------------------------------------------------------
-# GET /tickets/stats
-# ---------------------------------------------------------------------------
-
-@router.get("/stats", summary="Get ticket stats for dashboard")
-async def get_ticket_stats(db: AsyncSession = Depends(get_db)):
-    from sqlalchemy import func, case
-    from app.models.ticket import Ticket
-    from app.models.ticket_status import TicketStatus
-
-    result = await db.execute(
-        select(
-            func.count(Ticket.id).label("total"),
-            func.sum(case((Ticket.is_deleted == False, 1), else_=0)).label("active"),  # noqa: E712
-            func.sum(case((Ticket.is_deleted == True,  1), else_=0)).label("deleted"),  # noqa: E712
-        )
-    )
-    row = result.first()
-
-    # count per status
-    status_result = await db.execute(
-        select(TicketStatus.status_name, func.count(Ticket.id).label("count"))
-        .join(Ticket, Ticket.status_id == TicketStatus.id)
-        .where(Ticket.is_deleted == False)  # noqa: E712
-        .group_by(TicketStatus.status_name)
-    )
-    by_status = {r.status_name: r.count for r in status_result}
-
-    return success("Stats fetched successfully", {
-        "total":   row.total   or 0,
-        "active":  row.active  or 0,
-        "deleted": row.deleted or 0,
-        "by_status": by_status,
-    })
