@@ -1,12 +1,14 @@
 """
 app/routes/tickets.py
 
-GET  /tickets/                    → paginated list
-GET  /tickets/filter              → filtered list (?source ?status ?priority ?include_deleted)
-GET  /tickets/stats               → aggregate counts for dashboard
-GET  /tickets/stats/agent/{id}    → aggregate counts for a specific agent
-GET  /tickets/by-agent/{id}       → tickets assigned to an agent
-GET  /tickets/{id}                → full detail
+GET  /tickets/                           → paginated list
+GET  /tickets/filter                     → filtered list (?source ?status ?priority ?include_deleted)
+GET  /tickets/stats                      → aggregate counts for dashboard
+GET  /tickets/stats/agent/{id}           → aggregate counts for a specific agent
+GET  /tickets/by-agent/{id}             → tickets assigned to an agent
+GET  /tickets/{id}                       → full detail
+GET  /tickets/{id}/comments              → paginated comments for a ticket
+POST /tickets/{id}/comments/sync         → fetch comments from CRM and store in DB
 """
 
 from __future__ import annotations
@@ -19,9 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.dependencies import get_db
 from app.schemas.agent import AgentBriefResponse
+from app.schemas.comment import CommentResponse
 from app.schemas.company import CompanyBriefResponse
 from app.schemas.customer import CustomerBriefResponse
 from app.schemas.ticket import TicketBriefResponse, TicketDetailResponse
+from app.services.comment_service import CommentService
 from app.services.ticket_service import TicketService
 from app.utils.response import paginated, success
 
@@ -78,6 +82,24 @@ def _to_detail(ticket) -> dict:
         closed_at=ticket.closed_at,
         is_deleted=ticket.is_deleted,
         deleted_at=ticket.deleted_at,
+    ).model_dump()
+
+
+def _to_comment(comment) -> dict:
+    return CommentResponse(
+        id=comment.id,
+        ticket_id=comment.ticket_id,
+        source_system=comment.source_system.system_name,
+        crm_comment_id=comment.crm_comment_id,
+        body=comment.body,
+        comment_type=comment.comment_type,
+        author_name=comment.author_name,
+        author_email=comment.author_email,
+        is_internal=comment.is_internal,
+        crm_created_at=comment.crm_created_at,
+        crm_updated_at=comment.crm_updated_at,
+        created_at=comment.created_at,
+        updated_at=comment.updated_at,
     ).model_dump()
 
 
@@ -155,7 +177,6 @@ async def get_ticket_stats(db: AsyncSession = Depends(get_db)):
 
 # ---------------------------------------------------------------------------
 # GET /tickets/stats/agent/{agent_id}
-# NOTE: defined before /{ticket_id}
 # ---------------------------------------------------------------------------
 
 @router.get("/stats/agent/{agent_id}", summary="Get ticket stats for a specific agent")
@@ -169,7 +190,6 @@ async def get_agent_ticket_stats(
 
 # ---------------------------------------------------------------------------
 # GET /tickets/by-agent/{agent_id}
-# NOTE: defined before /{ticket_id}
 # ---------------------------------------------------------------------------
 
 @router.get("/by-agent/{agent_id}", summary="List tickets assigned to a specific agent")
@@ -210,3 +230,37 @@ async def get_ticket(
 ):
     ticket = await TicketService(db).get_ticket_or_404(ticket_id)
     return success("Ticket fetched successfully", _to_detail(ticket))
+
+
+# ---------------------------------------------------------------------------
+# GET /tickets/{ticket_id}/comments
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{ticket_id}/comments",
+    summary="Get comments for a ticket",
+    description=(
+        "Returns paginated comments stored in the DB for this ticket. "
+        "Comments are populated by calling POST /tickets/{id}/comments/sync first. "
+        "Ordered oldest first."
+    ),
+)
+async def get_ticket_comments(
+    ticket_id: uuid.UUID,
+    page: int = Query(default=1, ge=1, description="Page number"),
+    page_size: int = Query(default=50, ge=1, le=200, description="Comments per page (max 200)"),
+    db: AsyncSession = Depends(get_db),
+):
+    comments, total = await CommentService(db).get_comments_for_ticket(
+        ticket_id=ticket_id,
+        page=page,
+        page_size=page_size,
+    )
+    return paginated(
+        items=[_to_comment(c) for c in comments],
+        total=total,
+        page=page,
+        page_size=page_size,
+        message="Comments fetched successfully",
+    )
+

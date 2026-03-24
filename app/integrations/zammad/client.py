@@ -303,3 +303,38 @@ class ZammadClient:
 
         logger.info("Zammad: fetched %d organizations total", len(all_orgs))
         return all_orgs
+    
+    async def get_comments_by_ticket(self, crm_ticket_id: str | int) -> list[dict]:
+        """
+        Fetch all articles (comments) for a Zammad ticket.
+
+        GET /api/v1/ticket_articles/by_ticket/{ticket_id}
+
+        Zammad returns ALL articles for a ticket in one response (no pagination).
+
+        Args:
+            crm_ticket_id: Zammad's integer ticket ID (e.g. 6).
+
+        Returns:
+            List of raw ticket_article dicts.
+
+        Example response item:
+            {
+                "id": 12,
+                "ticket_id": 6,
+                "type": "note",
+                "body": "Comment text here",
+                "from": "Agent <agent@company.com>",
+                "internal": false,
+                "created_at": "2024-01-15T10:30:00.000Z",
+                "updated_at": "2024-01-15T10:30:00.000Z"
+            }
+        """
+        path = f"/api/v1/ticket_articles/by_ticket/{crm_ticket_id}"
+        logger.debug("Fetching Zammad articles for ticket %s", crm_ticket_id)
+        response = await self._get(path)
+
+        # Zammad returns either a list directly or {"ticket_articles": [...]}
+        if isinstance(response, list):
+            return response
+        return response.get("ticket_articles", response.get("articles", []))

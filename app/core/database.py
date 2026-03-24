@@ -63,6 +63,7 @@ async def create_tables() -> None:
         import app.models.role_permission         # noqa: F401
         import app.models.ticket_sync_log         # noqa: F401
         import app.models.user_agent_mapping      # noqa: F401
+        import app.models.ticket_comment 
 
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

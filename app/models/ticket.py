@@ -205,6 +205,13 @@ class Ticket(Base):
         foreign_keys=[deleted_by_id],
         back_populates="deleted_tickets",
     )
+     # Relationship to comments (back_populates on TicketComment.ticket)
+    comments: Mapped[list["TicketComment"]] = relationship(
+        "TicketComment",
+        back_populates="ticket",
+        lazy="noload",
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:
         return (

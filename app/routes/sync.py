@@ -14,6 +14,7 @@ Recommended order:
 from __future__ import annotations
 
 import logging
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -27,7 +28,10 @@ from app.integrations.zammad.service import ZammadService
 from app.models.source_system import SourceSystem
 from app.services.entity_sync_service import EntitySyncService
 from app.services.sync_service import SyncService
+from app.services.comment_service import CommentService
 from app.utils.response import success
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -262,3 +266,28 @@ async def sync_espocrm_full(db: AsyncSession = Depends(get_db)):
             "failed":        ticket_result.failed,
         },
     })
+
+
+# ---------------------------------------------------------------------------
+# POST /tickets/{ticket_id}/comments/sync
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{ticket_id}/comments/sync",
+    summary="Sync comments for a ticket from its CRM",
+    description=(
+        "Fetches comments from the ticket's source CRM (Zammad or EspoCRM), "
+        "normalizes them, and upserts into the ticket_comments table. "
+        "Source system is determined automatically from the ticket record. "
+        "Safe to call multiple times — uses upsert (no duplicates)."
+    ),
+)
+async def sync_ticket_comments(
+    ticket_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    count = await CommentService(db).sync_comments_for_ticket(ticket_id)
+    return success(
+        f"Synced {count} comment(s) for ticket {ticket_id}",
+        {"ticket_id": str(ticket_id), "synced_count": count},
+    )

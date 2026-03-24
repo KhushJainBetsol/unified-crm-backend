@@ -354,3 +354,67 @@ class EspoClient:
             params={"offset": offset, "maxSize": ESPO_PAGE_SIZE},
         )
         return response.get("list", []), response.get("total", 0)
+    
+    
+    async def get_comments_by_ticket(self, crm_ticket_id: str) -> list[dict]:
+        """
+        Fetch all stream Post items for an EspoCRM Case (ticket comments).
+
+        GET /api/v1/Case/{id}/stream
+            ?where[0][type]=equals
+            &where[0][attribute]=type
+            &where[0][value]=Post
+
+        EspoCRM's stream endpoint uses the same offset pagination as other endpoints.
+        We paginate until all Posts are retrieved.
+
+        Args:
+            crm_ticket_id: EspoCRM Case UUID string (e.g. "699d917f87d8ffe8").
+
+        Returns:
+            List of raw stream Post dicts.
+
+        Example response item:
+            {
+                "id": "abc123",
+                "type": "Post",
+                "data": { "post": "The comment text" },
+                "createdByName": "John Agent",
+                "createdAt": "2024-01-15T10:30:00.000Z",
+                "modifiedAt": "2024-01-15T10:30:00.000Z"
+            }
+        """
+        all_posts: list[dict] = []
+        offset = 0
+
+        while True:
+            response = await self._get(
+                f"/api/v1/Case/{crm_ticket_id}/stream",
+                params={
+                    "offset": offset,
+                    "maxSize": ESPO_PAGE_SIZE,
+                    "where[0][type]": "equals",
+                    "where[0][attribute]": "type",
+                    "where[0][value]": "Post",
+                },
+            )
+
+            # EspoCRM stream returns: { "list": [...], "total": N }
+            batch = response.get("list", [])
+            total = response.get("total", 0)
+
+            if not batch:
+                break
+
+            all_posts.extend(batch)
+            offset += ESPO_PAGE_SIZE
+
+            if len(all_posts) >= total:
+                break
+
+        logger.debug(
+            "EspoCRM: fetched %d stream posts for Case %s",
+            len(all_posts),
+            crm_ticket_id,
+        )
+        return all_posts
