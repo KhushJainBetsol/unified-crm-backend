@@ -134,6 +134,8 @@ def normalize_zammad_comments(raw_list: list[dict]) -> list[NormalizedComment]:
     """Normalize a list of Zammad articles, skipping any that fail."""
     results = []
     for raw in raw_list:
+        if raw.get("type") != "note": 
+            continue
         comment = normalize_zammad_comment(raw)
         if comment:
             results.append(comment)
