@@ -97,9 +97,7 @@ def _to_comment(comment) -> dict:
         author_email=comment.author_email,
         is_internal=comment.is_internal,
         crm_created_at=comment.crm_created_at,
-        crm_updated_at=comment.crm_updated_at,
-        created_at=comment.created_at,
-        updated_at=comment.updated_at,
+        crm_updated_at=comment.crm_updated_at
     ).model_dump()
 
 
