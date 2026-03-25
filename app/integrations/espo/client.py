@@ -16,6 +16,13 @@ EspoCRM API quirks vs Zammad:
   - Entity for tickets is "Case" not "Ticket"
   - Timestamps use camelCase: "createdAt", "modifiedAt"
 
+Agent vs Customer differentiation strategy:
+  - GET /api/v1/User (list) gives minimal fields — no rolesNames
+  - GET /api/v1/User/:id (detail) includes rolesNames dict
+  - _get_all_users_with_detail() fetches all IDs then hydrates each one
+  - get_all_agents()    → calls _get_all_users_with_detail(), keeps rolesNames == "agent"
+  - get_all_customers() → calls _get_all_users_with_detail(), keeps rolesNames == "customer"
+
 EspoCRM API docs: https://docs.espocrm.com/development/api/
 """
 
@@ -34,6 +41,12 @@ settings = get_settings()
 
 # EspoCRM recommends max 200 records per request
 ESPO_PAGE_SIZE = 200
+
+# Role name keyword for agents (case-insensitive match against rolesNames values)
+AGENT_ROLE_KEYWORD = "Agent"
+
+# Role name keyword for customers (case-insensitive match against rolesNames values)
+CUSTOMER_ROLE_KEYWORD = "Customer"
 
 
 class EspoClientError(Exception):
@@ -120,6 +133,61 @@ class EspoClient:
             )
 
         return response.json()
+
+    async def _get_all_users_with_detail(self) -> list[dict]:
+        """
+        Shared helper used by get_all_agents() and get_all_customers().
+
+        Step 1 — paginate GET /api/v1/User to collect all user IDs.
+                 (List endpoint returns minimal fields, no rolesNames.)
+        Step 2 — fetch GET /api/v1/User/:id for every ID to get the full
+                 detail record, which includes rolesNames, teamsNames,
+                 lastAccess, etc.
+
+        Returns:
+            List of fully-hydrated raw user dicts.
+        """
+        # --- Step 1: collect all user IDs from the paginated list --------
+        all_ids: list[str] = []
+        offset = 0
+
+        while True:
+            response = await self._get(
+                "/api/v1/User",
+                params={"offset": offset, "maxSize": ESPO_PAGE_SIZE},
+            )
+            batch: list[dict] = response.get("list", [])
+            total: int = response.get("total", 0)
+
+            if not batch:
+                break
+
+            all_ids.extend(user["id"] for user in batch)
+            offset += ESPO_PAGE_SIZE
+
+            if len(all_ids) >= total:
+                break
+
+        logger.info("EspoCRM: found %d user IDs, fetching full details...", len(all_ids))
+
+        # --- Step 2: fetch full detail per user --------------------------
+        detailed_users: list[dict] = []
+
+        for i, user_id in enumerate(all_ids, start=1):
+            logger.debug("Fetching user detail %d/%d  id=%s", i, len(all_ids), user_id)
+            try:
+                detail = await self._get(f"/api/v1/User/{user_id}")
+                detailed_users.append(detail)
+            except EspoClientError as exc:
+                logger.warning(
+                    "Skipping user %s — failed to fetch detail: %s", user_id, exc
+                )
+
+        logger.info(
+            "EspoCRM: fetched full details for %d / %d users",
+            len(detailed_users), len(all_ids),
+        )
+        return detailed_users
 
     # ------------------------------------------------------------------
     # Ticket (Case) endpoints
@@ -264,25 +332,29 @@ class EspoClient:
     # ------------------------------------------------------------------
     async def get_all_agents(self) -> list[dict]:
         """
-        Fetch all EspoCRM users.
-        GET /api/v1/User
-        Returns flat list of raw user dicts.
+        Fetch all EspoCRM users whose rolesNames contains "agent".
+
+        Internally calls _get_all_users_with_detail() to get fully-hydrated
+        user records (list endpoint does not include rolesNames), then
+        filters to only those whose rolesNames values contain AGENT_ROLE_KEYWORD.
+
+        GET /api/v1/User  +  GET /api/v1/User/:id per user
+
+        Returns:
+            Flat list of full user dicts for agents only.
         """
-        all_agents: list[dict] = []
-        offset = 0
+        all_users = await self._get_all_users_with_detail()
 
-        batch, total = await self._get_users(offset=offset)
-        all_agents.extend(batch)
+        agents = [
+            user for user in all_users
+            if any(
+                AGENT_ROLE_KEYWORD in role_name
+                for role_name in (user.get("rolesNames") or {}).values()
+            )
+        ]
 
-        while len(all_agents) < total:
-            offset += ESPO_PAGE_SIZE
-            batch, _ = await self._get_users(offset=offset)
-            if not batch:
-                break
-            all_agents.extend(batch)
-
-        logger.info("EspoCRM: fetched %d agents total", len(all_agents))
-        return all_agents
+        logger.info("EspoCRM: fetched %d agents total", len(agents))
+        return agents
 
     async def _get_users(self, offset: int = 0) -> tuple[list[dict], int]:
         response = await self._get(
@@ -296,25 +368,29 @@ class EspoClient:
     # ------------------------------------------------------------------
     async def get_all_customers(self) -> list[dict]:
         """
-        Fetch all EspoCRM contacts (customers).
-        GET /api/v1/Contact
-        Returns flat list of raw contact dicts.
+        Fetch all EspoCRM users whose rolesNames contains "customer".
+
+        Internally calls _get_all_users_with_detail() to get fully-hydrated
+        user records (list endpoint does not include rolesNames), then
+        filters to only those whose rolesNames values contain CUSTOMER_ROLE_KEYWORD.
+
+        GET /api/v1/User  +  GET /api/v1/User/:id per user
+
+        Returns:
+            Flat list of full user dicts for customers only.
         """
-        all_customers: list[dict] = []
-        offset = 0
+        all_users = await self._get_all_users_with_detail()
 
-        batch, total = await self._get_contacts(offset=offset)
-        all_customers.extend(batch)
+        customers = [
+            user for user in all_users
+            if any(
+                CUSTOMER_ROLE_KEYWORD in role_name
+                for role_name in (user.get("rolesNames") or {}).values()
+            )
+        ]
 
-        while len(all_customers) < total:
-            offset += ESPO_PAGE_SIZE
-            batch, _ = await self._get_contacts(offset=offset)
-            if not batch:
-                break
-            all_customers.extend(batch)
-
-        logger.info("EspoCRM: fetched %d customers total", len(all_customers))
-        return all_customers
+        logger.info("EspoCRM: fetched %d customers total", len(customers))
+        return customers
 
     async def _get_contacts(self, offset: int = 0) -> tuple[list[dict], int]:
         response = await self._get(
@@ -354,8 +430,10 @@ class EspoClient:
             params={"offset": offset, "maxSize": ESPO_PAGE_SIZE},
         )
         return response.get("list", []), response.get("total", 0)
-    
-    
+
+    # ------------------------------------------------------------------
+    # Comments (Case stream) endpoints
+    # ------------------------------------------------------------------
     async def get_comments_by_ticket(self, crm_ticket_id: str) -> list[dict]:
         """
         Fetch all stream Post items for an EspoCRM Case (ticket comments).
