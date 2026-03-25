@@ -262,4 +262,3 @@ async def get_ticket_comments(
         page_size=page_size,
         message="Comments fetched successfully",
     )
-
