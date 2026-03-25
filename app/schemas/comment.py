@@ -30,7 +30,5 @@ class CommentResponse(BaseModel):
 
     crm_created_at: datetime | None
     crm_updated_at: datetime | None
-    created_at: datetime
-    updated_at: datetime
 
     model_config = {"from_attributes": True}
