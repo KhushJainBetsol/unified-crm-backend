@@ -249,6 +249,7 @@ async def get_ticket_comments(
     page_size: int = Query(default=50, ge=1, le=200, description="Comments per page (max 200)"),
     db: AsyncSession = Depends(get_db),
 ):
+    
     comments, total = await CommentService(db).get_comments_for_ticket(
         ticket_id=ticket_id,
         page=page,
