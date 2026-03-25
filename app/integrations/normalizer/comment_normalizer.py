@@ -134,12 +134,33 @@ def normalize_zammad_comments(raw_list: list[dict]) -> list[NormalizedComment]:
     """Normalize a list of Zammad articles, skipping any that fail."""
     results = []
     for raw in raw_list:
-        if raw.get("type") != "note": 
+        if raw.get("type") != "note":
             continue
         comment = normalize_zammad_comment(raw)
         if comment:
             results.append(comment)
     return results
+
+def extract_first_zammad_body(raw_list: list[dict]) -> str | None:
+    """
+    Sort ALL articles (any type) by created_at ascending,
+    pick the very first one, and return its body.
+
+    This is used to populate the ticket description with the
+    original opening message before any type filtering is applied.
+
+    Returns None if raw_list is empty or the first article has no body.
+    """
+    if not raw_list:
+        return None
+
+    sorted_articles = sorted(
+        raw_list,
+        key=lambda a: a.get("created_at") or "",  # empty string sorts before any date
+    )
+
+    first = sorted_articles[0]
+    return first.get("body") or None
 
 
 # ---------------------------------------------------------------------------

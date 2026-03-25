@@ -110,12 +110,22 @@ class CommentService:
         Returns:
             Number of comments upserted.
         """
+        from app.integrations.normalizer.comment_normalizer import extract_first_zammad_body
         from app.integrations.zammad.client import ZammadClient
 
         source_system_id = await self._get_source_system_id("zammad")
 
         async with ZammadClient() as client:
             raw = await client.get_comments_by_ticket(crm_ticket_id)
+
+        first_body = extract_first_zammad_body(raw)
+        if first_body:
+            ticket = await self._get_ticket_or_404(ticket_id)
+            ticket.description = first_body
+            self.db.add(ticket)
+            logger.info(
+                "Updated description for ticket %s from first Zammad article", ticket_id
+            )
 
         normalized = normalize_zammad_comments(raw)
 
