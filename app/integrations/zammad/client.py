@@ -314,8 +314,8 @@ class ZammadClient:
         ]
 
         logger.info(
-            "Zammad: filtered %d pure customers (role_id=%d, not role_id=%d) from %d total users",
-            len(customers), CUSTOMER_ROLE_ID, AGENT_ROLE_ID, len(all_users),
+            "Zammad: filtered %d customers (role_id=%d) from %d total users",
+            len(customers), CUSTOMER_ROLE_ID, len(all_users),
         )
         return customers
 
