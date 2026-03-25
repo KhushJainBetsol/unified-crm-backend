@@ -98,8 +98,6 @@ def _to_comment(comment) -> dict:
         is_internal=comment.is_internal,
         crm_created_at=comment.crm_created_at,
         crm_updated_at=comment.crm_updated_at,
-        created_at=comment.created_at,
-        updated_at=comment.updated_at,
     ).model_dump()
 
 
@@ -263,4 +261,3 @@ async def get_ticket_comments(
         page_size=page_size,
         message="Comments fetched successfully",
     )
-
