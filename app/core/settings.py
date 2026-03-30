@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     # Zammad
     ZAMMAD_BASE_URL: str = ""
     ZAMMAD_API_TOKEN: str = ""
+    
+    SYNC_INTERVAL_MINUTES: int = 15
 
     @property
     def allowed_origins_list(self) -> list[str]:

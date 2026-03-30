@@ -8,7 +8,9 @@ Startup sequence:
   2. Register global exception handlers
   3. Create all DB tables
   4. Seed lookup tables if empty
-  5. Register routers
+  5. Run initial full CRM sync
+  6. Start scheduled CRM sync
+  7. Register routers
 """
 
 from __future__ import annotations
@@ -24,7 +26,8 @@ from sqlalchemy.exc import OperationalError
 from app.core.database import async_session_maker, create_tables
 from app.core.logging import configure_logging
 from app.core.settings import get_settings
-from app.routes import sync, tickets , agents , customers , companies
+from app.routes import sync, tickets, agents, customers, companies
+from app.services.scheduler import run_all_full_sync, start_scheduler, stop_scheduler
 from app.utils.exceptions import register_exception_handlers
 
 settings = get_settings()
@@ -104,8 +107,15 @@ async def lifespan(app: FastAPI):
         )
         raise
 
+    # Initial sync on boot, then start recurring scheduler
+    logger.info("Running initial CRM full sync on startup...")
+    await run_all_full_sync()
+    start_scheduler()
+    logger.info("CRM sync scheduler started.")
+
     yield
 
+    stop_scheduler()
     logger.info("Shutting down %s", settings.APP_NAME)
 
 
@@ -135,11 +145,12 @@ app.add_middleware(
 )
 
 # Routers
-app.include_router(tickets.router, prefix="/api/v1")
-app.include_router(agents.router, prefix="/api/v1")
+app.include_router(tickets.router,   prefix="/api/v1")
+app.include_router(agents.router,    prefix="/api/v1")
 app.include_router(customers.router, prefix="/api/v1")
 app.include_router(companies.router, prefix="/api/v1")
-app.include_router(sync.router,    prefix="/api/v1")
+app.include_router(sync.router,      prefix="/api/v1")
+
 
 # ---------------------------------------------------------------------------
 # Health check
