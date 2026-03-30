@@ -1,15 +1,4 @@
-"""
-app/routes/sync.py
-
-Sync endpoints — manually trigger CRM syncs.
-
-Recommended order:
-  POST /sync/{crm}/full   → entities then tickets in one call (recommended)
-
-  OR step by step:
-  POST /sync/{crm}/entities → agents, customers, companies first
-  POST /sync/{crm}          → tickets second
-"""
+# app/routes/sync.py
 
 from __future__ import annotations
 
@@ -29,9 +18,8 @@ from app.models.source_system import SourceSystem
 from app.services.entity_sync_service import EntitySyncService
 from app.services.sync_service import SyncService
 from app.services.comment_service import CommentService
+from app.services.scheduler import run_zammad_full_sync, run_espocrm_full_sync
 from app.utils.response import success
-
-
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +27,7 @@ router = APIRouter(prefix="/sync", tags=["Sync"])
 
 
 # ---------------------------------------------------------------------------
-# Shared helper
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 async def _get_source_system_id(name: str, db: AsyncSession) -> int:
@@ -56,7 +44,6 @@ async def _get_source_system_id(name: str, db: AsyncSession) -> int:
 
 
 def _crm_error_to_http(exc: Exception) -> HTTPException:
-    """Convert CRM client errors to appropriate HTTP exceptions."""
     if isinstance(exc, (ZammadAuthError, EspoAuthError)):
         return HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -134,38 +121,11 @@ async def sync_zammad_tickets(db: AsyncSession = Depends(get_db)):
 @router.post("/zammad/full-sync", summary="Full Zammad sync — entities then tickets")
 async def sync_zammad_full(db: AsyncSession = Depends(get_db)):
     """Runs entity sync then ticket sync in one call."""
-    source_system_id = await _get_source_system_id("zammad", db)
-
     try:
-        async with ZammadClient() as client:
-            raw_agents    = await client.get_all_agents()
-            raw_customers = await client.get_all_customers()
-            raw_orgs      = await client.get_all_organizations()
-            normalized    = await ZammadService(client).fetch_all_tickets()
+        result = await run_zammad_full_sync(db)
     except (ZammadClientError, ZammadAuthError) as exc:
         raise _crm_error_to_http(exc)
-
-    svc = EntitySyncService(db, source_system_id)
-    agents_c,    agents_u    = await svc.sync_zammad_agents(raw_agents)
-    customers_c, customers_u = await svc.sync_zammad_customers(raw_customers)
-    companies_c, companies_u = await svc.sync_zammad_companies(raw_orgs)
-
-    ticket_result = await SyncService(db).sync_tickets(normalized, source_system="zammad")
-    logger.info("Zammad full sync complete")
-
-    return success("Zammad full sync completed", {
-        "entities": {
-            "agents":    {"created": agents_c,    "updated": agents_u},
-            "customers": {"created": customers_c, "updated": customers_u},
-            "companies": {"created": companies_c, "updated": companies_u},
-        },
-        "tickets": {
-            "total_fetched": ticket_result.total_fetched,
-            "created":       ticket_result.created,
-            "updated":       ticket_result.updated,
-            "failed":        ticket_result.failed,
-        },
-    })
+    return success("Zammad full sync completed", result)
 
 
 # ===========================================================================
@@ -234,38 +194,11 @@ async def sync_espocrm_tickets(db: AsyncSession = Depends(get_db)):
 @router.post("/espocrm/full-sync", summary="Full EspoCRM sync — entities then tickets")
 async def sync_espocrm_full(db: AsyncSession = Depends(get_db)):
     """Runs entity sync then ticket sync in one call."""
-    source_system_id = await _get_source_system_id("espocrm", db)
-
     try:
-        async with EspoClient() as client:
-            raw_agents    = await client.get_all_agents()
-            raw_customers = await client.get_all_customers()
-            raw_companies = await client.get_all_companies()
-            normalized    = await EspoService(client).fetch_all_tickets()
+        result = await run_espocrm_full_sync(db)
     except (EspoClientError, EspoAuthError) as exc:
         raise _crm_error_to_http(exc)
-
-    svc = EntitySyncService(db, source_system_id)
-    agents_c,    agents_u    = await svc.sync_espo_agents(raw_agents)
-    customers_c, customers_u = await svc.sync_espo_customers(raw_customers)
-    companies_c, companies_u = await svc.sync_espo_companies(raw_companies)
-
-    ticket_result = await SyncService(db).sync_tickets(normalized, source_system="espocrm")
-    logger.info("EspoCRM full sync complete")
-
-    return success("EspoCRM full sync completed", {
-        "entities": {
-            "agents":    {"created": agents_c,    "updated": agents_u},
-            "customers": {"created": customers_c, "updated": customers_u},
-            "companies": {"created": companies_c, "updated": companies_u},
-        },
-        "tickets": {
-            "total_fetched": ticket_result.total_fetched,
-            "created":       ticket_result.created,
-            "updated":       ticket_result.updated,
-            "failed":        ticket_result.failed,
-        },
-    })
+    return success("EspoCRM full sync completed", result)
 
 
 # ---------------------------------------------------------------------------
