@@ -50,3 +50,32 @@
 [fallbacks]
 status   = "open"
 priority = ""       # empty string = NULL in DB
+
+# ---------------------------------------------------------------------------
+# Push mappings — internal value → Zammad value
+# Used when pushing updates FROM the dashboard TO Zammad.
+# Keys are internal standard values (lowercase).
+# Values are the exact Zammad strings this instance accepts.
+#
+# Status values map to Zammad "state" names.
+# Check valid states in Zammad admin under:
+#   Admin → Ticket States
+#
+# Priority values map to Zammad priority display names.
+# Check valid priorities in Zammad admin under:
+#   Admin → Ticket Priorities
+#
+# Note: Zammad has no "urgent" priority by default — it maps to "3 high".
+# If your instance has a custom "4 urgent" state, update the value below.
+# ---------------------------------------------------------------------------
+[push_status]
+"open"    = "open"
+"pending" = "pending reminder"
+"closed"  = "closed"
+
+[push_priority]
+"low"    = "1 low"
+"normal" = "2 normal"
+"high"   = "3 high"
+"urgent" = "3 high"
+

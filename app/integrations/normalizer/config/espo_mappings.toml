@@ -37,3 +37,23 @@
 [fallbacks]
 status   = "open"
 priority = ""       # empty string = NULL in DB
+
+# ---------------------------------------------------------------------------
+# Push mappings — internal value → EspoCRM value
+# Used when pushing updates FROM the dashboard TO EspoCRM.
+# Keys are internal standard values (lowercase).
+# Values are the exact EspoCRM strings this instance accepts.
+#
+# Pick ONE canonical EspoCRM value per internal value.
+# Check your EspoCRM admin panel under:
+#   Admin → Entity Manager → Case → Fields → Status / Priority
+# ---------------------------------------------------------------------------
+[push_status]
+"open"    = "New"          
+"pending" = "In Process"   
+"closed"  = "Closed"        
+[push_priority]
+"low"    = "Low"
+"normal" = "Normal"
+"high"   = "High"
+"urgent" = "Urgent"

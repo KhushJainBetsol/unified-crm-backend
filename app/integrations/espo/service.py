@@ -84,12 +84,13 @@ class EspoService:
             return None
 
         try:
-            from app.integrations.normalizer.espo_normalizer import normalize_espo_ticket
+            from app.integrations.normalizer.espo_normalizer import (
+                normalize_espo_ticket,
+            )
+
             return normalize_espo_ticket(raw)
         except (KeyError, ValueError) as exc:
-            logger.error(
-                "Failed to normalize EspoCRM case %s: %s", ticket_id, exc
-            )
+            logger.error("Failed to normalize EspoCRM case %s: %s", ticket_id, exc)
             return None
 
     async def fetch_tickets_since(
@@ -112,9 +113,7 @@ class EspoService:
         try:
             raw_tickets = await self._client.get_tickets_updated_since(since_str)
         except EspoClientError as exc:
-            logger.error(
-                "Failed to fetch EspoCRM cases since %s: %s", since_str, exc
-            )
+            logger.error("Failed to fetch EspoCRM cases since %s: %s", since_str, exc)
             raise
 
         normalized = normalize_tickets(raw_tickets, source_system="espocrm")
@@ -125,3 +124,49 @@ class EspoService:
             len(normalized),
         )
         return normalized
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+    async def get_case_field_options(self) -> dict[str, list[str]]:
+        """
+        Return the valid option values for Case fields from EspoCRM metadata.
+
+        Use this to discover what status / priority values your specific
+        EspoCRM instance accepts — admins can customise these via the UI
+        so they differ between installations.
+
+        Returns:
+            Dict of field_name → list of valid option strings.
+            e.g. {"status": ["New", "Assigned", "Closed", ...], ...}
+        """
+        return await self._client.get_case_field_options()
+
+    # ------------------------------------------------------------------
+    # Ticket update (push change to EspoCRM)
+    # ------------------------------------------------------------------
+    async def update_ticket(
+        self,
+        crm_ticket_id: str,
+        data: dict,
+    ) -> dict:
+        """
+        Push a field update for an existing EspoCRM Case.
+
+        Args:
+            crm_ticket_id: EspoCRM Case UUID string (stored as crm_ticket_id in our DB).
+            data:          EspoCRM-native field dict, e.g.
+                           {
+                               "status":         "Closed",
+                               "priority":       "High",
+                               "assignedUserId": "abc123-espo-uuid"
+                           }
+
+        Returns:
+            Raw updated Case dict from EspoCRM.
+
+        Raises:
+            EspoClientError: on HTTP errors from EspoCRM.
+        """
+        logger.info("EspoCRM update_ticket crm_id=%s data=%s", crm_ticket_id, data)
+        return await self._client.update_ticket(crm_ticket_id, data)

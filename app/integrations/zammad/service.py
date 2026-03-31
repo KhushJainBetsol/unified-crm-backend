@@ -84,12 +84,13 @@ class ZammadService:
             return None
 
         try:
-            from app.integrations.normalizer.zammad_normalizer import normalize_zammad_ticket
+            from app.integrations.normalizer.zammad_normalizer import (
+                normalize_zammad_ticket,
+            )
+
             return normalize_zammad_ticket(raw)
         except (KeyError, ValueError) as exc:
-            logger.error(
-                "Failed to normalize Zammad ticket %s: %s", ticket_id, exc
-            )
+            logger.error("Failed to normalize Zammad ticket %s: %s", ticket_id, exc)
             return None
 
     async def fetch_tickets_since(
@@ -112,9 +113,7 @@ class ZammadService:
         try:
             raw_tickets = await self._client.get_tickets_updated_since(since_str)
         except ZammadClientError as exc:
-            logger.error(
-                "Failed to fetch Zammad tickets since %s: %s", since_str, exc
-            )
+            logger.error("Failed to fetch Zammad tickets since %s: %s", since_str, exc)
             raise
 
         normalized = normalize_tickets(raw_tickets, source_system="zammad")
@@ -125,3 +124,52 @@ class ZammadService:
             len(normalized),
         )
         return normalized
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+    async def get_ticket_field_options(self) -> dict[str, list[str]]:
+        """
+        Return valid field option values for Zammad tickets.
+
+        Fetches live data from Zammad's dedicated state and priority
+        endpoints so the values always reflect what this instance accepts,
+        including any custom states or priorities added by an admin.
+
+        Returns:
+            Dict with two keys:
+            {
+                "state":    ["new", "open", "pending reminder", "closed", ...],
+                "priority": ["1 low", "2 normal", "3 high", ...],
+            }
+        """
+        return await self._client.get_ticket_field_options()
+
+    # ------------------------------------------------------------------
+    # Ticket update (push change to Zammad)
+    # ------------------------------------------------------------------
+    async def update_ticket(
+        self,
+        crm_ticket_id: str | int,
+        data: dict,
+    ) -> dict:
+        """
+        Push a field update for an existing Zammad ticket.
+
+        Args:
+            crm_ticket_id: Zammad integer ticket ID (stored as crm_ticket_id in our DB).
+            data:          Zammad-native field dict, e.g.
+                           {
+                               "state":    "closed",
+                               "priority": "3 high",
+                               "owner_id": 42
+                           }
+
+        Returns:
+            Raw updated ticket dict from Zammad.
+
+        Raises:
+            ZammadClientError: on HTTP errors from Zammad.
+        """
+        logger.info("Zammad update_ticket crm_id=%s data=%s", crm_ticket_id, data)
+        return await self._client.update_ticket(crm_ticket_id, data)

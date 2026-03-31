@@ -51,11 +51,13 @@ CUSTOMER_ROLE_KEYWORD = "Customer"
 
 class EspoClientError(Exception):
     """Raised when EspoCRM API returns an error response."""
+
     pass
 
 
 class EspoAuthError(EspoClientError):
     """Raised on 401 / 403 responses."""
+
     pass
 
 
@@ -86,7 +88,7 @@ class EspoClient:
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             headers={
-                "X-Api-Key": self._api_key,    # EspoCRM uses X-Api-Key
+                "X-Api-Key": self._api_key,
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(30.0),
@@ -134,6 +136,75 @@ class EspoClient:
 
         return response.json()
 
+    async def _put(self, path: str, data: dict) -> Any:
+        """
+        Perform a PUT request and return the parsed JSON response.
+
+        Raises:
+            EspoAuthError: on 401 / 403
+            EspoClientError: on any other non-2xx response
+        """
+        client = self._ensure_client()
+        logger.debug("EspoCRM PUT %s payload=%s", path, data)
+
+        response = await client.put(path, json=data)
+
+        if response.status_code in (401, 403):
+            raise EspoAuthError(
+                f"EspoCRM authentication failed ({response.status_code}). "
+                "Check ESPO_API_KEY in your .env"
+            )
+        if not response.is_success:
+            raise EspoClientError(
+                f"EspoCRM API error {response.status_code} for PUT {path}: "
+                f"{response.text[:300]}"
+            )
+
+        return response.json()
+
+    async def get_case_field_options(self) -> dict[str, list[str]]:
+        """
+        Fetch the valid field options for the Case entity from EspoCRM metadata.
+
+        Calls GET /api/v1/metadata?scopes[]=Case and extracts the `options`
+        list for each field — this gives us the exact enum values this
+        EspoCRM instance accepts for status, priority, etc.
+
+        EspoCRM allows admins to add/rename/remove options via the admin UI,
+        so the valid values vary per instance and cannot be hardcoded safely.
+
+        Returns:
+            Dict mapping field name → list of valid option strings.
+            e.g. {
+                "status":   ["New", "Assigned", "Pending Input", "Closed", ...],
+                "priority": ["Low", "Normal", "High", "Urgent"],
+            }
+        """
+        response = await self._get(
+            "/api/v1/metadata",
+            params={"scopes[]": "Case"},
+        )
+
+        # Response shape:
+        # {
+        #   "entityDefs": {
+        #     "Case": {
+        #       "fields": {
+        #         "status":   { "type": "enum", "options": ["New", "Assigned", ...] },
+        #         "priority": { "type": "enum", "options": ["Low", "Normal", ...] },
+        #         ...
+        #       }
+        #     }
+        #   }
+        # }
+        fields: dict = response.get("entityDefs", {}).get("Case", {}).get("fields", {})
+
+        return {
+            field_name: field_def.get("options", [])
+            for field_name, field_def in fields.items()
+            if field_def.get("options")  # only fields that have an enum options list
+        }
+
     async def _get_all_users_with_detail(self) -> list[dict]:
         """
         Shared helper used by get_all_agents() and get_all_customers().
@@ -147,7 +218,6 @@ class EspoClient:
         Returns:
             List of fully-hydrated raw user dicts.
         """
-        # --- Step 1: collect all user IDs from the paginated list --------
         all_ids: list[str] = []
         offset = 0
 
@@ -168,9 +238,10 @@ class EspoClient:
             if len(all_ids) >= total:
                 break
 
-        logger.info("EspoCRM: found %d user IDs, fetching full details...", len(all_ids))
+        logger.info(
+            "EspoCRM: found %d user IDs, fetching full details...", len(all_ids)
+        )
 
-        # --- Step 2: fetch full detail per user --------------------------
         detailed_users: list[dict] = []
 
         for i, user_id in enumerate(all_ids, start=1):
@@ -185,7 +256,8 @@ class EspoClient:
 
         logger.info(
             "EspoCRM: fetched full details for %d / %d users",
-            len(detailed_users), len(all_ids),
+            len(detailed_users),
+            len(all_ids),
         )
         return detailed_users
 
@@ -216,9 +288,6 @@ class EspoClient:
 
         GET /api/v1/Case?offset=0&maxSize=200
 
-        EspoCRM list response shape:
-            { "list": [...], "total": 1234 }
-
         Args:
             offset:   Number of records to skip (0-indexed).
             max_size: Records per request (max 200).
@@ -235,7 +304,6 @@ class EspoClient:
                 "order": "asc",
             },
         )
-        # EspoCRM wraps list responses: { "list": [...], "total": N }
         return response.get("list", []), response.get("total", 0)
 
     async def get_all_tickets(
@@ -244,8 +312,6 @@ class EspoClient:
     ) -> list[dict]:
         """
         Fetch ALL Cases by paginating through every page automatically.
-
-        Uses offset-based pagination until all records are retrieved.
 
         Args:
             max_size: Records per request (max 200).
@@ -256,14 +322,10 @@ class EspoClient:
         all_tickets: list[dict] = []
         offset = 0
 
-        # fetch first page to get total count
         batch, total = await self.get_tickets(offset=offset, max_size=max_size)
         all_tickets.extend(batch)
-        logger.info(
-            "EspoCRM: fetched %d tickets (total: %d)", len(all_tickets), total
-        )
+        logger.info("EspoCRM: fetched %d tickets (total: %d)", len(all_tickets), total)
 
-        # keep fetching until we have everything
         while len(all_tickets) < total:
             offset += max_size
             logger.info("Fetching EspoCRM tickets offset=%d", offset)
@@ -287,8 +349,6 @@ class EspoClient:
         """
         Fetch Cases modified after a given timestamp.
         Used for incremental sync.
-
-        EspoCRM supports filtering via 'where' query parameter.
 
         Args:
             since: ISO 8601 datetime string e.g. "2024-01-01T00:00:00Z"
@@ -327,6 +387,26 @@ class EspoClient:
 
         return all_tickets
 
+    async def update_ticket(self, crm_ticket_id: str, data: dict) -> dict:
+        """
+        Update an existing EspoCRM Case.
+
+        PUT /api/v1/Case/:id
+
+        Accepted fields (send only what changed):
+            status           → e.g. "Assigned", "Pending Input", "Closed"
+            priority         → e.g. "Low", "Normal", "High", "Urgent"
+            assignedUserId   → EspoCRM string UUID of the assigned agent
+
+        Args:
+            crm_ticket_id: EspoCRM Case UUID string.
+            data:          Dict of fields to update (EspoCRM field names).
+
+        Returns:
+            Raw updated Case dict from EspoCRM.
+        """
+        return await self._put(f"/api/v1/Case/{crm_ticket_id}", data)
+
     # ------------------------------------------------------------------
     # Agent (User) endpoints
     # ------------------------------------------------------------------
@@ -334,19 +414,14 @@ class EspoClient:
         """
         Fetch all EspoCRM users whose rolesNames contains "agent".
 
-        Internally calls _get_all_users_with_detail() to get fully-hydrated
-        user records (list endpoint does not include rolesNames), then
-        filters to only those whose rolesNames values contain AGENT_ROLE_KEYWORD.
-
-        GET /api/v1/User  +  GET /api/v1/User/:id per user
-
         Returns:
             Flat list of full user dicts for agents only.
         """
         all_users = await self._get_all_users_with_detail()
 
         agents = [
-            user for user in all_users
+            user
+            for user in all_users
             if any(
                 AGENT_ROLE_KEYWORD in role_name
                 for role_name in (user.get("rolesNames") or {}).values()
@@ -370,19 +445,14 @@ class EspoClient:
         """
         Fetch all EspoCRM users whose rolesNames contains "customer".
 
-        Internally calls _get_all_users_with_detail() to get fully-hydrated
-        user records (list endpoint does not include rolesNames), then
-        filters to only those whose rolesNames values contain CUSTOMER_ROLE_KEYWORD.
-
-        GET /api/v1/User  +  GET /api/v1/User/:id per user
-
         Returns:
             Flat list of full user dicts for customers only.
         """
         all_users = await self._get_all_users_with_detail()
 
         customers = [
-            user for user in all_users
+            user
+            for user in all_users
             if any(
                 CUSTOMER_ROLE_KEYWORD in role_name
                 for role_name in (user.get("rolesNames") or {}).values()
@@ -443,24 +513,11 @@ class EspoClient:
             &where[0][attribute]=type
             &where[0][value]=Post
 
-        EspoCRM's stream endpoint uses the same offset pagination as other endpoints.
-        We paginate until all Posts are retrieved.
-
         Args:
-            crm_ticket_id: EspoCRM Case UUID string (e.g. "699d917f87d8ffe8").
+            crm_ticket_id: EspoCRM Case UUID string.
 
         Returns:
             List of raw stream Post dicts.
-
-        Example response item:
-            {
-                "id": "abc123",
-                "type": "Post",
-                "data": { "post": "The comment text" },
-                "createdByName": "John Agent",
-                "createdAt": "2024-01-15T10:30:00.000Z",
-                "modifiedAt": "2024-01-15T10:30:00.000Z"
-            }
         """
         all_posts: list[dict] = []
         offset = 0
@@ -477,7 +534,6 @@ class EspoClient:
                 },
             )
 
-            # EspoCRM stream returns: { "list": [...], "total": N }
             batch = response.get("list", [])
             total = response.get("total", 0)
 
