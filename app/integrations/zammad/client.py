@@ -34,11 +34,13 @@ ZAMMAD_PAGE_SIZE = 100
 
 class ZammadClientError(Exception):
     """Raised when Zammad API returns an error response."""
+
     pass
 
 
 class ZammadAuthError(ZammadClientError):
     """Raised on 401 / 403 responses."""
+
     pass
 
 
@@ -117,6 +119,32 @@ class ZammadClient:
 
         return response.json()
 
+    async def _put(self, path: str, data: dict) -> Any:
+        """
+        Perform a PUT request and return the parsed JSON response.
+
+        Raises:
+            ZammadAuthError: on 401 / 403
+            ZammadClientError: on any other non-2xx response
+        """
+        client = self._ensure_client()
+        logger.debug("Zammad PUT %s payload=%s", path, data)
+
+        response = await client.put(path, json=data)
+
+        if response.status_code in (401, 403):
+            raise ZammadAuthError(
+                f"Zammad authentication failed ({response.status_code}). "
+                "Check ZAMMAD_API_TOKEN in your .env"
+            )
+        if not response.is_success:
+            raise ZammadClientError(
+                f"Zammad API error {response.status_code} for PUT {path}: "
+                f"{response.text[:300]}"
+            )
+
+        return response.json()
+
     # ------------------------------------------------------------------
     # Ticket endpoints
     # ------------------------------------------------------------------
@@ -189,7 +217,6 @@ class ZammadClient:
                 len(all_tickets),
             )
 
-            # last page — fewer results than requested means no more pages
             if len(batch) < per_page:
                 break
 
@@ -219,6 +246,76 @@ class ZammadClient:
                 "per_page": ZAMMAD_PAGE_SIZE,
             },
         )
+
+    async def update_ticket(self, crm_ticket_id: str | int, data: dict) -> dict:
+        """
+        Update an existing Zammad ticket.
+
+        PUT /api/v1/tickets/:id
+
+        Accepted fields (send only what changed):
+            state    → e.g. "open", "closed", "pending reminder"
+            priority → e.g. "1 low", "2 normal", "3 high"
+            owner_id → integer Zammad user ID of the assigned agent
+
+        Args:
+            crm_ticket_id: Zammad's integer ticket ID (stored as crm_ticket_id).
+            data:          Dict of fields to update (Zammad field names).
+
+        Returns:
+            Raw updated ticket dict from Zammad.
+        """
+        return await self._put(f"/api/v1/tickets/{crm_ticket_id}", data)
+
+    async def get_ticket_field_options(self) -> dict[str, list[str]]:
+        """
+        Fetch the valid field options for tickets from Zammad's dedicated
+        state and priority endpoints.
+
+        Calls:
+            GET /api/v1/ticket_states     → valid state (status) names
+            GET /api/v1/ticket_priorities → valid priority names
+
+        Zammad exposes these as first-class REST resources, unlike EspoCRM
+        which uses a generic metadata endpoint. Each item in the response
+        has a `name` field which is the exact string Zammad accepts in a
+        PUT /api/v1/tickets/:id payload.
+
+        Returns:
+            Dict with two keys:
+            {
+                "state":    ["new", "open", "pending reminder", "closed", ...],
+                "priority": ["1 low", "2 normal", "3 high", ...],
+            }
+
+        Note: state names are lowercased for consistent comparison.
+              priority names are kept as-is (Zammad uses "1 low" format).
+        """
+        states_response = await self._get("/api/v1/ticket_states")
+        priorities_response = await self._get("/api/v1/ticket_priorities")
+
+        # Each response is a list of objects with at least a `name` field:
+        # [{"id": 1, "name": "new", "active": true, ...}, ...]
+        valid_states = [
+            s["name"].lower()
+            for s in states_response
+            if s.get("active", True)  # skip inactive states
+        ]
+        valid_priorities = [
+            p["name"]
+            for p in priorities_response
+            if p.get("active", True)  # skip inactive priorities
+        ]
+
+        logger.debug(
+            "Zammad field options — states: %s | priorities: %s",
+            valid_states,
+            valid_priorities,
+        )
+        return {
+            "state": valid_states,
+            "priority": valid_priorities,
+        }
 
     # ------------------------------------------------------------------
     # Internal helper — fetch ALL users (paginated, no role filter)
@@ -275,14 +372,16 @@ class ZammadClient:
         all_users = await self._get_all_users()
 
         agents = [
-            u for u in all_users
-            if u.get("id") != 1                          # skip system user
-            and AGENT_ROLE_ID in (u.get("role_ids") or [])
+            u
+            for u in all_users
+            if u.get("id") != 1 and AGENT_ROLE_ID in (u.get("role_ids") or [])
         ]
 
         logger.info(
             "Zammad: filtered %d agents (role_id=%d) from %d total users",
-            len(agents), AGENT_ROLE_ID, len(all_users),
+            len(agents),
+            AGENT_ROLE_ID,
+            len(all_users),
         )
         return agents
 
@@ -298,9 +397,6 @@ class ZammadClient:
           - Does NOT have role_id=2 (Agent) — agents are not customers
           - Skips system user id=1
 
-        This prevents agents who also have the Customer role from
-        being synced into the customers table.
-
         Returns flat list of raw user dicts.
         """
         CUSTOMER_ROLE_ID = 3
@@ -308,14 +404,16 @@ class ZammadClient:
         all_users = await self._get_all_users()
 
         customers = [
-            u for u in all_users
-            if u.get("id") != 1                               # skip system user
-            and CUSTOMER_ROLE_ID in (u.get("role_ids") or [])  # has Customer role
+            u
+            for u in all_users
+            if u.get("id") != 1 and CUSTOMER_ROLE_ID in (u.get("role_ids") or [])
         ]
 
         logger.info(
             "Zammad: filtered %d customers (role_id=%d) from %d total users",
-            len(customers), CUSTOMER_ROLE_ID, len(all_users),
+            len(customers),
+            CUSTOMER_ROLE_ID,
+            len(all_users),
         )
         return customers
 
@@ -346,7 +444,7 @@ class ZammadClient:
 
         logger.info("Zammad: fetched %d organizations total", len(all_orgs))
         return all_orgs
-    
+
     async def get_comments_by_ticket(self, crm_ticket_id: str | int) -> list[dict]:
         """
         Fetch all articles (comments) for a Zammad ticket.
@@ -360,24 +458,11 @@ class ZammadClient:
 
         Returns:
             List of raw ticket_article dicts.
-
-        Example response item:
-            {
-                "id": 12,
-                "ticket_id": 6,
-                "type": "note",
-                "body": "Comment text here",
-                "from": "Agent <agent@company.com>",
-                "internal": false,
-                "created_at": "2024-01-15T10:30:00.000Z",
-                "updated_at": "2024-01-15T10:30:00.000Z"
-            }
         """
         path = f"/api/v1/ticket_articles/by_ticket/{crm_ticket_id}"
         logger.debug("Fetching Zammad articles for ticket %s", crm_ticket_id)
         response = await self._get(path)
 
-        # Zammad returns either a list directly or {"ticket_articles": [...]}
         if isinstance(response, list):
             return response
         return response.get("ticket_articles", response.get("articles", []))
