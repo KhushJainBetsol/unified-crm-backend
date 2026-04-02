@@ -552,3 +552,17 @@ class EspoClient:
             crm_ticket_id,
         )
         return all_posts
+
+
+async def post_comment(self, crm_ticket_id: str, body: str, author_name: str) -> dict:
+    """
+    POST /api/v1/Note
+    Creates a stream Post on an EspoCRM Case.
+    """
+    payload = {
+        "type": "Post",
+        "parentId": crm_ticket_id,
+        "parentType": "Case",
+        "post": body,
+    }
+    return await self._post("/api/v1/Note", json=payload)

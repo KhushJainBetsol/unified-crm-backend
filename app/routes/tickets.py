@@ -33,6 +33,7 @@ from app.schemas.ticket import (
 from app.services.comment_service import CommentService
 from app.services.ticket_service import TicketService
 from app.utils.response import paginated, success
+from app.schemas.comment import AddCommentRequest
 
 logger = logging.getLogger(__name__)
 
@@ -345,4 +346,33 @@ async def get_ticket_comments(
         page_size=page_size,
         message="Comments fetched successfully",
     )
-    
+
+
+# ---------------------------------------------------------------------------
+# POST /tickets/{ticket_id}/comments
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/{ticket_id}/comments",
+    summary="Post a comment to a ticket",
+    description=(
+        "Sends the comment to the originating CRM (Zammad or EspoCRM) "
+        "and persists it in the local DB.\n\n"
+        "> `author_name` is supplied by the caller for now. "
+        "It will be replaced by the Keycloak JWT identity once auth is integrated."
+    ),
+    status_code=201,
+)
+async def add_ticket_comment(
+    ticket_id: uuid.UUID,
+    body: AddCommentRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    comment = await CommentService(db).add_comment(
+        ticket_id=ticket_id,
+        text=body.text,
+        author_name=body.author_name,
+        author_email=body.author_email,
+    )
+    return success("Comment posted successfully", _to_comment(comment))

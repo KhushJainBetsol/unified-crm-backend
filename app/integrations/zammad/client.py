@@ -466,3 +466,18 @@ class ZammadClient:
         if isinstance(response, list):
             return response
         return response.get("ticket_articles", response.get("articles", []))
+
+
+async def post_comment(self, crm_ticket_id: str, body: str, author_name: str) -> dict:
+    """
+    POST /api/v1/ticket_articles
+    Creates a public note article on a Zammad ticket.
+    """
+    payload = {
+        "ticket_id": int(crm_ticket_id),
+        "body": body,
+        "content_type": "text/html",
+        "type": "note",
+        "internal": False,
+    }
+    return await self._post("/api/v1/ticket_articles", json=payload)
