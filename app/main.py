@@ -29,6 +29,8 @@ from app.core.settings import get_settings
 from app.routes import sync, tickets, agents, customers, companies
 from app.services.scheduler import run_all_full_sync, start_scheduler, stop_scheduler
 from app.utils.exceptions import register_exception_handlers
+from app.integrations.webhooks.router import router as webhook_router
+from app.integrations.webhooks.seeder import seed_crm_integrations
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -37,6 +39,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Seed lookup tables
 # ---------------------------------------------------------------------------
+
 
 async def seed_lookup_tables() -> None:
     """
@@ -51,29 +54,35 @@ async def seed_lookup_tables() -> None:
         try:
             # source_systems
             if not (await db.execute(select(SourceSystem))).scalars().first():
-                db.add_all([
-                    SourceSystem(system_name="zammad"),
-                    SourceSystem(system_name="espocrm"),
-                ])
+                db.add_all(
+                    [
+                        SourceSystem(system_name="zammad"),
+                        SourceSystem(system_name="espocrm"),
+                    ]
+                )
                 logger.info("Seeded source_systems")
 
             # ticket_status
             if not (await db.execute(select(TicketStatus))).scalars().first():
-                db.add_all([
-                    TicketStatus(status_name="open"),
-                    TicketStatus(status_name="pending"),
-                    TicketStatus(status_name="closed"),
-                ])
+                db.add_all(
+                    [
+                        TicketStatus(status_name="open"),
+                        TicketStatus(status_name="pending"),
+                        TicketStatus(status_name="closed"),
+                    ]
+                )
                 logger.info("Seeded ticket_status")
 
             # ticket_priority
             if not (await db.execute(select(TicketPriority))).scalars().first():
-                db.add_all([
-                    TicketPriority(priority_name="low"),
-                    TicketPriority(priority_name="normal"),
-                    TicketPriority(priority_name="high"),
-                    TicketPriority(priority_name="urgent"),
-                ])
+                db.add_all(
+                    [
+                        TicketPriority(priority_name="low"),
+                        TicketPriority(priority_name="normal"),
+                        TicketPriority(priority_name="high"),
+                        TicketPriority(priority_name="urgent"),
+                    ]
+                )
                 logger.info("Seeded ticket_priority")
 
             await db.commit()
@@ -83,23 +92,28 @@ async def seed_lookup_tables() -> None:
             await db.rollback()
             logger.error("Failed to seed lookup tables: %s", exc)
             raise
+    await seed_crm_integrations()
 
 
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     logger.info(
         "Starting %s v%s [%s]",
-        settings.APP_NAME, settings.APP_VERSION, settings.ENVIRONMENT,
+        settings.APP_NAME,
+        settings.APP_VERSION,
+        settings.ENVIRONMENT,
     )
 
     try:
         await create_tables()
         await seed_lookup_tables()
+        await seed_crm_integrations()
     except OperationalError:
         logger.critical(
             "Startup failed — cannot connect to database. "
@@ -145,16 +159,18 @@ app.add_middleware(
 )
 
 # Routers
-app.include_router(tickets.router,   prefix="/api/v1")
-app.include_router(agents.router,    prefix="/api/v1")
+app.include_router(tickets.router, prefix="/api/v1")
+app.include_router(agents.router, prefix="/api/v1")
 app.include_router(customers.router, prefix="/api/v1")
 app.include_router(companies.router, prefix="/api/v1")
-app.include_router(sync.router,      prefix="/api/v1")
+app.include_router(sync.router, prefix="/api/v1")
+app.include_router(webhook_router)
 
 
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health", tags=["Health"])
 async def health():

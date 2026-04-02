@@ -44,7 +44,15 @@ class Settings(BaseSettings):
     # Zammad
     ZAMMAD_BASE_URL: str = ""
     ZAMMAD_API_TOKEN: str = ""
-    
+
+    WEBHOOK_TENANT_ID: str = ""  # leave empty until Keycloak integrated
+    ESPO_WEBHOOK_UUID: str = ""  # python -c "import uuid; print(uuid.uuid4())"
+    ESPO_SECRET_CASE_CREATE: str = ""
+    ESPO_SECRET_CASE_UPDATE: str = ""
+    ESPO_SECRET_CASE_DELETE: str = ""
+    ZAMMAD_WEBHOOK_UUID: str = ""  # python -c "import uuid; print(uuid.uuid4())"
+    ZAMMAD_WEBHOOK_SECRET: str = ""
+
     SYNC_INTERVAL_MINUTES: int = 15
 
     @property
