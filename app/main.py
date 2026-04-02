@@ -40,7 +40,6 @@ logger = logging.getLogger(__name__)
 # Seed lookup tables
 # ---------------------------------------------------------------------------
 
-
 async def seed_lookup_tables() -> None:
     """
     Insert default values for lookup tables on first run.
@@ -54,36 +53,30 @@ async def seed_lookup_tables() -> None:
         try:
             # source_systems
             if not (await db.execute(select(SourceSystem))).scalars().first():
-                db.add_all(
-                    [
-                        SourceSystem(system_name="zammad"),
-                        SourceSystem(system_name="espocrm"),
-                    ]
-                )
+                db.add_all([
+                    SourceSystem(system_name="zammad"),
+                    SourceSystem(system_name="espocrm"),
+                ])
                 logger.info("Seeded source_systems")
 
-            # ticket_status
+            # ticket_statuses
             if not (await db.execute(select(TicketStatus))).scalars().first():
-                db.add_all(
-                    [
-                        TicketStatus(status_name="open"),
-                        TicketStatus(status_name="pending"),
-                        TicketStatus(status_name="closed"),
-                    ]
-                )
-                logger.info("Seeded ticket_status")
+                db.add_all([
+                    TicketStatus(status_name="open"),
+                    TicketStatus(status_name="pending"),
+                    TicketStatus(status_name="closed"),
+                ])
+                logger.info("Seeded ticket_statuses")
 
-            # ticket_priority
+            # ticket_priorities
             if not (await db.execute(select(TicketPriority))).scalars().first():
-                db.add_all(
-                    [
-                        TicketPriority(priority_name="low"),
-                        TicketPriority(priority_name="normal"),
-                        TicketPriority(priority_name="high"),
-                        TicketPriority(priority_name="urgent"),
-                    ]
-                )
-                logger.info("Seeded ticket_priority")
+                db.add_all([
+                    TicketPriority(priority_name="low"),
+                    TicketPriority(priority_name="normal"),
+                    TicketPriority(priority_name="high"),
+                    TicketPriority(priority_name="urgent"),
+                ])
+                logger.info("Seeded ticket_priorities")
 
             await db.commit()
             logger.info("Lookup tables ready")
@@ -92,13 +85,11 @@ async def seed_lookup_tables() -> None:
             await db.rollback()
             logger.error("Failed to seed lookup tables: %s", exc)
             raise
-    await seed_crm_integrations()
 
 
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -111,9 +102,13 @@ async def lifespan(app: FastAPI):
     )
 
     try:
+        # 1. Database Setup
         await create_tables()
+        
+        # 2. Seeding (Lookup Data + CRM Integrations)
         await seed_lookup_tables()
         await seed_crm_integrations()
+        
     except OperationalError:
         logger.critical(
             "Startup failed — cannot connect to database. "
@@ -121,14 +116,16 @@ async def lifespan(app: FastAPI):
         )
         raise
 
-    # Initial sync on boot, then start recurring scheduler
+    # 3. Background Tasks
     logger.info("Running initial CRM full sync on startup...")
     await run_all_full_sync()
+    
     start_scheduler()
     logger.info("CRM sync scheduler started.")
 
     yield
 
+    # 4. Shutdown
     stop_scheduler()
     logger.info("Shutting down %s", settings.APP_NAME)
 
@@ -170,7 +167,6 @@ app.include_router(webhook_router)
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
-
 
 @app.get("/health", tags=["Health"])
 async def health():
