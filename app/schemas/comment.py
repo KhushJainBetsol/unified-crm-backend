@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class CommentResponse(BaseModel):
@@ -19,11 +19,11 @@ class CommentResponse(BaseModel):
 
     id: uuid.UUID
     ticket_id: uuid.UUID
-    source_system: str          # "zammad" | "espocrm"
+    source_system: str  # "zammad" | "espocrm"
     crm_comment_id: str
 
     body: str | None
-    comment_type: str | None    # "note", "email", "Post", "phone" …
+    comment_type: str | None  # "note", "email", "Post", "phone" …
     author_name: str | None
     author_email: str | None
     is_internal: bool
@@ -32,3 +32,12 @@ class CommentResponse(BaseModel):
     crm_updated_at: datetime | None
 
     model_config = {"from_attributes": True}
+
+
+class AddCommentRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=10_000, description="Comment body")
+    author_name: str = Field(
+        default="Agent",
+        description="Caller supplies this; replace with Keycloak user later",
+    )
+    author_email: str | None = Field(default=None)

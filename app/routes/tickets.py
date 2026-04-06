@@ -381,6 +381,7 @@ from app.schemas.ticket import (
 from app.services.comment_service import CommentService
 from app.services.ticket_service import TicketService
 from app.utils.response import paginated, success
+from app.schemas.comment import AddCommentRequest
 
 logger = logging.getLogger(__name__)
 
