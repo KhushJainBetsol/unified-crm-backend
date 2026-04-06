@@ -467,17 +467,44 @@ class ZammadClient:
             return response
         return response.get("ticket_articles", response.get("articles", []))
 
+    async def _post(self, path: str, data: dict) -> Any:
+        """
+        Perform a POST request and return the parsed JSON response.
 
-async def post_comment(self, crm_ticket_id: str, body: str, author_name: str) -> dict:
-    """
-    POST /api/v1/ticket_articles
-    Creates a public note article on a Zammad ticket.
-    """
-    payload = {
-        "ticket_id": int(crm_ticket_id),
-        "body": body,
-        "content_type": "text/html",
-        "type": "note",
-        "internal": False,
-    }
-    return await self._post("/api/v1/ticket_articles", json=payload)
+        Raises:
+            ZammadAuthError: on 401 / 403
+            ZammadClientError: on any other non-2xx response
+        """
+        client = self._ensure_client()
+        logger.debug("Zammad POST %s payload=%s", path, data)
+
+        response = await client.post(path, json=data)
+
+        if response.status_code in (401, 403):
+            raise ZammadAuthError(
+                f"Zammad authentication failed ({response.status_code}). "
+                "Check ZAMMAD_API_TOKEN in your .env"
+            )
+        if not response.is_success:
+            raise ZammadClientError(
+                f"Zammad API error {response.status_code} for POST {path}: "
+                f"{response.text[:300]}"
+            )
+
+        return response.json()
+
+    async def post_comment(
+        self, crm_ticket_id: str, body: str, author_name: str
+    ) -> dict:
+        """
+        Create a public note article on a Zammad ticket.
+        POST /api/v1/ticket_articles
+        """
+        payload = {
+            "ticket_id": int(crm_ticket_id),
+            "body": body,
+            "content_type": "text/html",
+            "type": "note",
+            "internal": False,
+        }
+        return await self._post("/api/v1/ticket_articles", payload)
