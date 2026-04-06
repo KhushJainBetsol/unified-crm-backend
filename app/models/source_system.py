@@ -39,8 +39,8 @@ class SourceSystem(Base):
     sync_logs: Mapped[list["TicketSyncLog"]] = relationship(  # type: ignore[name-defined]
         "TicketSyncLog", back_populates="source_system"
     )
-    user_source_systems: Mapped[list["UserSourceSystem"]] = relationship(  # type: ignore[name-defined]
-        "UserSourceSystem", back_populates="source_system"
+    tenant_source_systems: Mapped[list["TenantSourceSystem"]] = relationship(  # type: ignore[name-defined]
+        "TenantSourceSystem", back_populates="source_system"
     )
     user_agent_mappings: Mapped[list["UserAgentMapping"]] = relationship(  # type: ignore[name-defined]
         "UserAgentMapping", back_populates="source_system"
