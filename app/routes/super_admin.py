@@ -1,14 +1,15 @@
 """
 app/routes/super_admin.py
 
-Flow 1 — Super Admin Onboards Organisation Admin.
+Super Admin APIs — two separate flows:
 
-POST /super-admin/tenants        → create org + invite first admin
-GET  /super-admin/tenants        → list all tenants
-GET  /super-admin/users          → list all dashboard users
+  POST /super-admin/tenants              → create tenant in DB only (no Keycloak, no invite)
+  POST /super-admin/admins/invite        → invite an admin to an existing tenant (Keycloak + invite token)
+  GET  /super-admin/tenants              → list all tenants
+  GET  /super-admin/admins               → list all admins (dashboard_users with role=admin)
+  GET  /super-admin/users                → list all dashboard users
 
-Super admin is identified by email match (SUPER_ADMIN_EMAIL env var).
-Production: replace with dedicated superadmin role check.
+Super admin is identified by email match (SUPER_ADMIN_EMAIL env var) or is_superadmin flag.
 """
 from __future__ import annotations
 
@@ -27,8 +28,8 @@ from app.core.keycloak_admin import create_keycloak_user
 from app.core.settings import get_settings
 from app.dependencies import get_db
 from app.models.dashboard_user import DashboardUser
-from app.models.tenant import Tenant
 from app.models.invitation import Invitation
+from app.models.tenant import Tenant
 from app.models.tenant_realm import TenantRealm
 
 settings = get_settings()
@@ -48,7 +49,14 @@ def _require_super_admin(user: CurrentUser) -> None:
 # ---------------------------------------------------------------------------
 
 class CreateTenantRequest(BaseModel):
+    """Only tenant info — no admin details."""
     name: str
+    contact_email: EmailStr  # stored for reference, not used to create a user
+
+
+class InviteAdminRequest(BaseModel):
+    """Invite an admin to an already-existing tenant."""
+    tenant_id: uuid.UUID
     admin_email: EmailStr
     admin_first_name: str = "Admin"
     admin_last_name: str = "User"
@@ -56,7 +64,7 @@ class CreateTenantRequest(BaseModel):
 
 # ---------------------------------------------------------------------------
 # POST /super-admin/tenants
-# Flow 1 Part A — Super Admin creates org and invites org admin
+# ONLY inserts tenant into DB — no Keycloak, no invite.
 # ---------------------------------------------------------------------------
 
 @router.post("/tenants", status_code=status.HTTP_201_CREATED)
@@ -66,15 +74,17 @@ async def create_tenant(
     user: CurrentUser = Depends(get_current_user),
 ):
     """
-    Flow 1 — Super Admin creates an organisation and sends first admin invite.
+    Create a new tenant organisation in the database.
 
-    Steps (from Flow 1 diagram):
-      1. Generate slug from org name (ACME Corp → acme-corp)
-      2. Create tenant in DB
-      3. Seed shared tenant_realms row (unified-crm realm)
-      4. Create Keycloak user for org admin in unified-crm realm
-      5. Generate one-time invite token (24h expiry)
-      6. Return invite link
+    This endpoint ONLY creates the tenant row. No Keycloak user is created
+    and no invitation is sent — use POST /super-admin/admins/invite for that.
+
+    Steps:
+      1. Generate URL-friendly slug from tenant name
+      2. Check slug uniqueness
+      3. Insert tenant row
+      4. Seed shared TenantRealm row (idempotent)
+      5. Return the new tenant
     """
     _require_super_admin(user)
 
@@ -82,6 +92,7 @@ async def create_tenant(
     slug = body.name.lower().replace(" ", "-").replace("_", "-")
     slug = "".join(c for c in slug if c.isalnum() or c == "-")
 
+    # Step 2 — uniqueness check
     existing = await db.execute(select(Tenant).where(Tenant.slug == slug))
     if existing.scalars().first():
         raise HTTPException(
@@ -89,25 +100,97 @@ async def create_tenant(
             f"Organisation slug '{slug}' already exists",
         )
 
-    # Step 2 — tenant
+    # Step 3 — insert tenant
     tenant = Tenant(name=body.name, slug=slug)
     db.add(tenant)
-    await db.flush()  # get tenant.id
+    await db.flush()  # populate tenant.id
 
-    # Step 3 — seed shared realm (only once)
+    # Step 4 — seed shared realm (idempotent)
     existing_realm = await db.execute(
         select(TenantRealm).where(TenantRealm.realm_name == settings.KEYCLOAK_REALM)
     )
     if not existing_realm.scalars().first():
         realm = TenantRealm(
-            tenant_id=None,  # NULL = shared realm
+            tenant_id=None,
             realm_name=settings.KEYCLOAK_REALM,
             issuer_url=f"{settings.KEYCLOAK_URL}/realms/{settings.KEYCLOAK_REALM}",
             is_active=True,
         )
         db.add(realm)
 
-    # Step 4 — Keycloak user for org admin
+    await db.commit()
+
+    logger.info("Created tenant '%s' (id=%s)", slug, tenant.id)
+
+    return {
+        "tenant": {
+            "id": str(tenant.id),
+            "name": tenant.name,
+            "slug": tenant.slug,
+            "is_active": tenant.is_active,
+            "created_at": tenant.created_at,
+        },
+        "message": (
+            f"Tenant '{tenant.name}' created. "
+            "Use POST /super-admin/admins/invite to invite an admin."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /super-admin/admins/invite
+# Creates Keycloak user + one-time invite token for an existing tenant.
+# ---------------------------------------------------------------------------
+
+@router.post("/admins/invite", status_code=status.HTTP_201_CREATED)
+async def invite_admin(
+    body: InviteAdminRequest,
+    db: AsyncSession = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Invite an admin to an already-existing tenant.
+
+    Steps:
+      1. Verify tenant exists and is active
+      2. Check no duplicate active (pending + non-expired) invite
+      3. Create Keycloak user in the shared realm
+      4. Generate one-time invite token (24 h expiry) and store it
+      5. Return the invite link
+    """
+    _require_super_admin(user)
+
+    # Step 1 — tenant must exist and be active
+    tenant_result = await db.execute(
+        select(Tenant).where(Tenant.id == body.tenant_id)
+    )
+    tenant = tenant_result.scalars().first()
+    if not tenant:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"Tenant '{body.tenant_id}' not found",
+        )
+    if not tenant.is_active:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Tenant '{tenant.name}' is not active",
+        )
+
+    # Step 2 — no duplicate active invite
+    dup = await db.execute(
+        select(Invitation)
+        .where(Invitation.email == body.admin_email)
+        .where(Invitation.tenant_id == tenant.id)
+        .where(Invitation.status == "pending")
+        .where(Invitation.expires_at > datetime.utcnow())
+    )
+    if dup.scalars().first():
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"An active invite already exists for '{body.admin_email}' in this tenant",
+        )
+
+    # Step 3 — create Keycloak user
     try:
         await create_keycloak_user(
             email=body.admin_email,
@@ -122,7 +205,7 @@ async def create_tenant(
     except Exception as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Keycloak error: {e}")
 
-    # Step 5 — invite token
+    # Step 4 — invite token
     invite_token = secrets.token_urlsafe(32)
     invitation = Invitation(
         tenant_id=tenant.id,
@@ -137,13 +220,16 @@ async def create_tenant(
     await db.commit()
 
     invite_link = f"{settings.FRONTEND_URL}/invite?token={invite_token}"
-    logger.info("Created tenant %s, invite sent to %s", slug, body.admin_email)
+    logger.info("Admin invite → '%s' for tenant '%s'", body.admin_email, tenant.slug)
 
     return {
         "tenant": {"id": str(tenant.id), "name": tenant.name, "slug": tenant.slug},
         "admin_email": body.admin_email,
         "invite_link": invite_link,
-        "message": f"Tenant created. Send this invite link to {body.admin_email}",
+        "message": (
+            f"Invitation sent to {body.admin_email}. "
+            "Link expires in 24 hours."
+        ),
     }
 
 
@@ -156,10 +242,9 @@ async def list_tenants(
     db: AsyncSession = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
 ):
-    """List all active tenants."""
+    """List all tenants."""
     _require_super_admin(user)
-    result = await db.execute(select(Tenant).where(Tenant.is_active == True))  # noqa: E712
-    tenants = result.scalars().all()
+    result = await db.execute(select(Tenant))
     return [
         {
             "id": str(t.id),
@@ -168,7 +253,35 @@ async def list_tenants(
             "is_active": t.is_active,
             "created_at": t.created_at,
         }
-        for t in tenants
+        for t in result.scalars().all()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# GET /super-admin/admins
+# All dashboard users with role=admin across all tenants.
+# ---------------------------------------------------------------------------
+
+@router.get("/admins")
+async def list_admins(
+    db: AsyncSession = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """List all admin-role users across all tenants."""
+    _require_super_admin(user)
+    result = await db.execute(
+        select(DashboardUser).where(DashboardUser.role == "admin")
+    )
+    return [
+        {
+            "id": str(a.id),
+            "email": a.email,
+            "role": a.role,
+            "tenant_id": str(a.tenant_id),
+            "is_active": a.is_active,
+            "created_at": a.created_at,
+        }
+        for a in result.scalars().all()
     ]
 
 
@@ -184,7 +297,6 @@ async def list_all_users(
     """List all dashboard users across all tenants."""
     _require_super_admin(user)
     result = await db.execute(select(DashboardUser))
-    users = result.scalars().all()
     return [
         {
             "id": str(u.id),
@@ -193,5 +305,5 @@ async def list_all_users(
             "tenant_id": str(u.tenant_id),
             "is_active": u.is_active,
         }
-        for u in users
+        for u in result.scalars().all()
     ]
