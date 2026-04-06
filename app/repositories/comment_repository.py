@@ -104,7 +104,7 @@ class CommentRepository:
         Used by upsert to decide insert vs update.
         """
         q = (
-            select(TicketComment)
+            _base_query()  # fixed: was select(TicketComment), missing joinedload
             .where(
                 TicketComment.crm_comment_id == crm_comment_id,
                 TicketComment.source_system_id == source_system_id,
@@ -137,23 +137,23 @@ class CommentRepository:
         All fields are updated on every sync run so that edits propagate.
 
         Returns:
-            The inserted or updated TicketComment ORM object.
+            The inserted or updated TicketComment ORM object,
+            with source_system relationship fully loaded.
         """
         existing = await self.get_by_crm_id(crm_comment_id, source_system_id)
 
         if existing:
-            # Update mutable fields
-            existing.ticket_id     = ticket_id
-            existing.body          = body
-            existing.comment_type  = comment_type
-            existing.author_name   = author_name
-            existing.author_email  = author_email
-            existing.is_internal   = is_internal
+            existing.ticket_id      = ticket_id
+            existing.body           = body
+            existing.comment_type   = comment_type
+            existing.author_name    = author_name
+            existing.author_email   = author_email
+            existing.is_internal    = is_internal
             existing.crm_created_at = crm_created_at
             existing.crm_updated_at = crm_updated_at
             self.db.add(existing)
             logger.debug("Updated comment crm_id=%s", crm_comment_id)
-            return existing
+            return existing  # source_system already loaded via get_by_crm_id
 
         comment = TicketComment(
             id=uuid.uuid4(),
@@ -169,6 +169,8 @@ class CommentRepository:
             crm_updated_at=crm_updated_at,
         )
         self.db.add(comment)
+        await self.db.flush()                              
+        await self.db.refresh(comment, ["source_system"]) 
         logger.debug("Inserted comment crm_id=%s", crm_comment_id)
         return comment
 
