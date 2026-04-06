@@ -13,13 +13,16 @@ Responsibilities:
 
 Routes call get_comments_for_ticket().
 Sync endpoints call sync_comments_for_ticket().
+Post endpoints call add_comment().
 """
 
 from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime, timezone
 
+import httpx
 from fastapi import HTTPException
 from fastapi import status as http_status
 from sqlalchemy import select
@@ -48,9 +51,7 @@ class CommentService:
     # ------------------------------------------------------------------
 
     async def _get_ticket_or_404(self, ticket_id: uuid.UUID) -> Ticket:
-        result = await self.db.execute(
-            select(Ticket).where(Ticket.id == ticket_id)
-        )
+        result = await self.db.execute(select(Ticket).where(Ticket.id == ticket_id))
         ticket = result.scalars().first()
         if not ticket:
             raise HTTPException(
@@ -67,6 +68,118 @@ class CommentService:
         if not row:
             raise ValueError(f"Source system '{name}' not in DB")
         return row.id
+
+    async def _get_source_or_500(self, source_system_id: int) -> SourceSystem:
+        """Load a SourceSystem row or raise 500 — ticket data is inconsistent if missing."""
+        result = await self.db.execute(
+            select(SourceSystem).where(SourceSystem.id == source_system_id)
+        )
+        source = result.scalars().first()
+        if not source:
+            raise HTTPException(
+                status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Ticket has no source system configured",
+            )
+        return source
+
+    async def _post_to_crm(
+        self,
+        system_name: str,
+        crm_ticket_id: str,
+        text: str,
+        author_name: str,
+    ) -> str:
+        """
+        Dispatch comment to the correct CRM client.
+
+        Wraps ALL exceptions into clean HTTPExceptions so FastAPI's
+        error handler always fires — which means CORS middleware always
+        gets to add its headers. A bare unhandled exception produces a
+        raw 500 that bypasses middleware, stripping CORS headers and
+        confusing the browser into reporting a CORS error.
+        """
+        try:
+            if system_name == "zammad":
+                return await self._post_zammad(crm_ticket_id, text, author_name)
+
+            if system_name == "espocrm":
+                return await self._post_espo(crm_ticket_id, text, author_name)
+
+            # Unsupported CRM — clean 400, not a 500
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=f"Posting comments not supported for CRM: {system_name}",
+            )
+
+        except HTTPException:
+            raise  # already a clean HTTP error — let FastAPI handle it
+
+        except httpx.TimeoutException:
+            logger.warning(
+                "CRM timeout | crm=%s crm_ticket=%s", system_name, crm_ticket_id
+            )
+            raise HTTPException(
+                status_code=http_status.HTTP_502_BAD_GATEWAY,
+                detail=f"{system_name} timed out. Try again in a moment.",
+            )
+
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "CRM HTTP error | crm=%s status=%s body=%.200s",
+                system_name,
+                exc.response.status_code,
+                exc.response.text,
+            )
+            raise HTTPException(
+                status_code=http_status.HTTP_502_BAD_GATEWAY,
+                detail=f"{system_name} rejected the comment (HTTP {exc.response.status_code}).",
+            )
+
+        except Exception:
+            # Catch-all: log the full traceback server-side, return a safe
+            # 502 to the client. This is what was causing the CORS-less 500 —
+            # unhandled exceptions skip middleware entirely.
+            logger.exception(
+                "Unexpected CRM error | crm=%s crm_ticket=%s",
+                system_name,
+                crm_ticket_id,
+            )
+            raise HTTPException(
+                status_code=http_status.HTTP_502_BAD_GATEWAY,
+                detail="Could not reach the CRM. The comment was not posted.",
+            )
+
+    async def _post_zammad(
+        self,
+        crm_ticket_id: str,
+        text: str,
+        author_name: str,
+    ) -> str:
+        from app.integrations.zammad.client import ZammadClient
+
+        async with ZammadClient() as client:
+            response = await client.post_comment(
+                crm_ticket_id=crm_ticket_id,
+                body=text,
+                author_name=author_name,
+            )
+        return str(response.get("id") or f"local-{uuid.uuid4()}")
+
+    async def _post_espo(
+        self,
+        crm_ticket_id: str,
+        text: str,
+        author_name: str,
+    ) -> str:
+        from app.integrations.espo.client import EspoClient
+
+        async with EspoClient() as client:
+            response = await client.post_comment(
+                crm_ticket_id=crm_ticket_id,
+                body=text,
+                author_name=author_name,
+            )
+        return str(response.get("id") or f"local-{uuid.uuid4()}")
 
     # ------------------------------------------------------------------
     # READ — paginated list for API
@@ -103,14 +216,12 @@ class CommentService:
         Fetch all articles from Zammad for crm_ticket_id,
         normalize them, and upsert into the DB.
 
-        Args:
-            ticket_id:     Internal UUID of the ticket in our DB.
-            crm_ticket_id: Zammad's integer ticket id (as string).
-
         Returns:
             Number of comments upserted.
         """
-        from app.integrations.normalizer.comment_normalizer import extract_first_zammad_body
+        from app.integrations.normalizer.comment_normalizer import (
+            extract_first_zammad_body,
+        )
         from app.integrations.zammad.client import ZammadClient
 
         source_system_id = await self._get_source_system_id("zammad")
@@ -145,10 +256,7 @@ class CommentService:
             )
             count += 1
 
-        logger.info(
-            "Zammad comment sync: upserted %d comments for ticket %s",
-            count, ticket_id,
-        )
+        logger.info("Zammad sync: upserted %d comments for ticket %s", count, ticket_id)
         return count
 
     # ------------------------------------------------------------------
@@ -163,10 +271,6 @@ class CommentService:
         """
         Fetch all stream Posts from EspoCRM for crm_ticket_id,
         normalize them, and upsert into the DB.
-
-        Args:
-            ticket_id:     Internal UUID of the ticket in our DB.
-            crm_ticket_id: EspoCRM Case UUID string.
 
         Returns:
             Number of comments upserted.
@@ -197,8 +301,7 @@ class CommentService:
             count += 1
 
         logger.info(
-            "EspoCRM comment sync: upserted %d comments for ticket %s",
-            count, ticket_id,
+            "EspoCRM sync: upserted %d comments for ticket %s", count, ticket_id
         )
         return count
 
@@ -211,36 +314,81 @@ class CommentService:
         Fetch the ticket, determine its source system, then sync comments
         from the correct CRM automatically.
 
-        This is what the sync endpoint calls — no need to pass source manually.
-
         Returns:
             Total number of comments upserted.
         """
         ticket = await self._get_ticket_or_404(ticket_id)
-
-        # Load source system name
-        result = await self.db.execute(
-            select(SourceSystem).where(SourceSystem.id == ticket.source_system_id)
-        )
-        source = result.scalars().first()
-        if not source:
-            raise HTTPException(
-                status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Ticket has no source system",
-            )
+        source = await self._get_source_or_500(ticket.source_system_id)
 
         if source.system_name == "zammad":
             return await self.sync_zammad_comments(
                 ticket_id=ticket_id,
                 crm_ticket_id=ticket.crm_ticket_id,
             )
-        elif source.system_name == "espocrm":
+        if source.system_name == "espocrm":
             return await self.sync_espo_comments(
                 ticket_id=ticket_id,
                 crm_ticket_id=ticket.crm_ticket_id,
             )
-        else:
-            raise HTTPException(
-                status_code=http_status.HTTP_400_BAD_REQUEST,
-                detail=f"Comment sync not supported for source: {source.system_name}",
-            )
+
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"Comment sync not supported for source: {source.system_name}",
+        )
+
+    # ------------------------------------------------------------------
+    # WRITE — post a new comment from the dashboard to the CRM + DB
+    # ------------------------------------------------------------------
+
+    async def add_comment(
+        self,
+        ticket_id: uuid.UUID,
+        text: str,
+        author_name: str = "Agent",
+        author_email: str | None = None,
+    ) -> TicketComment:
+        """
+        Post a new comment to the originating CRM and persist it in our DB.
+
+        Flow:
+            1. Load ticket → resolve crm_ticket_id + source system
+            2. POST to the correct CRM via _post_to_crm (all errors caught → 502)
+            3. Upsert the new comment into our DB
+            4. Return the saved TicketComment row
+
+        Raises:
+            404 – ticket not found
+            400 – unsupported CRM
+            502 – CRM rejected or failed to respond
+        """
+        ticket = await self._get_ticket_or_404(ticket_id)
+        source = await self._get_source_or_500(ticket.source_system_id)
+
+        crm_comment_id = await self._post_to_crm(
+            system_name=source.system_name,
+            crm_ticket_id=ticket.crm_ticket_id,
+            text=text,
+            author_name=author_name,
+        )
+
+        now = datetime.now(timezone.utc)
+        comment = await self.repo.upsert(
+            ticket_id=ticket_id,
+            source_system_id=source.id,  # already loaded — no second DB call
+            crm_comment_id=crm_comment_id,
+            body=text,
+            comment_type="note",
+            author_name=author_name,
+            author_email=author_email,
+            is_internal=False,
+            crm_created_at=now,
+            crm_updated_at=now,
+        )
+
+        logger.info(
+            "Comment posted | crm_id=%s ticket=%s crm=%s",
+            crm_comment_id,
+            ticket_id,
+            source.system_name,
+        )
+        return comment
