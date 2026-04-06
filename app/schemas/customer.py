@@ -53,7 +53,7 @@
 #     model_config = {"from_attributes": True}
 from __future__ import annotations
 from uuid import UUID
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 
 
 class CustomerCreate(BaseModel):
@@ -74,6 +74,14 @@ class CustomerResponse(BaseModel):
     email: str | None
     phone: str | None
     crm_customer_id: str
-    source_system_id: int
+    source_system: str
+
+    model_config = {"from_attributes": True}
+
+class CustomerBriefResponse(BaseModel):
+    """Lightweight customer info — used when nested inside ticket responses."""
+    id: UUID
+    name: str
+    email: EmailStr | None
 
     model_config = {"from_attributes": True}

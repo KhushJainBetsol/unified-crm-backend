@@ -670,6 +670,8 @@ CRM ID → Internal UUID resolution:
 
   If an agent / customer / company is not yet in the DB the field is set to NULL
   and a warning is logged. Run the respective sync first to populate those tables.
+
+  tenant_id is stored as NULL for now — isolation logic not yet decided.
 """
 
 from __future__ import annotations
@@ -712,11 +714,11 @@ class SyncService:
         # In-memory caches — populated on first lookup, reused per sync run
         # key pattern: (crm_id_string, source_system_id) → internal UUID
         # ----------------------------------------------------------------
-        self._status_cache:   dict[str, int]                  = {}
-        self._priority_cache: dict[str, int]                  = {}
+        self._status_cache:   dict[str, int]                        = {}
+        self._priority_cache: dict[str, int]                        = {}
         self._agent_cache:    dict[tuple[str, int], uuid.UUID | None] = {}
         self._customer_cache: dict[tuple[str, int], uuid.UUID | None] = {}
-        self._company_cache:  dict[tuple[str, int], tuple[uuid.UUID | None, uuid.UUID | None]] = {}
+        self._company_cache:  dict[tuple[str, int], uuid.UUID | None] = {}
 
     # ------------------------------------------------------------------
     # Source system
@@ -727,9 +729,7 @@ class SyncService:
         )
         source = result.scalars().first()
         if not source:
-            logger.error(
-                "Source system '%s' not found in DB — make sure it is seeded", name
-            )
+            logger.error("Source system '%s' not found in DB — make sure it is seeded", name)
         return source.id if source else None
 
     # ------------------------------------------------------------------
@@ -766,9 +766,7 @@ class SyncService:
             return self._priority_cache[name]
 
         result = await self.db.execute(
-            select(TicketPriority).where(
-                TicketPriority.priority_name == name.lower()
-            )
+            select(TicketPriority).where(TicketPriority.priority_name == name.lower())
         )
         priority = result.scalars().first()
 
@@ -778,9 +776,7 @@ class SyncService:
         return None
 
     # ------------------------------------------------------------------
-    # Agent — crm_agent_id is a string regardless of CRM
-    #   Zammad:  owner_id     = 4        → stored as "4"
-    #   EspoCRM: assignedUserId = "abc"  → stored as "abc"
+    # Agent
     # ------------------------------------------------------------------
     async def _get_agent_uuid(
         self,
@@ -801,22 +797,18 @@ class SyncService:
             )
         )
         agent = result.scalars().first()
-
         internal_id = agent.id if agent else None
         self._agent_cache[cache_key] = internal_id
 
         if not internal_id:
             logger.warning(
-                "Agent crm_id=%r source=%d not found — "
-                "agent_id will be NULL. Sync agents first.",
+                "Agent crm_id=%r source=%d not found — agent_id will be NULL.",
                 crm_agent_id, source_system_id,
             )
         return internal_id
 
     # ------------------------------------------------------------------
-    # Customer — crm_customer_id is a string regardless of CRM
-    #   Zammad:  customer_id  = 8        → stored as "8"
-    #   EspoCRM: contactId    = "xyz"    → stored as "xyz"
+    # Customer
     # ------------------------------------------------------------------
     async def _get_customer_uuid(
         self,
@@ -837,33 +829,27 @@ class SyncService:
             )
         )
         customer = result.scalars().first()
-
         internal_id = customer.id if customer else None
         self._customer_cache[cache_key] = internal_id
 
         if not internal_id:
             logger.warning(
-                "Customer crm_id=%r source=%d not found — "
-                "customer_id will be NULL. Sync customers first.",
+                "Customer crm_id=%r source=%d not found — customer_id will be NULL.",
                 crm_customer_id, source_system_id,
             )
         return internal_id
 
     # ------------------------------------------------------------------
-    # Company — crm_company_id is a string regardless of CRM
-    #   Zammad:  organization_id = 2     → stored as "2"
-    #   EspoCRM: accountId       = "aaa" → stored as "aaa"
-    # Returns (company_id, tenant_id) — tenant_id is derived from the
-    # company row since tickets don't carry tenant in the CRM payload.
+    # Company — returns just the company UUID.
+    # tenant_id is stored as NULL for now.
     # ------------------------------------------------------------------
     async def _get_company_uuid(
         self,
         crm_company_id: str | None,
         source_system_id: int,
-    ) -> tuple[uuid.UUID | None, uuid.UUID | None]:
-        """Returns (company_id, tenant_id)."""
+    ) -> uuid.UUID | None:
         if not crm_company_id:
-            return None, None
+            return None
 
         cache_key = (crm_company_id, source_system_id)
         if cache_key in self._company_cache:
@@ -876,19 +862,15 @@ class SyncService:
             )
         )
         company = result.scalars().first()
+        internal_id = company.id if company else None
+        self._company_cache[cache_key] = internal_id
 
-        if company:
-            value = (company.id, company.tenant_id)
-        else:
-            value = (None, None)
+        if not internal_id:
             logger.warning(
-                "Company crm_id=%r source=%d not found — "
-                "company_id and tenant_id will be NULL. Sync companies first.",
+                "Company crm_id=%r source=%d not found — company_id will be NULL.",
                 crm_company_id, source_system_id,
             )
-
-        self._company_cache[cache_key] = value
-        return value
+        return internal_id
 
     # ------------------------------------------------------------------
     # Save single ticket
@@ -902,11 +884,10 @@ class SyncService:
         agent_id: uuid.UUID | None,
         customer_id: uuid.UUID | None,
         company_id: uuid.UUID | None,
-        tenant_id: uuid.UUID | None,
     ) -> bool:
         """Upsert one normalized ticket. Returns True if created, False if updated."""
         data = {
-            "tenant_id": tenant_id,       # derived from company.tenant_id
+            "tenant_id": None,            # NULL for now — isolation logic not yet decided
             "title": ticket.title,
             "description": ticket.description,
             "status_id": status_id,
@@ -940,20 +921,12 @@ class SyncService:
         Resolve all FK IDs and upsert a list of NormalizedTickets into the DB.
 
         Resolution order per ticket:
-          1. status_id     — from ticket_status table (required, falls back to open)
-          2. priority_id   — from ticket_priority table (optional, NULL if not found)
-          3. agent_id      — from agents table by (crm_agent_id, source_system_id)
-          4. customer_id   — from customers table by (crm_customer_id, source_system_id)
-          5. company_id    — from companies table by (crm_company_id, source_system_id)
-          6. tenant_id     — derived from company.tenant_id (not from CRM payload)
-                             ticket is skipped if tenant_id cannot be resolved.
-
-        Args:
-            normalized_tickets: List from ZammadService or EspoService.
-            source_system:      "zammad" or "espocrm".
-
-        Returns:
-            SyncResult with counts.
+          1. status_id    — from ticket_status table (required, falls back to open)
+          2. priority_id  — from ticket_priority table (optional)
+          3. agent_id     — from agents table by (crm_agent_id, source_system_id)
+          4. customer_id  — from customers table by (crm_customer_id, source_system_id)
+          5. company_id   — from companies table by (crm_company_id, source_system_id)
+          6. tenant_id    — NULL for now (isolation logic not yet decided)
         """
         result = SyncResult(
             source_system=source_system,
@@ -979,7 +952,6 @@ class SyncService:
 
         for ticket in normalized_tickets:
             try:
-                # ---- required ----
                 status_id = await self._get_status_id(ticket.status)
                 if not status_id:
                     logger.error(
@@ -989,20 +961,10 @@ class SyncService:
                     result.failed += 1
                     continue
 
-                # ---- optional FK resolutions ----
-                priority_id           = await self._get_priority_id(ticket.priority)
-                agent_id              = await self._get_agent_uuid(ticket.crm_agent_id, source_system_id)
-                customer_id           = await self._get_customer_uuid(ticket.crm_customer_id, source_system_id)
-                company_id, tenant_id = await self._get_company_uuid(ticket.crm_company_id, source_system_id)
-
-                if not tenant_id:
-                    logger.warning(
-                        "Ticket %s has no resolvable tenant_id — "
-                        "company not found or company has no tenant. Skipping.",
-                        ticket.crm_ticket_id,
-                    )
-                    result.failed += 1
-                    continue
+                priority_id = await self._get_priority_id(ticket.priority)
+                agent_id    = await self._get_agent_uuid(ticket.crm_agent_id, source_system_id)
+                customer_id = await self._get_customer_uuid(ticket.crm_customer_id, source_system_id)
+                company_id  = await self._get_company_uuid(ticket.crm_company_id, source_system_id)
 
                 created = await self._save_ticket(
                     ticket=ticket,
@@ -1012,7 +974,6 @@ class SyncService:
                     agent_id=agent_id,
                     customer_id=customer_id,
                     company_id=company_id,
-                    tenant_id=tenant_id,
                 )
 
                 if created:
@@ -1021,10 +982,7 @@ class SyncService:
                     result.updated += 1
 
             except Exception as exc:
-                logger.error(
-                    "Failed to save ticket %s: %s",
-                    ticket.crm_ticket_id, exc,
-                )
+                logger.error("Failed to save ticket %s: %s", ticket.crm_ticket_id, exc)
                 result.failed += 1
 
         logger.info(

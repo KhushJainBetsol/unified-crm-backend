@@ -224,7 +224,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, EmailStr
 
 from app.schemas.agent import AgentBriefResponse
 from app.schemas.company import CompanyBriefResponse

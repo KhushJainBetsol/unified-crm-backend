@@ -132,7 +132,7 @@ def _to_response(customer) -> dict:
         name=customer.name,
         email=customer.email,
         phone=customer.phone,
-        company_id=customer.company_id,
+        #company_id=customer.company_id,
     ).model_dump()
 
 
