@@ -1,16 +1,12 @@
 """
-app/main.py
+app/main.py  — UPDATED for multitenancy
 
-FastAPI application entry point.
+Changes from original:
+  + Import and register auth, invitations, super_admin routers
+  + Seed tenant_realms table on startup (shared unified-crm realm)
+  + Import new tenant models so create_all picks them up
 
-Startup sequence:
-  1. Configure logging
-  2. Register global exception handlers
-  3. Create all DB tables
-  4. Seed lookup tables if empty
-  5. Run initial full CRM sync
-  6. Start scheduled CRM sync
-  7. Register routers
+All existing startup logic (sync, scheduler, lookup seeding) is UNTOUCHED.
 """
 
 from __future__ import annotations
@@ -20,36 +16,35 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError
 
 from app.core.database import async_session_maker, create_tables
 from app.core.logging import configure_logging
 from app.core.settings import get_settings
+# Existing routers
 from app.routes import sync, tickets, agents, customers, companies
+# NEW routers
+from app.routes.auth import router as auth_router
+from app.routes.invitations import router as invitations_router
+from app.routes.super_admin import router as super_admin_router
 from app.services.scheduler import run_all_full_sync, start_scheduler, stop_scheduler
 from app.utils.exceptions import register_exception_handlers
 from app.integrations.webhooks.router import router as webhook_router
+from app.integrations.webhooks.seeder import seed_crm_integrations
+
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Seed lookup tables
-# ---------------------------------------------------------------------------
-
 async def seed_lookup_tables() -> None:
-    """
-    Insert default values for lookup tables on first run.
-    Safe to call on every startup — skips if data already exists.
-    """
+    """Unchanged from original — inserts source_systems, ticket_status, ticket_priority."""
     from app.models.source_system import SourceSystem
     from app.models.ticket_priority import TicketPriority
     from app.models.ticket_status import TicketStatus
 
     async with async_session_maker() as db:
         try:
-            # source_systems
             if not (await db.execute(select(SourceSystem))).scalars().first():
                 db.add_all([
                     SourceSystem(system_name="zammad"),
@@ -57,7 +52,6 @@ async def seed_lookup_tables() -> None:
                 ])
                 logger.info("Seeded source_systems")
 
-            # ticket_status
             if not (await db.execute(select(TicketStatus))).scalars().first():
                 db.add_all([
                     TicketStatus(status_name="open"),
@@ -66,7 +60,6 @@ async def seed_lookup_tables() -> None:
                 ])
                 logger.info("Seeded ticket_status")
 
-            # ticket_priority
             if not (await db.execute(select(TicketPriority))).scalars().first():
                 db.add_all([
                     TicketPriority(priority_name="low"),
@@ -78,28 +71,58 @@ async def seed_lookup_tables() -> None:
 
             await db.commit()
             logger.info("Lookup tables ready")
-
         except Exception as exc:
             await db.rollback()
             logger.error("Failed to seed lookup tables: %s", exc)
             raise
 
 
-# ---------------------------------------------------------------------------
-# Lifespan
-# ---------------------------------------------------------------------------
+async def seed_tenant_realms() -> None:
+    """
+    NEW — Seeds the shared Keycloak realm into tenant_realms on first boot.
+    Safe to call on every startup — skips if already seeded.
+    """
+    async with async_session_maker() as db:
+        try:
+            result = await db.execute(
+                text("SELECT id FROM tenant_realms WHERE realm_name = :realm"),
+                {"realm": settings.KEYCLOAK_REALM},
+            )
+            if not result.fetchone():
+                await db.execute(
+                    text("""
+                        INSERT INTO tenant_realms (id, tenant_id, realm_name, issuer_url, is_active, created_at)
+                        VALUES (gen_random_uuid(), NULL, :realm, :issuer, true, now())
+                    """),
+                    {
+                        "realm": settings.KEYCLOAK_REALM,
+                        "issuer": f"{settings.KEYCLOAK_URL}/realms/{settings.KEYCLOAK_REALM}",
+                    },
+                )
+                await db.commit()
+                logger.info("Seeded tenant_realms with realm: %s", settings.KEYCLOAK_REALM)
+            else:
+                logger.info("tenant_realms already seeded")
+        except Exception as exc:
+            logger.error("Failed to seed tenant_realms: %s", exc)
+            # Don't raise — app can still run, auth will fail gracefully
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     logger.info(
         "Starting %s v%s [%s]",
-        settings.APP_NAME, settings.APP_VERSION, settings.ENVIRONMENT,
+        settings.APP_NAME,
+        settings.APP_VERSION,
+        settings.ENVIRONMENT,
     )
 
     try:
         await create_tables()
         await seed_lookup_tables()
+        await seed_crm_integrations()
+        await seed_tenant_realms()         # NEW
     except OperationalError:
         logger.critical(
             "Startup failed — cannot connect to database. "
@@ -107,7 +130,6 @@ async def lifespan(app: FastAPI):
         )
         raise
 
-    # Initial sync on boot, then start recurring scheduler
     logger.info("Running initial CRM full sync on startup...")
     await run_all_full_sync()
     start_scheduler()
@@ -119,10 +141,6 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down %s", settings.APP_NAME)
 
 
-# ---------------------------------------------------------------------------
-# App instance
-# ---------------------------------------------------------------------------
-
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
@@ -132,10 +150,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Global exception handlers — must be registered before any routes
 register_exception_handlers(app)
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins_list,
@@ -144,18 +160,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
-app.include_router(tickets.router,   prefix="/api/v1")
-app.include_router(agents.router,    prefix="/api/v1")
+# ── Routers ────────────────────────────────────────────────────────────────
+# NEW auth routers
+app.include_router(auth_router, prefix="/api/v1")
+app.include_router(invitations_router, prefix="/api/v1")
+app.include_router(super_admin_router, prefix="/api/v1")
+
+# Existing routers (unchanged)
+app.include_router(tickets.router, prefix="/api/v1")
+app.include_router(agents.router, prefix="/api/v1")
 app.include_router(customers.router, prefix="/api/v1")
 app.include_router(companies.router, prefix="/api/v1")
-app.include_router(sync.router,      prefix="/api/v1")
+app.include_router(sync.router, prefix="/api/v1")
 app.include_router(webhook_router)
 
-
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
 
 @app.get("/health", tags=["Health"])
 async def health():
@@ -169,7 +187,4 @@ async def health():
 
 @app.get("/", tags=["Health"])
 async def root():
-    return {
-        "message": f"Welcome to {settings.APP_NAME}",
-        "docs": "/docs",
-    }
+    return {"message": f"Welcome to {settings.APP_NAME}", "docs": "/docs"}

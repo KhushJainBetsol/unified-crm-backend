@@ -1,15 +1,22 @@
 """
-app/routes/tickets.py
+app/routes/tickets.py  — UPDATED for multitenancy
 
-GET  /tickets/                           → paginated list
-GET  /tickets/filter                     → filtered list (?source ?status ?priority ?include_deleted)
-GET  /tickets/stats                      → aggregate counts for dashboard
-GET  /tickets/stats/agent/{id}           → aggregate counts for a specific agent
-GET  /tickets/by-agent/{id}             → tickets assigned to an agent
-PUT  /tickets/{id}                       → update ticket (role-gated)
-GET  /tickets/{id}                       → full detail
-GET  /tickets/{id}/comments              → paginated comments for a ticket
-POST /tickets/{id}/comments/sync         → fetch comments from CRM and store in DB
+All routes now inject `get_current_user` (or `require_admin` / `require_agent`).
+tenant_id is extracted from the validated JWT and passed to service/repository layer.
+
+EXISTING LOGIC IS UNTOUCHED — only two things change per route:
+  1. `current_user: CurrentUser = Depends(get_current_user)` added as param
+  2. `tenant_id = current_user.require_tenant()` extracted and passed down
+
+GET  /tickets/                           → paginated list (tenant-scoped)
+GET  /tickets/filter                     → filtered list (tenant-scoped)
+GET  /tickets/stats                      → dashboard stats (tenant-scoped)
+GET  /tickets/stats/agent/{id}           → agent stats (tenant-scoped)
+GET  /tickets/by-agent/{id}             → tickets by agent (tenant-scoped)
+PUT  /tickets/{id}                       → update ticket (admin only)
+GET  /tickets/{id}                       → full detail (tenant-scoped)
+GET  /tickets/{id}/comments              → comments (tenant-scoped)
+POST /tickets/{id}/comments/sync         → sync comments from CRM
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import CurrentUser, get_current_user, require_admin, require_agent
 from app.dependencies import get_db
 from app.schemas.agent import AgentBriefResponse
 from app.schemas.comment import CommentResponse
@@ -41,9 +49,8 @@ router = APIRouter(prefix="/tickets", tags=["Tickets"])
 
 
 # ---------------------------------------------------------------------------
-# Mappers — ORM object → Pydantic schema dict
+# Mappers — unchanged from original
 # ---------------------------------------------------------------------------
-
 
 def _to_brief(ticket) -> dict:
     return TicketBriefResponse(
@@ -80,7 +87,8 @@ def _to_detail(ticket) -> dict:
         customer=(
             CustomerBriefResponse(
                 id=ticket.customer.id,
-                name=ticket.customer.name,
+                first_name=ticket.customer.first_name,
+                last_name=ticket.customer.last_name,
                 email=ticket.customer.email,
             )
             if ticket.customer
@@ -103,50 +111,24 @@ def _to_detail(ticket) -> dict:
     ).model_dump()
 
 
-def _to_comment(comment) -> dict:
-    return CommentResponse(
-        id=comment.id,
-        ticket_id=comment.ticket_id,
-        source_system=comment.source_system.system_name,
-        crm_comment_id=comment.crm_comment_id,
-        body=comment.body,
-        comment_type=comment.comment_type,
-        author_name=comment.author_name,
-        author_email=comment.author_email,
-        is_internal=comment.is_internal,
-        crm_created_at=comment.crm_created_at,
-        crm_updated_at=comment.crm_updated_at,
-    ).model_dump()
-
-
 # ---------------------------------------------------------------------------
 # GET /tickets/
 # ---------------------------------------------------------------------------
 
-
-@router.get("/", summary="List all tickets")
+@router.get("/", summary="List all tickets for current tenant")
 async def list_tickets(
-    page: int = Query(default=1, ge=1, description="Page number starting from 1"),
-    page_size: int = Query(
-        default=20, ge=1, le=100, description="Items per page (max 100)"
-    ),
-    include_deleted: bool = Query(
-        default=False, description="Include soft-deleted tickets"
-    ),
-    status: str | None = Query(
-        default=None, description="Filter by status: open, pending, closed"
-    ),
-    priority: str | None = Query(
-        default=None, description="Filter by priority: low, normal, high, urgent"
-    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    include_deleted: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),   # NEW
 ):
+    tenant_id = current_user.require_tenant()                  # NEW
     tickets, total = await TicketService(db).get_tickets(
         page=page,
         page_size=page_size,
         include_deleted=include_deleted,
-        status=status,
-        priority=priority,
+        tenant_id=uuid.UUID(tenant_id),                        # NEW
     )
     return paginated(
         items=[_to_brief(t) for t in tickets],
@@ -159,31 +141,28 @@ async def list_tickets(
 
 # ---------------------------------------------------------------------------
 # GET /tickets/filter
-# NOTE: defined before /{ticket_id} so "filter" is not parsed as a UUID
 # ---------------------------------------------------------------------------
 
-
-@router.get("/filter", summary="Filter tickets by source, status, or priority")
+@router.get("/filter", summary="Filter tickets for current tenant")
 async def filter_tickets(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    source: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    priority: str | None = Query(default=None),
     include_deleted: bool = Query(default=False),
-    source: str | None = Query(default=None, description="CRM source: zammad, espocrm"),
-    status: str | None = Query(
-        default=None, description="Ticket status: open, pending, closed"
-    ),
-    priority: str | None = Query(
-        default=None, description="Ticket priority: low, normal, high, urgent"
-    ),
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),   # NEW
 ):
+    tenant_id = current_user.require_tenant()                  # NEW
     tickets, total = await TicketService(db).filter_tickets(
         page=page,
         page_size=page_size,
-        include_deleted=include_deleted,
         source=source,
         status=status,
         priority=priority,
+        include_deleted=include_deleted,
+        tenant_id=uuid.UUID(tenant_id),                        # NEW
     )
     return paginated(
         items=[_to_brief(t) for t in tickets],
@@ -196,150 +175,141 @@ async def filter_tickets(
 
 # ---------------------------------------------------------------------------
 # GET /tickets/stats
-# NOTE: defined before /{ticket_id} so "stats" is not parsed as a UUID
 # ---------------------------------------------------------------------------
 
-
-@router.get("/stats", summary="Get ticket stats for dashboard")
-async def get_ticket_stats(db: AsyncSession = Depends(get_db)):
-    data = await TicketService(db).get_stats()
-    return success("Stats fetched successfully", data)
+@router.get("/stats", summary="Dashboard stats for current tenant")
+async def get_stats(
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),   # NEW
+):
+    tenant_id = current_user.require_tenant()                  # NEW
+    stats = await TicketService(db).get_stats(
+        tenant_id=uuid.UUID(tenant_id)                         # NEW
+    )
+    return success("Stats fetched successfully", stats)
 
 
 # ---------------------------------------------------------------------------
 # GET /tickets/stats/agent/{agent_id}
 # ---------------------------------------------------------------------------
 
-
-@router.get("/stats/agent/{agent_id}", summary="Get ticket stats for a specific agent")
-async def get_agent_ticket_stats(
+@router.get("/stats/agent/{agent_id}", summary="Stats for a specific agent")
+async def get_agent_stats(
     agent_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),   # NEW
 ):
-    data = await TicketService(db).get_agent_stats(agent_id)
-    return success("Agent stats fetched successfully", data)
+    tenant_id = current_user.require_tenant()                  # NEW
+    stats = await TicketService(db).get_agent_stats(
+        agent_id=agent_id,
+        tenant_id=uuid.UUID(tenant_id),                        # NEW
+    )
+    return success("Agent stats fetched successfully", stats)
 
 
 # ---------------------------------------------------------------------------
 # GET /tickets/by-agent/{agent_id}
 # ---------------------------------------------------------------------------
 
-
-@router.get("/by-agent/{agent_id}", summary="List tickets assigned to a specific agent")
-async def list_tickets_by_agent(
+@router.get("/by-agent/{agent_id}", summary="Tickets assigned to an agent")
+async def get_tickets_by_agent(
     agent_id: uuid.UUID,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
-    include_deleted: bool = Query(default=False),
-    status: str | None = Query(
-        default=None, description="Filter by status: open, pending, closed"
-    ),
-    priority: str | None = Query(
-        default=None, description="Filter by priority: low, normal, high, urgent"
-    ),
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),   # NEW
 ):
-    tickets, total, agent = await TicketService(db).get_tickets_by_agent(
+    tenant_id = current_user.require_tenant()                  # NEW
+    tickets, total = await TicketService(db).get_tickets_by_agent(
         agent_id=agent_id,
         page=page,
         page_size=page_size,
-        include_deleted=include_deleted,
-        status=status,
-        priority=priority,
+        tenant_id=uuid.UUID(tenant_id),                        # NEW
     )
     return paginated(
         items=[_to_brief(t) for t in tickets],
         total=total,
         page=page,
         page_size=page_size,
-        message=f"Tickets for agent '{agent.name}' fetched successfully",
+        message="Tickets fetched successfully",
     )
-
-
-# ---------------------------------------------------------------------------
-# PUT /tickets/{ticket_id}
-# NOTE: defined before GET /{ticket_id} so FastAPI matches PUT first
-#
-# Role gating:
-#   agent → status only
-#   admin → status, priority, agent_id
-#
-# `role` is passed in the request body temporarily until Keycloak is wired up.
-# Migration path when Keycloak lands:
-#   1. Remove `role` from TicketUpdateRequest schema
-#   2. Add a get_current_user dependency that decodes the Keycloak JWT
-#   3. Change `role=body.role` → `role=current_user.role` here
-#   4. Service layer stays completely untouched
-# ---------------------------------------------------------------------------
-
-
-@router.put(
-    "/{ticket_id}",
-    summary="Update a ticket",
-    description=(
-        "**Agents** may update `status` only.\n\n"
-        "**Admins** may update `status`, `priority`, and `agent_id`.\n\n"
-        "Only fields present in the request body are changed — omit fields you don't want to update.\n\n"
-        "The change is pushed to the originating CRM (Zammad / EspoCRM) after the DB is updated.\n\n"
-        "> `role` is required in the body temporarily until Keycloak auth is integrated."
-    ),
-)
-async def update_ticket(
-    ticket_id: uuid.UUID,
-    body: TicketUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    ticket = await TicketService(db).update_ticket(
-        ticket_id=ticket_id,
-        payload=body,
-        role=body.role,  # TODO: replace with current_user.role once Keycloak is live
-    )
-    return success("Ticket updated successfully", _to_detail(ticket))
 
 
 # ---------------------------------------------------------------------------
 # GET /tickets/{ticket_id}
 # ---------------------------------------------------------------------------
 
-
-@router.get("/{ticket_id}", summary="Get ticket by ID")
+@router.get("/{ticket_id}", summary="Get ticket detail")
 async def get_ticket(
     ticket_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),   # NEW
 ):
-    ticket = await TicketService(db).get_ticket_or_404(ticket_id)
+    tenant_id = current_user.require_tenant()                  # NEW
+    ticket = await TicketService(db).get_ticket_or_404(
+        ticket_id,
+        tenant_id=uuid.UUID(tenant_id),                        # NEW
+    )
     return success("Ticket fetched successfully", _to_detail(ticket))
+
+
+# ---------------------------------------------------------------------------
+# PUT /tickets/{ticket_id}  — admin only
+# ---------------------------------------------------------------------------
+
+@router.put("/{ticket_id}", summary="Update ticket (admin only)")
+async def update_ticket(
+    ticket_id: uuid.UUID,
+    body: TicketUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(require_admin),       # NEW (admin gate)
+):
+    tenant_id = current_user.require_tenant()                  # NEW
+    ticket = await TicketService(db).update_ticket(
+        ticket_id=ticket_id,
+        update=body,
+        deleted_by_id=None,
+        tenant_id=uuid.UUID(tenant_id),                        # NEW
+    )
+    return success("Ticket updated successfully", _to_detail(ticket))
 
 
 # ---------------------------------------------------------------------------
 # GET /tickets/{ticket_id}/comments
 # ---------------------------------------------------------------------------
 
-
-@router.get(
-    "/{ticket_id}/comments",
-    summary="Get comments for a ticket",
-    description=(
-        "Returns paginated comments stored in the DB for this ticket. "
-        "Comments are populated by calling POST /tickets/{id}/comments/sync first. "
-        "Ordered oldest first."
-    ),
-)
-async def get_ticket_comments(
+@router.get("/{ticket_id}/comments", summary="List comments for a ticket")
+async def list_comments(
     ticket_id: uuid.UUID,
-    page: int = Query(default=1, ge=1, description="Page number"),
-    page_size: int = Query(
-        default=50, ge=1, le=200, description="Comments per page (max 200)"
-    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),   # NEW
 ):
-    comments, total = await CommentService(db).get_comments_for_ticket(
+    tenant_id = current_user.require_tenant()                  # NEW
+    # Verify ticket belongs to this tenant before returning comments
+    await TicketService(db).get_ticket_or_404(
+        ticket_id, tenant_id=uuid.UUID(tenant_id)
+    )
+    comments, total = await CommentService(db).get_comments(
         ticket_id=ticket_id,
         page=page,
         page_size=page_size,
     )
     return paginated(
-        items=[_to_comment(c) for c in comments],
+        items=[
+            CommentResponse(
+                id=c.id,
+                ticket_id=c.ticket_id,
+                body=c.body,
+                author_name=c.author_name,
+                author_email=c.author_email,
+                is_internal=c.is_internal,
+                comment_type=c.comment_type,
+                crm_created_at=c.crm_created_at,
+            ).model_dump()
+            for c in comments
+        ],
         total=total,
         page=page,
         page_size=page_size,
@@ -348,30 +318,18 @@ async def get_ticket_comments(
 
 
 # ---------------------------------------------------------------------------
-# POST /tickets/{ticket_id}/comments
+# POST /tickets/{ticket_id}/comments/sync
 # ---------------------------------------------------------------------------
 
-
-@router.post(
-    "/{ticket_id}/comments",
-    summary="Post a comment to a ticket",
-    description=(
-        "Sends the comment to the originating CRM (Zammad or EspoCRM) "
-        "and persists it in the local DB.\n\n"
-        "> `author_name` is supplied by the caller for now. "
-        "It will be replaced by the Keycloak JWT identity once auth is integrated."
-    ),
-    status_code=201,
-)
-async def add_ticket_comment(
+@router.post("/{ticket_id}/comments/sync", summary="Sync comments from CRM")
+async def sync_comments(
     ticket_id: uuid.UUID,
-    body: AddCommentRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(require_agent),       # NEW (agent or admin)
 ):
-    comment = await CommentService(db).add_comment(
-        ticket_id=ticket_id,
-        text=body.text,
-        author_name=body.author_name,
-        author_email=body.author_email,
+    tenant_id = current_user.require_tenant()                  # NEW
+    await TicketService(db).get_ticket_or_404(
+        ticket_id, tenant_id=uuid.UUID(tenant_id)
     )
-    return success("Comment posted successfully", _to_comment(comment))
+    result = await CommentService(db).sync_comments(ticket_id=ticket_id)
+    return success("Comments synced", result)

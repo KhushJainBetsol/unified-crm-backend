@@ -2,10 +2,13 @@
 app/core/settings.py
 
 Centralised environment configuration using pydantic-settings.
+
+New vars added for Keycloak multitenancy (marked with # KEYCLOAK NEW).
+All existing vars are unchanged.
 """
 
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,13 +31,13 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str
 
-    # JWT
+    # JWT (legacy — keep for any existing helpers, not used for auth anymore)
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
-    # CORS — stored as plain string in .env, parsed into list here
+    # CORS
     ALLOWED_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
 
     # EspoCRM
@@ -45,19 +48,32 @@ class Settings(BaseSettings):
     ZAMMAD_BASE_URL: str = ""
     ZAMMAD_API_TOKEN: str = ""
 
-    WEBHOOK_TENANT_ID: str = ""  # leave empty until Keycloak integrated
-    ESPO_WEBHOOK_UUID: str = ""  # python -c "import uuid; print(uuid.uuid4())"
+    WEBHOOK_TENANT_ID: str = ""
+    ESPO_WEBHOOK_UUID: str = ""
     ESPO_SECRET_CASE_CREATE: str = ""
     ESPO_SECRET_CASE_UPDATE: str = ""
     ESPO_SECRET_CASE_DELETE: str = ""
-    ZAMMAD_WEBHOOK_UUID: str = ""  # python -c "import uuid; print(uuid.uuid4())"
+    ZAMMAD_WEBHOOK_UUID: str = ""
     ZAMMAD_WEBHOOK_SECRET: str = ""
 
     SYNC_INTERVAL_MINUTES: int = 15
 
+    # ── KEYCLOAK NEW ──────────────────────────────────────────────────────────
+    KEYCLOAK_URL: str = "http://localhost:8080"
+    KEYCLOAK_REALM: str = "unified-crm"
+    # Client used by the frontend (public PKCE client)
+    KEYCLOAK_CLIENT_ID: str = "crm-frontend"
+    # Service-account client used by backend to call Keycloak Admin API
+    KEYCLOAK_ADMIN_CLIENT_ID: str = "crm-admin-api"
+    KEYCLOAK_ADMIN_CLIENT_SECRET: str = ""
+    # Frontend URL — used when generating invite links
+    FRONTEND_URL: str = "http://localhost:5173"
+    # Super admin email — identified by this address until superadmin role is ready
+    SUPER_ADMIN_EMAIL: str = ""
+    # ── END KEYCLOAK NEW ──────────────────────────────────────────────────────
+
     @property
     def allowed_origins_list(self) -> list[str]:
-        """Parse ALLOWED_ORIGINS string into a list for CORSMiddleware."""
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
 
 
