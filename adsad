@@ -1,0 +1,352 @@
+[33mcommit 845d19cfdd8901c536fa5afac01aa7e9b010ce08[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m, [m[1;31morigin/master[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Merge: caa0a8e c603ccc
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Mon Apr 6 12:01:25 2026 +0530
+
+    Merge pull request #21 from KhushJainBetsol/post-comment
+    
+    Fixed identation and comment source errors
+
+[33mcommit c603ccc92d5e63a14f0a41dc5e08411c97d4a686[m[33m ([m[1;31morigin/post-comment[m[33m, [m[1;32mpost-comment[m[33m)[m
+Author: Khush Jain <khush.jain@betsol.com>
+Date:   Mon Apr 6 02:30:51 2026 -0400
+
+    Fixed identation and comment source errors
+
+[33mcommit caa0a8e0f0591c8bd0caa14c284af5d0f8a33c4d[m
+Merge: af9fcc7 1dc265d
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Mon Apr 6 11:24:21 2026 +0530
+
+    Merge pull request #20 from KhushJainBetsol/post-comment
+    
+    Updating client for post comments
+
+[33mcommit 1dc265d7034c5c7b273bbdcf0faf6a240e2c5f15[m
+Author: Khush Jain <khush.jain@betsol.com>
+Date:   Mon Apr 6 01:53:40 2026 -0400
+
+    Updating client for post comments
+
+[33mcommit af9fcc7dd51c906fab2eb3869a9a415c73554732[m
+Merge: e707d94 a479e44
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Mon Apr 6 10:23:12 2026 +0530
+
+    Merge pull request #19 from KhushJainBetsol/comment-service
+    
+    Fixed the client identation and login for posting comments
+
+[33mcommit a479e44c45dec542da4f13e844d8be34662e467f[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Mon Apr 6 10:07:14 2026 +0530
+
+    Fixed the client identation and login for posting comments
+
+[33mcommit e707d944cd1e3bf01f3a8226c1f6bb81a04c1687[m
+Merge: df6b29c d939b8c
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Mon Apr 6 10:00:52 2026 +0530
+
+    Merge pull request #18 from KhushJainBetsol/comment-service
+    
+    Comment service fixed for cors error
+
+[33mcommit d939b8c660f88a4a904d3401d16184e13b69c89f[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Mon Apr 6 10:00:24 2026 +0530
+
+    Comment service fixed for cors error
+
+[33mcommit df6b29cf36fe644688a32bb459051044a6565808[m
+Merge: 043315a cd36348
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Thu Apr 2 16:20:21 2026 +0530
+
+    Merge pull request #17 from KhushJainBetsol/post-comments
+    
+    Post api for adding comments
+
+[33mcommit cd363487abb3084cf20ac31c94140100272118e3[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Thu Apr 2 16:19:55 2026 +0530
+
+    Post api for adding comments
+
+[33mcommit 043315a71e5e45b1f49acc3fdd262c23deef13fb[m
+Merge: 2802802 8a63eb9
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Thu Apr 2 11:41:26 2026 +0530
+
+    Merge pull request #16 from KhushJainBetsol/webhook
+    
+    Added webhooks
+
+[33mcommit 8a63eb968ca309b26dc9b28b03c9d3652e4e583c[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Thu Apr 2 11:41:01 2026 +0530
+
+    Added webhooks
+
+[33mcommit 2802802928f40031b4065a07274a1fc2c8684cf3[m
+Merge: 363115a afa6730
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Tue Mar 31 21:44:57 2026 +0530
+
+    Merge pull request #15 from KhushJainBetsol/update-tickets
+    
+    Updated code to update tickets and send back updates to source crm
+
+[33mcommit afa6730c87535501d4812e735b24f544c6ee75e2[m[33m ([m[1;31morigin/update-tickets[m[33m)[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Tue Mar 31 21:42:03 2026 +0530
+
+    Updated code to update tickets and send back updates to source crm
+
+[33mcommit 363115af81959d9ec7a674a5efefac3b3a1be8f1[m
+Merge: d0ba5c0 e217b4b
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Mon Mar 30 10:43:03 2026 +0530
+
+    Merge pull request #14 from KhushJainBetsol/scheduler-service
+    
+    Added a scheduler and 15 min sync to get data from crm
+
+[33mcommit e217b4bec8e79a10707364a2ac3186e6e05f02ad[m[33m ([m[1;31morigin/scheduler-service[m[33m)[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Mon Mar 30 10:42:32 2026 +0530
+
+    Added a scheduler and 15 min sync to get data from crm
+
+[33mcommit d0ba5c0dc8791b51a101be89d85580e7df4cf63f[m
+Merge: d63e0e6 de0e308
+Author: SumedhaBagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 17:20:56 2026 +0530
+
+    Merge pull request #13 from KhushJainBetsol/sumedha
+    
+    Updated zammad client
+
+[33mcommit de0e3083e57904b1717800e00ba96a599f0adbb6[m[33m ([m[1;31morigin/sumedha[m[33m)[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 17:20:00 2026 +0530
+
+    Updated zammad client
+
+[33mcommit d63e0e63e5c1a8551228bdabf573a2e2603212a4[m
+Merge: 9275f83 43a3e19
+Author: SumedhaBagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 16:55:19 2026 +0530
+
+    Merge pull request #12 from KhushJainBetsol/sumedha
+    
+    Updated espo users endpoint
+
+[33mcommit 43a3e190fdcefda8382f92e80f02a19408c25a7e[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 16:54:04 2026 +0530
+
+    Updated espo users endpoint
+
+[33mcommit 9275f837e054a8878bc3c205a51a8d6ae48ff46d[m
+Merge: a5e2d93 cf1adcb
+Author: SumedhaBagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 16:23:38 2026 +0530
+
+    Merge pull request #11 from KhushJainBetsol/sumedha
+    
+    Updated zammad users endpoint
+
+[33mcommit cf1adcb4aed15134c373ab858ea355d7d8d1623f[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 16:23:10 2026 +0530
+
+    Updated zammad users endpoint
+
+[33mcommit a5e2d9344fe06f8fe2813006da52b30f300d9c1e[m
+Merge: 99297d0 477bb0c
+Author: SumedhaBagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 12:18:00 2026 +0530
+
+    Merge pull request #10 from KhushJainBetsol/sumedha
+    
+    Sumedha
+
+[33mcommit 477bb0c6a5269c9a92bee3e99fbfc87e7b781228[m
+Merge: 587f54d 99297d0
+Author: SumedhaBagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 12:17:50 2026 +0530
+
+    Merge branch 'master' into sumedha
+
+[33mcommit 587f54d747397e73f4a4f7514ff1d1479a398f41[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 12:16:05 2026 +0530
+
+    Updated zammad description
+
+[33mcommit 99297d03bf0e2be5073b4e59fbb221557eb6b07c[m
+Merge: dbb2a58 5e162be
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Wed Mar 25 10:47:17 2026 +0530
+
+    Merge pull request #9 from KhushJainBetsol/removed-fields
+    
+    Removed 2 fields from ticket routes
+
+[33mcommit 5e162be3a56f3a410c3c6e0d7b070f0b77cb7a67[m[33m ([m[1;31morigin/removed-fields[m[33m)[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Wed Mar 25 10:46:11 2026 +0530
+
+    Removed 2 fields from ticket routes
+
+[33mcommit 07dd836c7d48ad5c9ac396c8d7e0af6e8e1b23b6[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 10:08:55 2026 +0530
+
+    Updated comments get api
+
+[33mcommit dbb2a58bd161348c38320425118165094be345dd[m
+Merge: 93b791b c175af4
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 10:01:49 2026 +0530
+
+    Merge branch 'master' of https://github.com/KhushJainBetsol/unified-crm-backend into sumedha
+
+[33mcommit 93b791bf1065597e2cb36f770b941b9ef84afe47[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 09:55:53 2026 +0530
+
+    Updated comments api
+
+[33mcommit c175af4bf9d4234c843ad631db7eed623ba7bef1[m
+Merge: 3f0fa84 a8271cd
+Author: SumedhaBagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 09:54:26 2026 +0530
+
+    Merge pull request #8 from KhushJainBetsol/sumedha
+    
+    Updated comments api
+
+[33mcommit a8271cdfa8fdb091bbf7ac38afd1cbae0845e5fc[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Wed Mar 25 09:53:39 2026 +0530
+
+    Updated comments api
+
+[33mcommit 3f0fa8487f3ccd19a85ebe0aeea5683dfd41476c[m
+Merge: 80979c1 eaf1bd5
+Author: SumedhaBagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Tue Mar 24 15:30:41 2026 +0530
+
+    Merge pull request #7 from KhushJainBetsol/sumedha
+    
+    Added ticket comments api
+
+[33mcommit eaf1bd595a0730b5f7490c03603a1665ec7623b5[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Tue Mar 24 15:29:38 2026 +0530
+
+    Added ticket comments api
+
+[33mcommit 80979c19386fc55f546efa03e4072f9d34437d03[m
+Merge: ccbcc7c 6ee1688
+Author: SumedhaBagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Tue Mar 24 12:03:10 2026 +0530
+
+    Merge pull request #6 from KhushJainBetsol/sumedha
+    
+    Structured a code
+
+[33mcommit 6ee1688ee47147fdca14d6d6c3b59e2196e81d69[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Tue Mar 24 12:02:29 2026 +0530
+
+    Structured a code
+
+[33mcommit ccbcc7c07ae7134307dca493e5a18e7a09eb1c48[m
+Merge: 46cbace ee6c1a3
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Tue Mar 24 11:36:58 2026 +0530
+
+    Merge pull request #5 from KhushJainBetsol/stats-foragent
+    
+    Added api for stats for agents
+
+[33mcommit ee6c1a3eb99d2aa48f2d35db7b910790b3a1005e[m[33m ([m[1;31morigin/stats-foragent[m[33m)[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Tue Mar 24 11:36:30 2026 +0530
+
+    Added api for stats for agents
+
+[33mcommit 46cbace7953baf5f2f26b4dcef4654bb4906e2c3[m
+Merge: 6696f0e 8a3a13e
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Tue Mar 24 11:04:28 2026 +0530
+
+    Merge pull request #4 from KhushJainBetsol/espo-customerid-mapping
+    
+     Mapped customer id correclty
+
+[33mcommit 8a3a13ea2d1e9eb0b9a4b091b8f9cc9a28172a96[m[33m ([m[1;31morigin/espo-customerid-mapping[m[33m)[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Tue Mar 24 11:03:55 2026 +0530
+
+     Mapped customer id correclty
+
+[33mcommit 6696f0e0fafde76a399737b5faa9a3d58c10155d[m
+Merge: 856a49f bac3e5b
+Author: SumedhaBagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Mon Mar 23 15:16:36 2026 +0530
+
+    Merge pull request #3 from KhushJainBetsol/sumedha
+    
+    Added additional endpoints
+
+[33mcommit bac3e5b8b3f8d4869b8fc677009188657820ab29[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Mon Mar 23 15:12:17 2026 +0530
+
+    Added additional endpoints
+
+[33mcommit 856a49fe3e0093a849038dc0fac6401c8b0c6a4f[m
+Merge: 94d34f4 0daf438
+Author: KhushJainBetsol <khush.jain@betsol.com>
+Date:   Mon Mar 23 14:47:04 2026 +0530
+
+    Merge pull request #2 from KhushJainBetsol/updated-routes
+    
+    Updated routes and schemas for frontend
+
+[33mcommit 0daf4381694dd70fa251871e611fa56214d03d66[m[33m ([m[1;31morigin/updated-routes[m[33m)[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Mon Mar 23 14:46:20 2026 +0530
+
+    Updated routes and schemas for frontend
+
+[33mcommit 94d34f41e06c34801249b285c5ce9c7009d6e57f[m
+Merge: 66b121f 6934a11
+Author: SumedhaBagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Mon Mar 23 13:47:09 2026 +0530
+
+    Merge pull request #1 from KhushJainBetsol/sumedha
+    
+    Added additional endpoints
+
+[33mcommit 6934a112326935012117ca9df7d7e39815a4c642[m
+Author: Sumedha Bagalkoti <sumedha.bagalkoti@betsol.com>
+Date:   Mon Mar 23 13:46:04 2026 +0530
+
+    Added additional endpoints
+
+[33mcommit 66b121f93b28f54df96e9d6582719bdc61cc386b[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Mon Mar 23 11:45:48 2026 +0530
+
+    Changed hard coded to config files
+
+[33mcommit 825d2d899ac90da7c5a30d95be7b23c7283970a5[m
+Author: Khush Vikram Jain <khush.jain@betsol.com>
+Date:   Mon Mar 23 11:33:25 2026 +0530
+
+    Initial Commit
