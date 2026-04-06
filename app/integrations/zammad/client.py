@@ -34,13 +34,11 @@ ZAMMAD_PAGE_SIZE = 100
 
 class ZammadClientError(Exception):
     """Raised when Zammad API returns an error response."""
-
     pass
 
 
 class ZammadAuthError(ZammadClientError):
     """Raised on 401 / 403 responses."""
-
     pass
 
 
@@ -60,7 +58,7 @@ class ZammadClient:
         base_url: str | None = None,
         api_token: str | None = None,
     ) -> None:
-        self._base_url = (base_url or settings.ZAMMAD_BASE_URL).rstrip("/")
+        self._base_url  = (base_url or settings.ZAMMAD_BASE_URL).rstrip("/")
         self._api_token = api_token or settings.ZAMMAD_API_TOKEN
         self._client: httpx.AsyncClient | None = None
 
@@ -98,7 +96,7 @@ class ZammadClient:
         Perform a GET request and return the parsed JSON response.
 
         Raises:
-            ZammadAuthError: on 401 / 403
+            ZammadAuthError:   on 401 / 403
             ZammadClientError: on any other non-2xx response
         """
         client = self._ensure_client()
@@ -124,7 +122,7 @@ class ZammadClient:
         Perform a PUT request and return the parsed JSON response.
 
         Raises:
-            ZammadAuthError: on 401 / 403
+            ZammadAuthError:   on 401 / 403
             ZammadClientError: on any other non-2xx response
         """
         client = self._ensure_client()
@@ -140,6 +138,32 @@ class ZammadClient:
         if not response.is_success:
             raise ZammadClientError(
                 f"Zammad API error {response.status_code} for PUT {path}: "
+                f"{response.text[:300]}"
+            )
+
+        return response.json()
+
+    async def _post(self, path: str, data: dict) -> Any:
+        """
+        Perform a POST request and return the parsed JSON response.
+
+        Raises:
+            ZammadAuthError:   on 401 / 403
+            ZammadClientError: on any other non-2xx response
+        """
+        client = self._ensure_client()
+        logger.debug("Zammad POST %s", path)  # payload omitted — may contain user content
+
+        response = await client.post(path, json=data)
+
+        if response.status_code in (401, 403):
+            raise ZammadAuthError(
+                f"Zammad authentication failed ({response.status_code}). "
+                "Check ZAMMAD_API_TOKEN in your .env"
+            )
+        if not response.is_success:
+            raise ZammadClientError(
+                f"Zammad API error {response.status_code} for POST {path}: "
                 f"{response.text[:300]}"
             )
 
@@ -213,8 +237,7 @@ class ZammadClient:
             all_tickets.extend(batch)
             logger.info(
                 "Fetched %d tickets (total so far: %d)",
-                len(batch),
-                len(all_tickets),
+                len(batch), len(all_tickets),
             )
 
             if len(batch) < per_page:
@@ -242,7 +265,7 @@ class ZammadClient:
         return await self._get(
             "/api/v1/tickets/search",
             params={
-                "query": f"updated_at:>{since}",
+                "query":    f"updated_at:>{since}",
                 "per_page": ZAMMAD_PAGE_SIZE,
             },
         )
@@ -276,11 +299,6 @@ class ZammadClient:
             GET /api/v1/ticket_states     → valid state (status) names
             GET /api/v1/ticket_priorities → valid priority names
 
-        Zammad exposes these as first-class REST resources, unlike EspoCRM
-        which uses a generic metadata endpoint. Each item in the response
-        has a `name` field which is the exact string Zammad accepts in a
-        PUT /api/v1/tickets/:id payload.
-
         Returns:
             Dict with two keys:
             {
@@ -291,31 +309,97 @@ class ZammadClient:
         Note: state names are lowercased for consistent comparison.
               priority names are kept as-is (Zammad uses "1 low" format).
         """
-        states_response = await self._get("/api/v1/ticket_states")
+        states_response     = await self._get("/api/v1/ticket_states")
         priorities_response = await self._get("/api/v1/ticket_priorities")
 
-        # Each response is a list of objects with at least a `name` field:
-        # [{"id": 1, "name": "new", "active": true, ...}, ...]
         valid_states = [
             s["name"].lower()
             for s in states_response
-            if s.get("active", True)  # skip inactive states
+            if s.get("active", True)
         ]
         valid_priorities = [
             p["name"]
             for p in priorities_response
-            if p.get("active", True)  # skip inactive priorities
+            if p.get("active", True)
         ]
 
         logger.debug(
             "Zammad field options — states: %s | priorities: %s",
-            valid_states,
-            valid_priorities,
+            valid_states, valid_priorities,
         )
         return {
-            "state": valid_states,
+            "state":    valid_states,
             "priority": valid_priorities,
         }
+
+    # ------------------------------------------------------------------
+    # Comments (article) endpoints
+    # ------------------------------------------------------------------
+    async def get_comments_by_ticket(self, crm_ticket_id: str | int) -> list[dict]:
+        """
+        Fetch all articles (comments) for a Zammad ticket.
+
+        GET /api/v1/ticket_articles/by_ticket/{ticket_id}
+
+        Zammad returns ALL articles for a ticket in one response (no pagination).
+
+        Args:
+            crm_ticket_id: Zammad's integer ticket ID (e.g. 6).
+
+        Returns:
+            List of raw ticket_article dicts.
+        """
+        path = f"/api/v1/ticket_articles/by_ticket/{crm_ticket_id}"
+        logger.debug("Fetching Zammad articles for ticket %s", crm_ticket_id)
+        response = await self._get(path)
+
+        if isinstance(response, list):
+            return response
+        return response.get("ticket_articles", response.get("articles", []))
+
+    async def post_comment(
+        self,
+        crm_ticket_id: str,
+        body: str,
+        author_name: str,
+    ) -> dict:
+        """
+        Create a public note article on a Zammad ticket.
+
+        POST /api/v1/ticket_articles
+
+        Zammad requires ticket_id to be an integer — a string will be
+        rejected with a 422. If crm_ticket_id is not numeric it means
+        the ticket was not synced from Zammad correctly and we raise
+        early rather than sending a malformed request.
+
+        Args:
+            crm_ticket_id: Zammad ticket ID stored as string in our DB.
+            body:          Comment text (plain text).
+            author_name:   Display name of the author.
+
+        Returns:
+            Raw created article dict from Zammad.
+
+        Raises:
+            ZammadClientError: if crm_ticket_id is not numeric.
+        """
+        try:
+            ticket_id = int(crm_ticket_id)
+        except (ValueError, TypeError):
+            raise ZammadClientError(
+                f"crm_ticket_id must be numeric for Zammad, got: {crm_ticket_id!r}. "
+                "This ticket may not have been synced from Zammad correctly."
+            )
+
+        payload = {
+            "ticket_id":    ticket_id,    # integer required by Zammad
+            "body":         body,
+            "content_type": "text/plain", # safer than text/html for user input
+            "type":         "note",
+            "internal":     False,
+        }
+        return await self._post("/api/v1/ticket_articles", payload)
 
     # ------------------------------------------------------------------
     # Internal helper — fetch ALL users (paginated, no role filter)
@@ -372,16 +456,13 @@ class ZammadClient:
         all_users = await self._get_all_users()
 
         agents = [
-            u
-            for u in all_users
+            u for u in all_users
             if u.get("id") != 1 and AGENT_ROLE_ID in (u.get("role_ids") or [])
         ]
 
         logger.info(
             "Zammad: filtered %d agents (role_id=%d) from %d total users",
-            len(agents),
-            AGENT_ROLE_ID,
-            len(all_users),
+            len(agents), AGENT_ROLE_ID, len(all_users),
         )
         return agents
 
@@ -400,20 +481,16 @@ class ZammadClient:
         Returns flat list of raw user dicts.
         """
         CUSTOMER_ROLE_ID = 3
-
         all_users = await self._get_all_users()
 
         customers = [
-            u
-            for u in all_users
+            u for u in all_users
             if u.get("id") != 1 and CUSTOMER_ROLE_ID in (u.get("role_ids") or [])
         ]
 
         logger.info(
             "Zammad: filtered %d customers (role_id=%d) from %d total users",
-            len(customers),
-            CUSTOMER_ROLE_ID,
-            len(all_users),
+            len(customers), CUSTOMER_ROLE_ID, len(all_users),
         )
         return customers
 
@@ -444,67 +521,3 @@ class ZammadClient:
 
         logger.info("Zammad: fetched %d organizations total", len(all_orgs))
         return all_orgs
-
-    async def get_comments_by_ticket(self, crm_ticket_id: str | int) -> list[dict]:
-        """
-        Fetch all articles (comments) for a Zammad ticket.
-
-        GET /api/v1/ticket_articles/by_ticket/{ticket_id}
-
-        Zammad returns ALL articles for a ticket in one response (no pagination).
-
-        Args:
-            crm_ticket_id: Zammad's integer ticket ID (e.g. 6).
-
-        Returns:
-            List of raw ticket_article dicts.
-        """
-        path = f"/api/v1/ticket_articles/by_ticket/{crm_ticket_id}"
-        logger.debug("Fetching Zammad articles for ticket %s", crm_ticket_id)
-        response = await self._get(path)
-
-        if isinstance(response, list):
-            return response
-        return response.get("ticket_articles", response.get("articles", []))
-
-    async def _post(self, path: str, data: dict) -> Any:
-        """
-        Perform a POST request and return the parsed JSON response.
-
-        Raises:
-            ZammadAuthError: on 401 / 403
-            ZammadClientError: on any other non-2xx response
-        """
-        client = self._ensure_client()
-        logger.debug("Zammad POST %s payload=%s", path, data)
-
-        response = await client.post(path, json=data)
-
-        if response.status_code in (401, 403):
-            raise ZammadAuthError(
-                f"Zammad authentication failed ({response.status_code}). "
-                "Check ZAMMAD_API_TOKEN in your .env"
-            )
-        if not response.is_success:
-            raise ZammadClientError(
-                f"Zammad API error {response.status_code} for POST {path}: "
-                f"{response.text[:300]}"
-            )
-
-        return response.json()
-
-    async def post_comment(
-        self, crm_ticket_id: str, body: str, author_name: str
-    ) -> dict:
-        """
-        Create a public note article on a Zammad ticket.
-        POST /api/v1/ticket_articles
-        """
-        payload = {
-            "ticket_id": int(crm_ticket_id),
-            "body": body,
-            "content_type": "text/html",
-            "type": "note",
-            "internal": False,
-        }
-        return await self._post("/api/v1/ticket_articles", payload)
