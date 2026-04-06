@@ -51,13 +51,11 @@ CUSTOMER_ROLE_KEYWORD = "Customer"
 
 class EspoClientError(Exception):
     """Raised when EspoCRM API returns an error response."""
-
     pass
 
 
 class EspoAuthError(EspoClientError):
     """Raised on 401 / 403 responses."""
-
     pass
 
 
@@ -78,7 +76,7 @@ class EspoClient:
         api_key: str | None = None,
     ) -> None:
         self._base_url = (base_url or settings.ESPO_BASE_URL).rstrip("/")
-        self._api_key = api_key or settings.ESPO_API_KEY
+        self._api_key  = api_key or settings.ESPO_API_KEY
         self._client: httpx.AsyncClient | None = None
 
     # ------------------------------------------------------------------
@@ -88,7 +86,7 @@ class EspoClient:
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             headers={
-                "X-Api-Key": self._api_key,
+                "X-Api-Key":    self._api_key,
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(30.0),
@@ -115,7 +113,7 @@ class EspoClient:
         Perform a GET request and return the parsed JSON response.
 
         Raises:
-            EspoAuthError: on 401 / 403
+            EspoAuthError:   on 401 / 403
             EspoClientError: on any other non-2xx response
         """
         client = self._ensure_client()
@@ -141,7 +139,7 @@ class EspoClient:
         Perform a PUT request and return the parsed JSON response.
 
         Raises:
-            EspoAuthError: on 401 / 403
+            EspoAuthError:   on 401 / 403
             EspoClientError: on any other non-2xx response
         """
         client = self._ensure_client()
@@ -162,6 +160,35 @@ class EspoClient:
 
         return response.json()
 
+    async def _post(self, path: str, data: dict) -> Any:
+        """
+        Perform a POST request and return the parsed JSON response.
+
+        Raises:
+            EspoAuthError:   on 401 / 403
+            EspoClientError: on any other non-2xx response
+        """
+        client = self._ensure_client()
+        logger.debug("EspoCRM POST %s", path)  # payload omitted — may contain user content
+
+        response = await client.post(path, json=data)
+
+        if response.status_code in (401, 403):
+            raise EspoAuthError(
+                f"EspoCRM authentication failed ({response.status_code}). "
+                "Check ESPO_API_KEY in your .env"
+            )
+        if not response.is_success:
+            raise EspoClientError(
+                f"EspoCRM API error {response.status_code} for POST {path}: "
+                f"{response.text[:300]}"
+            )
+
+        return response.json()
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
     async def get_case_field_options(self) -> dict[str, list[str]]:
         """
         Fetch the valid field options for the Case entity from EspoCRM metadata.
@@ -185,26 +212,17 @@ class EspoClient:
             params={"scopes[]": "Case"},
         )
 
-        # Response shape:
-        # {
-        #   "entityDefs": {
-        #     "Case": {
-        #       "fields": {
-        #         "status":   { "type": "enum", "options": ["New", "Assigned", ...] },
-        #         "priority": { "type": "enum", "options": ["Low", "Normal", ...] },
-        #         ...
-        #       }
-        #     }
-        #   }
-        # }
         fields: dict = response.get("entityDefs", {}).get("Case", {}).get("fields", {})
 
         return {
             field_name: field_def.get("options", [])
             for field_name, field_def in fields.items()
-            if field_def.get("options")  # only fields that have an enum options list
+            if field_def.get("options")
         }
 
+    # ------------------------------------------------------------------
+    # User helpers
+    # ------------------------------------------------------------------
     async def _get_all_users_with_detail(self) -> list[dict]:
         """
         Shared helper used by get_all_agents() and get_all_customers().
@@ -227,7 +245,7 @@ class EspoClient:
                 params={"offset": offset, "maxSize": ESPO_PAGE_SIZE},
             )
             batch: list[dict] = response.get("list", [])
-            total: int = response.get("total", 0)
+            total: int        = response.get("total", 0)
 
             if not batch:
                 break
@@ -238,9 +256,7 @@ class EspoClient:
             if len(all_ids) >= total:
                 break
 
-        logger.info(
-            "EspoCRM: found %d user IDs, fetching full details...", len(all_ids)
-        )
+        logger.info("EspoCRM: found %d user IDs, fetching full details...", len(all_ids))
 
         detailed_users: list[dict] = []
 
@@ -250,16 +266,34 @@ class EspoClient:
                 detail = await self._get(f"/api/v1/User/{user_id}")
                 detailed_users.append(detail)
             except EspoClientError as exc:
-                logger.warning(
-                    "Skipping user %s — failed to fetch detail: %s", user_id, exc
-                )
+                logger.warning("Skipping user %s — failed to fetch detail: %s", user_id, exc)
 
         logger.info(
             "EspoCRM: fetched full details for %d / %d users",
-            len(detailed_users),
-            len(all_ids),
+            len(detailed_users), len(all_ids),
         )
         return detailed_users
+
+    async def _get_users(self, offset: int = 0) -> tuple[list[dict], int]:
+        response = await self._get(
+            "/api/v1/User",
+            params={"offset": offset, "maxSize": ESPO_PAGE_SIZE},
+        )
+        return response.get("list", []), response.get("total", 0)
+
+    async def _get_contacts(self, offset: int = 0) -> tuple[list[dict], int]:
+        response = await self._get(
+            "/api/v1/Contact",
+            params={"offset": offset, "maxSize": ESPO_PAGE_SIZE},
+        )
+        return response.get("list", []), response.get("total", 0)
+
+    async def _get_accounts(self, offset: int = 0) -> tuple[list[dict], int]:
+        response = await self._get(
+            "/api/v1/Account",
+            params={"offset": offset, "maxSize": ESPO_PAGE_SIZE},
+        )
+        return response.get("list", []), response.get("total", 0)
 
     # ------------------------------------------------------------------
     # Ticket (Case) endpoints
@@ -298,10 +332,10 @@ class EspoClient:
         response = await self._get(
             "/api/v1/Case",
             params={
-                "offset": offset,
+                "offset":  offset,
                 "maxSize": min(max_size, ESPO_PAGE_SIZE),
                 "orderBy": "createdAt",
-                "order": "asc",
+                "order":   "asc",
             },
         )
         return response.get("list", []), response.get("total", 0)
@@ -337,9 +371,7 @@ class EspoClient:
             all_tickets.extend(batch)
             logger.info(
                 "EspoCRM: fetched %d tickets (total so far: %d / %d)",
-                len(batch),
-                len(all_tickets),
-                total,
+                len(batch), len(all_tickets), total,
             )
 
         logger.info("EspoCRM: fetched %d tickets total", len(all_tickets))
@@ -364,13 +396,13 @@ class EspoClient:
             response = await self._get(
                 "/api/v1/Case",
                 params={
-                    "offset": offset,
-                    "maxSize": ESPO_PAGE_SIZE,
-                    "orderBy": "modifiedAt",
-                    "order": "asc",
-                    "where[0][type]": "after",
-                    "where[0][attribute]": "modifiedAt",
-                    "where[0][value]": since,
+                    "offset":               offset,
+                    "maxSize":              ESPO_PAGE_SIZE,
+                    "orderBy":              "modifiedAt",
+                    "order":                "asc",
+                    "where[0][type]":       "after",
+                    "where[0][attribute]":  "modifiedAt",
+                    "where[0][value]":      since,
                 },
             )
             batch = response.get("list", [])
@@ -420,8 +452,7 @@ class EspoClient:
         all_users = await self._get_all_users_with_detail()
 
         agents = [
-            user
-            for user in all_users
+            user for user in all_users
             if any(
                 AGENT_ROLE_KEYWORD in role_name
                 for role_name in (user.get("rolesNames") or {}).values()
@@ -430,13 +461,6 @@ class EspoClient:
 
         logger.info("EspoCRM: fetched %d agents total", len(agents))
         return agents
-
-    async def _get_users(self, offset: int = 0) -> tuple[list[dict], int]:
-        response = await self._get(
-            "/api/v1/User",
-            params={"offset": offset, "maxSize": ESPO_PAGE_SIZE},
-        )
-        return response.get("list", []), response.get("total", 0)
 
     # ------------------------------------------------------------------
     # Customer (Contact) endpoints
@@ -451,8 +475,7 @@ class EspoClient:
         all_users = await self._get_all_users_with_detail()
 
         customers = [
-            user
-            for user in all_users
+            user for user in all_users
             if any(
                 CUSTOMER_ROLE_KEYWORD in role_name
                 for role_name in (user.get("rolesNames") or {}).values()
@@ -461,13 +484,6 @@ class EspoClient:
 
         logger.info("EspoCRM: fetched %d customers total", len(customers))
         return customers
-
-    async def _get_contacts(self, offset: int = 0) -> tuple[list[dict], int]:
-        response = await self._get(
-            "/api/v1/Contact",
-            params={"offset": offset, "maxSize": ESPO_PAGE_SIZE},
-        )
-        return response.get("list", []), response.get("total", 0)
 
     # ------------------------------------------------------------------
     # Company (Account) endpoints
@@ -494,13 +510,6 @@ class EspoClient:
         logger.info("EspoCRM: fetched %d companies total", len(all_companies))
         return all_companies
 
-    async def _get_accounts(self, offset: int = 0) -> tuple[list[dict], int]:
-        response = await self._get(
-            "/api/v1/Account",
-            params={"offset": offset, "maxSize": ESPO_PAGE_SIZE},
-        )
-        return response.get("list", []), response.get("total", 0)
-
     # ------------------------------------------------------------------
     # Comments (Case stream) endpoints
     # ------------------------------------------------------------------
@@ -526,11 +535,11 @@ class EspoClient:
             response = await self._get(
                 f"/api/v1/Case/{crm_ticket_id}/stream",
                 params={
-                    "offset": offset,
-                    "maxSize": ESPO_PAGE_SIZE,
-                    "where[0][type]": "equals",
-                    "where[0][attribute]": "type",
-                    "where[0][value]": "Post",
+                    "offset":               offset,
+                    "maxSize":              ESPO_PAGE_SIZE,
+                    "where[0][type]":       "equals",
+                    "where[0][attribute]":  "type",
+                    "where[0][value]":      "Post",
                 },
             )
 
@@ -548,48 +557,38 @@ class EspoClient:
 
         logger.debug(
             "EspoCRM: fetched %d stream posts for Case %s",
-            len(all_posts),
-            crm_ticket_id,
+            len(all_posts), crm_ticket_id,
         )
         return all_posts
 
-    async def _post(self, path: str, data: dict) -> Any:
-        """
-        Perform a POST request and return the parsed JSON response.
-
-        Raises:
-            EspoAuthError: on 401 / 403
-            EspoClientError: on any other non-2xx response
-        """
-        client = self._ensure_client()
-        logger.debug("EspoCRM POST %s payload=%s", path, data)
-
-        response = await client.post(path, json=data)
-
-        if response.status_code in (401, 403):
-            raise EspoAuthError(
-                f"EspoCRM authentication failed ({response.status_code}). "
-                "Check ESPO_API_KEY in your .env"
-            )
-        if not response.is_success:
-            raise EspoClientError(
-                f"EspoCRM API error {response.status_code} for POST {path}: "
-                f"{response.text[:300]}"
-            )
-
-        return response.json()
-
     async def post_comment(
-        self, crm_ticket_id: str, body: str, author_name: str
+        self,
+        crm_ticket_id: str,
+        body: str,
+        author_name: str,
     ) -> dict:
         """
         Create a stream Post on an EspoCRM Case.
+
         POST /api/v1/Note
+
+        EspoCRM stream posts use the Note entity with type="Post".
+        The `post` field carries the comment body — NOT `body`.
+        No content_type field is needed (EspoCRM handles formatting).
+
+        Args:
+            crm_ticket_id: EspoCRM Case UUID string.
+            body:          Comment text.
+            author_name:   Display name of the author (informational only —
+                           EspoCRM assigns authorship from the API key identity).
+
+        Returns:
+            Raw created Note dict from EspoCRM.
         """
         payload = {
-            "type": "Post",
-            "parentId": crm_ticket_id,
+            "type":       "Post",
+            "parentId":   crm_ticket_id,
             "parentType": "Case",
-            "post": body,
+            "post":       body,          # EspoCRM uses "post", not "body"
         }
         return await self._post("/api/v1/Note", payload)
