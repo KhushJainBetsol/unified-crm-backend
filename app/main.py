@@ -216,7 +216,7 @@ from app.core.settings import get_settings
 from app.routes import sync, tickets, agents, customers, companies
 from app.services.scheduler import run_all_full_sync, start_scheduler, stop_scheduler
 from app.utils.exceptions import register_exception_handlers
-
+from app.integrations.webhooks.router import router as webhook_router
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
@@ -337,6 +337,7 @@ app.include_router(agents.router,    prefix="/api/v1")
 app.include_router(customers.router, prefix="/api/v1")
 app.include_router(companies.router, prefix="/api/v1")
 app.include_router(sync.router,      prefix="/api/v1")
+app.include_router(webhook_router)
 
 
 # ---------------------------------------------------------------------------
