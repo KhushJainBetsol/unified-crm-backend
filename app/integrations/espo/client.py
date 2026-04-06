@@ -553,16 +553,43 @@ class EspoClient:
         )
         return all_posts
 
+    async def _post(self, path: str, data: dict) -> Any:
+        """
+        Perform a POST request and return the parsed JSON response.
 
-async def post_comment(self, crm_ticket_id: str, body: str, author_name: str) -> dict:
-    """
-    POST /api/v1/Note
-    Creates a stream Post on an EspoCRM Case.
-    """
-    payload = {
-        "type": "Post",
-        "parentId": crm_ticket_id,
-        "parentType": "Case",
-        "post": body,
-    }
-    return await self._post("/api/v1/Note", json=payload)
+        Raises:
+            EspoAuthError: on 401 / 403
+            EspoClientError: on any other non-2xx response
+        """
+        client = self._ensure_client()
+        logger.debug("EspoCRM POST %s payload=%s", path, data)
+
+        response = await client.post(path, json=data)
+
+        if response.status_code in (401, 403):
+            raise EspoAuthError(
+                f"EspoCRM authentication failed ({response.status_code}). "
+                "Check ESPO_API_KEY in your .env"
+            )
+        if not response.is_success:
+            raise EspoClientError(
+                f"EspoCRM API error {response.status_code} for POST {path}: "
+                f"{response.text[:300]}"
+            )
+
+        return response.json()
+
+    async def post_comment(
+        self, crm_ticket_id: str, body: str, author_name: str
+    ) -> dict:
+        """
+        Create a stream Post on an EspoCRM Case.
+        POST /api/v1/Note
+        """
+        payload = {
+            "type": "Post",
+            "parentId": crm_ticket_id,
+            "parentType": "Case",
+            "post": body,
+        }
+        return await self._post("/api/v1/Note", payload)
