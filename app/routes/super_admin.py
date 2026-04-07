@@ -114,58 +114,71 @@ async def create_tenant(
             "At least one source system must be selected",
         )
 
-    # Step 1 — slug
-    slug = body.name.lower().replace(" ", "-").replace("_", "-")
-    slug = "".join(c for c in slug if c.isalnum() or c == "-")
+    try:
+        # Step 1 — slug
+        slug = body.name.lower().replace(" ", "-").replace("_", "-")
+        slug = "".join(c for c in slug if c.isalnum() or c == "-")
 
-    # Step 2 — uniqueness check
-    existing = await db.execute(select(Tenant).where(Tenant.slug == slug))
-    if existing.scalars().first():
+        # Step 2 — uniqueness check
+        existing = await db.execute(select(Tenant).where(Tenant.slug == slug))
+        if existing.scalars().first():
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Organisation slug '{slug}' already exists",
+            )
+
+        # Step 3 — insert tenant
+        tenant = Tenant(name=body.name, slug=slug)
+        db.add(tenant)
+        await db.flush()  # populate tenant.id
+
+        # Step 4 — seed shared realm (idempotent)
+        existing_realm = await db.execute(
+            select(TenantRealm).where(TenantRealm.realm_name == settings.KEYCLOAK_REALM)
+        )
+        if not existing_realm.scalars().first():
+            realm = TenantRealm(
+                tenant_id=None,
+                realm_name=settings.KEYCLOAK_REALM,
+                issuer_url=f"{settings.KEYCLOAK_URL}/realms/{settings.KEYCLOAK_REALM}",
+                is_active=True,
+            )
+            db.add(realm)
+
+        # Step 5 — validate all source_system_ids exist in DB
+        ss_result = await db.execute(
+            select(SourceSystem).where(SourceSystem.id.in_(body.source_system_ids))
+        )
+        found_systems = ss_result.scalars().all()
+        found_ids = {s.id for s in found_systems}
+        missing = set(body.source_system_ids) - found_ids
+        if missing:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Source system ID(s) not found: {sorted(missing)}",
+            )
+
+        # Step 6 — insert TenantSourceSystem rows (one per selected system)
+        for ss in found_systems:
+            db.add(TenantSourceSystem(
+                tenant_id=tenant.id,
+                source_system_id=ss.id,
+                is_active=True,
+            ))
+
+        await db.commit()
+
+    except HTTPException:
+        # Roll back any partial writes before bubbling up the HTTP error
+        await db.rollback()
+        raise
+    except Exception as exc:
+        await db.rollback()
+        logger.exception("Unexpected error creating tenant: %s", exc)
         raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"Organisation slug '{slug}' already exists",
-        )
-
-    # Step 3 — insert tenant
-    tenant = Tenant(name=body.name, slug=slug)
-    db.add(tenant)
-    await db.flush()  # populate tenant.id
-
-    # Step 4 — seed shared realm (idempotent)
-    existing_realm = await db.execute(
-        select(TenantRealm).where(TenantRealm.realm_name == settings.KEYCLOAK_REALM)
-    )
-    if not existing_realm.scalars().first():
-        realm = TenantRealm(
-            tenant_id=None,
-            realm_name=settings.KEYCLOAK_REALM,
-            issuer_url=f"{settings.KEYCLOAK_URL}/realms/{settings.KEYCLOAK_REALM}",
-            is_active=True,
-        )
-        db.add(realm)
-
-    # Step 5 — validate all source_system_ids exist in DB
-    ss_result = await db.execute(
-        select(SourceSystem).where(SourceSystem.id.in_(body.source_system_ids))
-    )
-    found_systems = ss_result.scalars().all()
-    found_ids = {s.id for s in found_systems}
-    missing = set(body.source_system_ids) - found_ids
-    if missing:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f"Source system ID(s) not found: {sorted(missing)}",
-        )
-
-    # Step 6 — insert TenantSourceSystem rows (one per selected system)
-    for ss in found_systems:
-        db.add(TenantSourceSystem(
-            tenant_id=tenant.id,
-            source_system_id=ss.id,
-            is_active=True,
-        ))
-
-    await db.commit()
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Failed to create tenant due to an internal error.",
+        ) from exc
 
     logger.info(
         "Created tenant '%s' (id=%s) with source systems %s",
@@ -214,69 +227,82 @@ async def invite_admin(
     """
     _require_super_admin(user)
 
-    # Step 1 — tenant must exist and be active
-    tenant_result = await db.execute(
-        select(Tenant).where(Tenant.id == body.tenant_id)
-    )
-    tenant = tenant_result.scalars().first()
-    if not tenant:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND,
-            f"Tenant '{body.tenant_id}' not found",
-        )
-    if not tenant.is_active:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"Tenant '{tenant.name}' is not active",
-        )
-
-    # Step 2 — no duplicate active invite
-    dup = await db.execute(
-        select(Invitation)
-        .where(Invitation.email == body.admin_email)
-        .where(Invitation.tenant_id == tenant.id)
-        .where(Invitation.status == "pending")
-        .where(Invitation.expires_at > datetime.utcnow())
-    )
-    if dup.scalars().first():
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"An active invite already exists for '{body.admin_email}' in this tenant",
-        )
-
-    # Step 3 — split full name into first / last for Keycloak
-    name_parts = body.admin_name.strip().split(" ", 1)
-    first_name = name_parts[0]
-    last_name = name_parts[1] if len(name_parts) > 1 else ""
-
-    # Step 4 — create Keycloak user
     try:
-        await create_keycloak_user(
-            email=body.admin_email,
-            first_name=first_name,
-            last_name=last_name,
-            tenant_id=str(tenant.id),
-            role="admin",
-            realm=settings.KEYCLOAK_REALM,
+        # Step 1 — tenant must exist and be active
+        tenant_result = await db.execute(
+            select(Tenant).where(Tenant.id == body.tenant_id)
         )
-    except ValueError as e:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
-    except Exception as e:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Keycloak error: {e}")
+        tenant = tenant_result.scalars().first()
+        if not tenant:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"Tenant '{body.tenant_id}' not found",
+            )
+        if not tenant.is_active:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Tenant '{tenant.name}' is not active",
+            )
 
-    # Step 5 — invite token
-    invite_token = secrets.token_urlsafe(32)
-    invitation = Invitation(
-        tenant_id=tenant.id,
-        email=body.admin_email,
-        role="admin",
-        token=invite_token,
-        status="pending",
-        expires_at=datetime.utcnow() + timedelta(hours=24),
-        realm_name=settings.KEYCLOAK_REALM,
-    )
-    db.add(invitation)
-    await db.commit()
+        # Step 2 — no duplicate active invite
+        dup = await db.execute(
+            select(Invitation)
+            .where(Invitation.email == body.admin_email)
+            .where(Invitation.tenant_id == tenant.id)
+            .where(Invitation.status == "pending")
+            .where(Invitation.expires_at > datetime.utcnow())
+        )
+        if dup.scalars().first():
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"An active invite already exists for '{body.admin_email}' in this tenant",
+            )
+
+        # Step 3 — split full name into first / last for Keycloak
+        name_parts = body.admin_name.strip().split(" ", 1)
+        first_name = name_parts[0]
+        last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+        # Step 4 — create Keycloak user
+        try:
+            await create_keycloak_user(
+                email=body.admin_email,
+                first_name=first_name,
+                last_name=last_name,
+                tenant_id=str(tenant.id),
+                role="admin",
+                realm=settings.KEYCLOAK_REALM,
+            )
+        except ValueError as e:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(e))
+        except Exception as e:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Keycloak error: {e}")
+
+        # Step 5 — invite token
+        invite_token = secrets.token_urlsafe(32)
+        invitation = Invitation(
+            tenant_id=tenant.id,
+            email=body.admin_email,
+            role="admin",
+            token=invite_token,
+            status="pending",
+            expires_at=datetime.utcnow() + timedelta(hours=24),
+            realm_name=settings.KEYCLOAK_REALM,
+        )
+        db.add(invitation)
+        await db.commit()
+
+    except HTTPException:
+        # Roll back any partial writes before bubbling the HTTP error up
+        await db.rollback()
+        raise
+    except Exception as exc:
+        await db.rollback()
+        logger.exception("Unexpected error inviting admin: %s", exc)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Failed to invite admin due to an internal error.",
+        ) from exc
 
     invite_link = f"{settings.FRONTEND_URL}/invite?token={invite_token}"
     logger.info("Admin invite → '%s' for tenant '%s'", body.admin_email, tenant.slug)

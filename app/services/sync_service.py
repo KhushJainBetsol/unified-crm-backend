@@ -61,8 +61,8 @@ class SyncService:
         # In-memory caches — populated on first lookup, reused per sync run
         # key pattern: (crm_id_string, source_system_id) → internal UUID
         # ----------------------------------------------------------------
-        self._status_cache:   dict[str, int]                        = {}
-        self._priority_cache: dict[str, int]                        = {}
+        self._status_cache:   dict[str, int]                          = {}
+        self._priority_cache: dict[str, int]                          = {}
         self._agent_cache:    dict[tuple[str, int], uuid.UUID | None] = {}
         self._customer_cache: dict[tuple[str, int], uuid.UUID | None] = {}
         self._company_cache:  dict[tuple[str, int], uuid.UUID | None] = {}
@@ -71,13 +71,28 @@ class SyncService:
     # Source system
     # ------------------------------------------------------------------
     async def _get_source_system_id(self, name: str) -> int | None:
-        result = await self.db.execute(
-            select(SourceSystem).where(SourceSystem.system_name == name.lower())
-        )
-        source = result.scalars().first()
-        if not source:
-            logger.error("Source system '%s' not found in DB — make sure it is seeded", name)
-        return source.id if source else None
+        """
+        Resolve source system name → internal integer ID.
+        Rolls back and returns None on any DB error so the caller can
+        decide whether to abort the whole sync.
+        """
+        try:
+            result = await self.db.execute(
+                select(SourceSystem).where(SourceSystem.system_name == name.lower())
+            )
+            source = result.scalars().first()
+            if not source:
+                logger.error(
+                    "Source system '%s' not found in DB — make sure it is seeded", name
+                )
+            return source.id if source else None
+        except Exception as exc:
+            # Roll back the aborted transaction so the session stays usable
+            await self.db.rollback()
+            logger.exception(
+                "DB error while resolving source system '%s': %s", name, exc
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Status
@@ -86,22 +101,32 @@ class SyncService:
         if name in self._status_cache:
             return self._status_cache[name]
 
-        result = await self.db.execute(
-            select(TicketStatus).where(TicketStatus.status_name == name.lower())
-        )
-        status = result.scalars().first()
-
-        if not status:
-            logger.warning("Status '%s' not found — falling back to 'open'", name)
+        try:
             result = await self.db.execute(
-                select(TicketStatus).where(TicketStatus.status_name == "open")
+                select(TicketStatus).where(TicketStatus.status_name == name.lower())
             )
             status = result.scalars().first()
 
-        if status:
-            self._status_cache[name] = status.id
-            return status.id
-        return None
+            if not status:
+                logger.warning("Status '%s' not found — falling back to 'open'", name)
+                result = await self.db.execute(
+                    select(TicketStatus).where(TicketStatus.status_name == "open")
+                )
+                status = result.scalars().first()
+
+            if status:
+                self._status_cache[name] = status.id
+                return status.id
+
+            logger.error("Fallback status 'open' not found in DB — check seed data")
+            return None
+
+        except Exception as exc:
+            await self.db.rollback()
+            logger.exception(
+                "DB error while resolving status '%s': %s", name, exc
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Priority
@@ -112,15 +137,28 @@ class SyncService:
         if name in self._priority_cache:
             return self._priority_cache[name]
 
-        result = await self.db.execute(
-            select(TicketPriority).where(TicketPriority.priority_name == name.lower())
-        )
-        priority = result.scalars().first()
+        try:
+            result = await self.db.execute(
+                select(TicketPriority).where(
+                    TicketPriority.priority_name == name.lower()
+                )
+            )
+            priority = result.scalars().first()
 
-        if priority:
-            self._priority_cache[name] = priority.id
-            return priority.id
-        return None
+            if priority:
+                self._priority_cache[name] = priority.id
+                return priority.id
+
+            # Priority is optional — warn but don't fail the ticket
+            logger.warning("Priority '%s' not found — priority_id will be NULL", name)
+            return None
+
+        except Exception as exc:
+            await self.db.rollback()
+            logger.exception(
+                "DB error while resolving priority '%s': %s", name, exc
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Agent
@@ -137,22 +175,31 @@ class SyncService:
         if cache_key in self._agent_cache:
             return self._agent_cache[cache_key]
 
-        result = await self.db.execute(
-            select(Agent).where(
-                Agent.crm_agent_id == crm_agent_id,
-                Agent.source_system_id == source_system_id,
+        try:
+            result = await self.db.execute(
+                select(Agent).where(
+                    Agent.crm_agent_id == crm_agent_id,
+                    Agent.source_system_id == source_system_id,
+                )
             )
-        )
-        agent = result.scalars().first()
-        internal_id = agent.id if agent else None
-        self._agent_cache[cache_key] = internal_id
+            agent = result.scalars().first()
+            internal_id = agent.id if agent else None
+            self._agent_cache[cache_key] = internal_id
 
-        if not internal_id:
-            logger.warning(
-                "Agent crm_id=%r source=%d not found — agent_id will be NULL.",
-                crm_agent_id, source_system_id,
+            if not internal_id:
+                logger.warning(
+                    "Agent crm_id=%r source=%d not found — agent_id will be NULL.",
+                    crm_agent_id, source_system_id,
+                )
+            return internal_id
+
+        except Exception as exc:
+            await self.db.rollback()
+            logger.exception(
+                "DB error while resolving agent crm_id=%r source=%d: %s",
+                crm_agent_id, source_system_id, exc,
             )
-        return internal_id
+            return None
 
     # ------------------------------------------------------------------
     # Customer
@@ -169,22 +216,31 @@ class SyncService:
         if cache_key in self._customer_cache:
             return self._customer_cache[cache_key]
 
-        result = await self.db.execute(
-            select(Customer).where(
-                Customer.crm_customer_id == crm_customer_id,
-                Customer.source_system_id == source_system_id,
+        try:
+            result = await self.db.execute(
+                select(Customer).where(
+                    Customer.crm_customer_id == crm_customer_id,
+                    Customer.source_system_id == source_system_id,
+                )
             )
-        )
-        customer = result.scalars().first()
-        internal_id = customer.id if customer else None
-        self._customer_cache[cache_key] = internal_id
+            customer = result.scalars().first()
+            internal_id = customer.id if customer else None
+            self._customer_cache[cache_key] = internal_id
 
-        if not internal_id:
-            logger.warning(
-                "Customer crm_id=%r source=%d not found — customer_id will be NULL.",
-                crm_customer_id, source_system_id,
+            if not internal_id:
+                logger.warning(
+                    "Customer crm_id=%r source=%d not found — customer_id will be NULL.",
+                    crm_customer_id, source_system_id,
+                )
+            return internal_id
+
+        except Exception as exc:
+            await self.db.rollback()
+            logger.exception(
+                "DB error while resolving customer crm_id=%r source=%d: %s",
+                crm_customer_id, source_system_id, exc,
             )
-        return internal_id
+            return None
 
     # ------------------------------------------------------------------
     # Company — returns just the company UUID.
@@ -202,25 +258,35 @@ class SyncService:
         if cache_key in self._company_cache:
             return self._company_cache[cache_key]
 
-        result = await self.db.execute(
-            select(Company).where(
-                Company.crm_company_id == crm_company_id,
-                Company.source_system_id == source_system_id,
+        try:
+            result = await self.db.execute(
+                select(Company).where(
+                    Company.crm_company_id == crm_company_id,
+                    Company.source_system_id == source_system_id,
+                )
             )
-        )
-        company = result.scalars().first()
-        internal_id = company.id if company else None
-        self._company_cache[cache_key] = internal_id
+            company = result.scalars().first()
+            internal_id = company.id if company else None
+            self._company_cache[cache_key] = internal_id
 
-        if not internal_id:
-            logger.warning(
-                "Company crm_id=%r source=%d not found — company_id will be NULL.",
-                crm_company_id, source_system_id,
+            if not internal_id:
+                logger.warning(
+                    "Company crm_id=%r source=%d not found — company_id will be NULL.",
+                    crm_company_id, source_system_id,
+                )
+            return internal_id
+
+        except Exception as exc:
+            await self.db.rollback()
+            logger.exception(
+                "DB error while resolving company crm_id=%r source=%d: %s",
+                crm_company_id, source_system_id, exc,
             )
-        return internal_id
+            return None
 
     # ------------------------------------------------------------------
-    # Save single ticket
+    # Save single ticket  (wrapped in a SAVEPOINT so one bad upsert
+    # cannot abort the outer transaction and block all remaining tickets)
     # ------------------------------------------------------------------
     async def _save_ticket(
         self,
@@ -232,7 +298,16 @@ class SyncService:
         customer_id: uuid.UUID | None,
         company_id: uuid.UUID | None,
     ) -> bool:
-        """Upsert one normalized ticket. Returns True if created, False if updated."""
+        """
+        Upsert one normalized ticket inside a SAVEPOINT.
+
+        Using a nested transaction (SAVEPOINT) means that if the upsert
+        fails, only that single ticket is rolled back — the outer
+        transaction and all previously committed tickets are unaffected.
+
+        Returns True if created, False if updated.
+        Raises on error (caller increments failed counter).
+        """
         data = {
             "tenant_id": None,            # NULL for now — isolation logic not yet decided
             "title": ticket.title,
@@ -249,11 +324,13 @@ class SyncService:
             "is_deleted_by_crm": False,
         }
 
-        _, created = await self.repo.upsert(
-            crm_ticket_id=ticket.crm_ticket_id,
-            source_system_id=source_system_id,
-            data=data,
-        )
+        # SAVEPOINT — isolates this upsert from the outer transaction
+        async with self.db.begin_nested():
+            _, created = await self.repo.upsert(
+                crm_ticket_id=ticket.crm_ticket_id,
+                source_system_id=source_system_id,
+                data=data,
+            )
         return created
 
     # ------------------------------------------------------------------
@@ -289,7 +366,12 @@ class SyncService:
 
         source_system_id = await self._get_source_system_id(source_system)
         if not source_system_id:
+            # Abort entire sync — every ticket would fail without a valid source system
             result.failed = len(normalized_tickets)
+            logger.error(
+                "Aborting sync for '%s' — source system could not be resolved",
+                source_system,
+            )
             return result
 
         logger.info(
@@ -329,8 +411,15 @@ class SyncService:
                     result.updated += 1
 
             except Exception as exc:
-                logger.error("Failed to save ticket %s: %s", ticket.crm_ticket_id, exc)
+                # SAVEPOINT in _save_ticket already rolled back the failed upsert.
+                # Roll back here as a safety net in case the error originated
+                # outside _save_ticket (e.g. a resolution helper re-raised).
+                await self.db.rollback()
+                logger.error(
+                    "Failed to save ticket %s: %s", ticket.crm_ticket_id, exc
+                )
                 result.failed += 1
+                # Continue — do not let one bad ticket abort the rest
 
         logger.info(
             "Sync complete for %s — created: %d, updated: %d, failed: %d",
