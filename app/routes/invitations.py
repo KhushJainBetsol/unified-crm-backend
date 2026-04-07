@@ -54,6 +54,7 @@ class InviteAgentRequest(BaseModel):
     role: str = "agent"
     first_name: str = ""
     last_name: str = ""
+    name: str = ""  
 
 
 # ---------------------------------------------------------------------------
@@ -190,10 +191,14 @@ async def accept_invite(
     existing = await db.execute(
         select(DashboardUser).where(DashboardUser.keycloak_sub == keycloak_sub)
     )
+    kc_first = kc_user.get("firstName", "")
+    kc_last  = kc_user.get("lastName", "")
+    full_name = f"{kc_first} {kc_last}".strip()
     if not existing.scalars().first():
         db_user = DashboardUser(
             tenant_id=invite.tenant_id,
             keycloak_sub=keycloak_sub,
+            name=full_name,
             email=invite.email,
             role=invite.role,
             is_active=True,
