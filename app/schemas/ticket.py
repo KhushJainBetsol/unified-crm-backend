@@ -10,7 +10,8 @@ All Response schemas replace raw FK IDs with human-readable string values:
   - source_system_id → source_system (e.g. "zammad")
 
 Update schemas:
-  - TicketUpdateRequest : public PUT endpoint schema (role-gated in the service)
+  - TicketUpdateRequest : public PUT endpoint schema (role-gated at the route
+                          via require_admin — no `role` field needed here)
 
 Response shapes:
   - TicketResponse       : full flat response
@@ -23,7 +24,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator, EmailStr
+from pydantic import BaseModel, Field, model_validator
 
 from app.schemas.agent import AgentBriefResponse
 from app.schemas.company import CompanyBriefResponse
@@ -77,32 +78,21 @@ class TicketAdminUpdate(BaseModel):
 # Public update request — used by PUT /tickets/{id}
 #
 # Uses human-readable string names (not raw FK IDs).
-# Role enforcement is handled in TicketService.update_ticket(), not here.
-#
-# `role` is passed directly from the frontend until Keycloak is integrated.
-# Once auth is live:
-#   - Remove the `role` field from this schema
-#   - Pass role from the decoded JWT in the route instead
+# Role enforcement is handled at the route level via `require_admin` —
+# the `role` field has been removed now that auth comes from the JWT.
 # ---------------------------------------------------------------------------
 class TicketUpdateRequest(BaseModel):
-    role: str = Field(
-        ...,
-        description=(
-            "Caller role: 'agent' | 'admin'  "
-            "— temporary until Keycloak auth is integrated"
-        ),
-    )
     status: str | None = Field(
         default=None,
         description="Ticket status: open | pending | closed",
     )
     priority: str | None = Field(
         default=None,
-        description="Ticket priority: low | normal | high | urgent  (admin only)",
+        description="Ticket priority: low | normal | high | urgent",
     )
     agent_id: UUID | None = Field(
         default=None,
-        description="UUID of the agent to assign this ticket to  (admin only)",
+        description="UUID of the agent to assign this ticket to",
     )
 
 

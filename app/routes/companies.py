@@ -1,9 +1,12 @@
 """
-app/routes/companies.py
+app/routes/companies.py  — UPDATED for multitenancy
 
-GET /companies/        → paginated list
-GET /companies/filter  → filtered list (?source)
-GET /companies/{id}    → full detail
+Same pattern as tickets/customers — get_current_user injected,
+tenant_id passed down. Existing logic unchanged.
+
+GET /companies/        → paginated list  (tenant-scoped)
+GET /companies/filter  → filtered list   (tenant-scoped, ?source)
+GET /companies/{id}    → full detail     (tenant-scoped)
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import CurrentUser, get_current_user
 from app.dependencies import get_db
 from app.schemas.company import CompanyResponse
 from app.services.company_service import CompanyService
@@ -39,15 +43,18 @@ def _to_response(company) -> dict:
 # GET /companies/
 # ---------------------------------------------------------------------------
 
-@router.get("/", summary="List all companies")
+@router.get("/", summary="List all companies for current tenant")
 async def list_companies(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),   # NEW
 ):
+    tenant_id = current_user.require_tenant()                  # NEW
     companies, total = await CompanyService(db).get_companies(
         page=page,
         page_size=page_size,
+        tenant_id=uuid.UUID(tenant_id),                        # NEW
     )
     return paginated(
         items=[_to_response(c) for c in companies],
@@ -69,11 +76,14 @@ async def filter_companies(
     page_size: int = Query(default=20, ge=1, le=100),
     source: str | None = Query(default=None, description="CRM source: zammad, espocrm"),
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),   # NEW
 ):
+    tenant_id = current_user.require_tenant()                  # NEW
     companies, total = await CompanyService(db).filter_companies(
         page=page,
         page_size=page_size,
         source=source,
+        tenant_id=uuid.UUID(tenant_id),                        # NEW
     )
     return paginated(
         items=[_to_response(c) for c in companies],
@@ -92,6 +102,11 @@ async def filter_companies(
 async def get_company(
     company_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),   # NEW
 ):
-    company = await CompanyService(db).get_company_or_404(company_id)
+    tenant_id = current_user.require_tenant()                  # NEW
+    company = await CompanyService(db).get_company_or_404(
+        company_id,
+        tenant_id=uuid.UUID(tenant_id),                        # NEW
+    )
     return success("Company fetched successfully", _to_response(company))
