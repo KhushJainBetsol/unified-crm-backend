@@ -359,6 +359,7 @@ async def list_admins(
     return [
         {
             "id": str(a.id),
+            "name":a.name,
             "email": a.email,
             "role": a.role,
             "tenant_id": str(a.tenant_id),
@@ -384,6 +385,7 @@ async def list_all_users(
     return [
         {
             "id": str(u.id),
+            "name":u.name,
             "email": u.email,
             "role": u.role,
             "tenant_id": str(u.tenant_id),
