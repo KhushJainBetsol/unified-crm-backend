@@ -22,11 +22,14 @@ from sqlalchemy.exc import OperationalError
 from app.core.database import async_session_maker, create_tables
 from app.core.logging import configure_logging
 from app.core.settings import get_settings
+
 # Existing routers
 from app.routes import sync, tickets, agents, customers, companies
+
 # NEW routers
 from app.routes.auth import router as auth_router
 from app.routes.invitations import router as invitations_router
+from app.routes.tenants import router as tenants_router
 from app.routes.super_admin import router as super_admin_router
 from app.services.scheduler import run_all_full_sync, start_scheduler, stop_scheduler
 from app.utils.exceptions import register_exception_handlers
@@ -46,27 +49,33 @@ async def seed_lookup_tables() -> None:
     async with async_session_maker() as db:
         try:
             if not (await db.execute(select(SourceSystem))).scalars().first():
-                db.add_all([
-                    SourceSystem(system_name="zammad"),
-                    SourceSystem(system_name="espocrm"),
-                ])
+                db.add_all(
+                    [
+                        SourceSystem(system_name="zammad"),
+                        SourceSystem(system_name="espocrm"),
+                    ]
+                )
                 logger.info("Seeded source_systems")
 
             if not (await db.execute(select(TicketStatus))).scalars().first():
-                db.add_all([
-                    TicketStatus(status_name="open"),
-                    TicketStatus(status_name="pending"),
-                    TicketStatus(status_name="closed"),
-                ])
+                db.add_all(
+                    [
+                        TicketStatus(status_name="open"),
+                        TicketStatus(status_name="pending"),
+                        TicketStatus(status_name="closed"),
+                    ]
+                )
                 logger.info("Seeded ticket_status")
 
             if not (await db.execute(select(TicketPriority))).scalars().first():
-                db.add_all([
-                    TicketPriority(priority_name="low"),
-                    TicketPriority(priority_name="normal"),
-                    TicketPriority(priority_name="high"),
-                    TicketPriority(priority_name="urgent"),
-                ])
+                db.add_all(
+                    [
+                        TicketPriority(priority_name="low"),
+                        TicketPriority(priority_name="normal"),
+                        TicketPriority(priority_name="high"),
+                        TicketPriority(priority_name="urgent"),
+                    ]
+                )
                 logger.info("Seeded ticket_priority")
 
             await db.commit()
@@ -90,17 +99,21 @@ async def seed_tenant_realms() -> None:
             )
             if not result.fetchone():
                 await db.execute(
-                    text("""
+                    text(
+                        """
                         INSERT INTO tenant_realms (id, tenant_id, realm_name, issuer_url, is_active, created_at)
                         VALUES (gen_random_uuid(), NULL, :realm, :issuer, true, now())
-                    """),
+                    """
+                    ),
                     {
                         "realm": settings.KEYCLOAK_REALM,
                         "issuer": f"{settings.KEYCLOAK_URL}/realms/{settings.KEYCLOAK_REALM}",
                     },
                 )
                 await db.commit()
-                logger.info("Seeded tenant_realms with realm: %s", settings.KEYCLOAK_REALM)
+                logger.info(
+                    "Seeded tenant_realms with realm: %s", settings.KEYCLOAK_REALM
+                )
             else:
                 logger.info("tenant_realms already seeded")
         except Exception as exc:
@@ -122,7 +135,7 @@ async def lifespan(app: FastAPI):
         await create_tables()
         await seed_lookup_tables()
         await seed_crm_integrations()
-        await seed_tenant_realms()         # NEW
+        await seed_tenant_realms()  # NEW
     except OperationalError:
         logger.critical(
             "Startup failed — cannot connect to database. "
@@ -172,6 +185,7 @@ app.include_router(agents.router, prefix="/api/v1")
 app.include_router(customers.router, prefix="/api/v1")
 app.include_router(companies.router, prefix="/api/v1")
 app.include_router(sync.router, prefix="/api/v1")
+app.include_router(tenants_router, prefix="/api/v1")
 app.include_router(webhook_router)
 
 
