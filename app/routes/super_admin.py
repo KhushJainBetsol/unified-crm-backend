@@ -1,15 +1,14 @@
 """
 app/routes/super_admin.py
 
-Super Admin APIs — two separate flows:
+Super Admin APIs:
 
-  POST /super-admin/tenants              → create tenant in DB only (no Keycloak, no invite)
-  POST /super-admin/admins/invite        → invite an admin to an existing tenant (Keycloak + invite token)
+  POST /super-admin/tenants              → create tenant in DB + assign source systems
+  POST /super-admin/admins/invite        → invite an admin to an existing tenant
   GET  /super-admin/tenants              → list all tenants
   GET  /super-admin/admins               → list all admins (dashboard_users with role=admin)
   GET  /super-admin/users                → list all dashboard users
-
-Super admin is identified by email match (SUPER_ADMIN_EMAIL env var) or is_superadmin flag.
+  GET  /super-admin/source-systems       → list all supported source systems (for frontend dropdown)
 """
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timedelta
+from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr
@@ -29,8 +29,10 @@ from app.core.settings import get_settings
 from app.dependencies import get_db
 from app.models.dashboard_user import DashboardUser
 from app.models.invitation import Invitation
+from app.models.source_system import SourceSystem
 from app.models.tenant import Tenant
 from app.models.tenant_realm import TenantRealm
+from app.models.tenant_source_systems import TenantSourceSystem
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -49,22 +51,41 @@ def _require_super_admin(user: CurrentUser) -> None:
 # ---------------------------------------------------------------------------
 
 class CreateTenantRequest(BaseModel):
-    """Only tenant info — no admin details."""
+    """Tenant info + list of source system IDs the tenant will use."""
     name: str
-    contact_email: EmailStr  # stored for reference, not used to create a user
+    contact_email: EmailStr
+    source_system_ids: List[int]  # e.g. [1, 2] — must exist in source_systems table
 
 
 class InviteAdminRequest(BaseModel):
     """Invite an admin to an already-existing tenant."""
     tenant_id: uuid.UUID
     admin_email: EmailStr
-    admin_first_name: str = "Admin"
-    admin_last_name: str = "User"
+    admin_name: str  # full name, split into first/last internally
+
+
+# ---------------------------------------------------------------------------
+# GET /super-admin/source-systems
+# Frontend calls this to populate the source systems checklist/dropdown.
+# ---------------------------------------------------------------------------
+
+@router.get("/source-systems")
+async def list_source_systems(
+    db: AsyncSession = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """Return all supported source systems so the frontend can display them."""
+    _require_super_admin(user)
+    result = await db.execute(select(SourceSystem))
+    return [
+        {"id": s.id, "system_name": s.system_name}
+        for s in result.scalars().all()
+    ]
 
 
 # ---------------------------------------------------------------------------
 # POST /super-admin/tenants
-# ONLY inserts tenant into DB — no Keycloak, no invite.
+# Creates tenant + assigns selected source systems in tenant_source_systems.
 # ---------------------------------------------------------------------------
 
 @router.post("/tenants", status_code=status.HTTP_201_CREATED)
@@ -74,19 +95,24 @@ async def create_tenant(
     user: CurrentUser = Depends(get_current_user),
 ):
     """
-    Create a new tenant organisation in the database.
-
-    This endpoint ONLY creates the tenant row. No Keycloak user is created
-    and no invitation is sent — use POST /super-admin/admins/invite for that.
+    Create a new tenant and assign the source systems they use.
 
     Steps:
       1. Generate URL-friendly slug from tenant name
       2. Check slug uniqueness
       3. Insert tenant row
       4. Seed shared TenantRealm row (idempotent)
-      5. Return the new tenant
+      5. Validate all provided source_system_ids exist
+      6. Insert a TenantSourceSystem row for each selected source system
+      7. Return the new tenant with assigned source systems
     """
     _require_super_admin(user)
+
+    if not body.source_system_ids:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "At least one source system must be selected",
+        )
 
     # Step 1 — slug
     slug = body.name.lower().replace(" ", "-").replace("_", "-")
@@ -118,9 +144,33 @@ async def create_tenant(
         )
         db.add(realm)
 
+    # Step 5 — validate all source_system_ids exist in DB
+    ss_result = await db.execute(
+        select(SourceSystem).where(SourceSystem.id.in_(body.source_system_ids))
+    )
+    found_systems = ss_result.scalars().all()
+    found_ids = {s.id for s in found_systems}
+    missing = set(body.source_system_ids) - found_ids
+    if missing:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Source system ID(s) not found: {sorted(missing)}",
+        )
+
+    # Step 6 — insert TenantSourceSystem rows (one per selected system)
+    for ss in found_systems:
+        db.add(TenantSourceSystem(
+            tenant_id=tenant.id,
+            source_system_id=ss.id,
+            is_active=True,
+        ))
+
     await db.commit()
 
-    logger.info("Created tenant '%s' (id=%s)", slug, tenant.id)
+    logger.info(
+        "Created tenant '%s' (id=%s) with source systems %s",
+        slug, tenant.id, [s.system_name for s in found_systems],
+    )
 
     return {
         "tenant": {
@@ -130,8 +180,11 @@ async def create_tenant(
             "is_active": tenant.is_active,
             "created_at": tenant.created_at,
         },
+        "source_systems": [
+            {"id": s.id, "system_name": s.system_name} for s in found_systems
+        ],
         "message": (
-            f"Tenant '{tenant.name}' created. "
+            f"Tenant '{tenant.name}' created with {len(found_systems)} source system(s). "
             "Use POST /super-admin/admins/invite to invite an admin."
         ),
     }
@@ -154,9 +207,10 @@ async def invite_admin(
     Steps:
       1. Verify tenant exists and is active
       2. Check no duplicate active (pending + non-expired) invite
-      3. Create Keycloak user in the shared realm
-      4. Generate one-time invite token (24 h expiry) and store it
-      5. Return the invite link
+      3. Split admin_name into first / last for Keycloak
+      4. Create Keycloak user in the shared realm
+      5. Generate one-time invite token (24 h expiry) and store it
+      6. Return the invite link
     """
     _require_super_admin(user)
 
@@ -190,12 +244,17 @@ async def invite_admin(
             f"An active invite already exists for '{body.admin_email}' in this tenant",
         )
 
-    # Step 3 — create Keycloak user
+    # Step 3 — split full name into first / last for Keycloak
+    name_parts = body.admin_name.strip().split(" ", 1)
+    first_name = name_parts[0]
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+    # Step 4 — create Keycloak user
     try:
         await create_keycloak_user(
             email=body.admin_email,
-            first_name=body.admin_first_name,
-            last_name=body.admin_last_name,
+            first_name=first_name,
+            last_name=last_name,
             tenant_id=str(tenant.id),
             role="admin",
             realm=settings.KEYCLOAK_REALM,
@@ -205,7 +264,7 @@ async def invite_admin(
     except Exception as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Keycloak error: {e}")
 
-    # Step 4 — invite token
+    # Step 5 — invite token
     invite_token = secrets.token_urlsafe(32)
     invitation = Invitation(
         tenant_id=tenant.id,
@@ -259,7 +318,6 @@ async def list_tenants(
 
 # ---------------------------------------------------------------------------
 # GET /super-admin/admins
-# All dashboard users with role=admin across all tenants.
 # ---------------------------------------------------------------------------
 
 @router.get("/admins")
