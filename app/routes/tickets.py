@@ -87,8 +87,9 @@ def _to_detail(ticket) -> dict:
         customer=(
             CustomerBriefResponse(
                 id=ticket.customer.id,
-                first_name=ticket.customer.first_name,
-                last_name=ticket.customer.last_name,
+                # first_name=ticket.customer.first_name,
+                # last_name=ticket.customer.last_name,
+                name=ticket.customer.name,
                 email=ticket.customer.email,
             )
             if ticket.customer
@@ -291,7 +292,7 @@ async def list_comments(
     await TicketService(db).get_ticket_or_404(
         ticket_id, tenant_id=uuid.UUID(tenant_id)
     )
-    comments, total = await CommentService(db).get_comments(
+    comments, total = await CommentService(db).get_comments_for_ticket(
         ticket_id=ticket_id,
         page=page,
         page_size=page_size,

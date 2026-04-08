@@ -3,22 +3,24 @@ app/services/sync_service.py
 
 Sync service — saves NormalizedTickets into the database.
 
+Multitenancy:
+  Every sync run is now scoped to a single (tenant_id, source_system_id) pair.
+  tenant_id is required — it is stamped on every ticket, agent, customer,
+  and company upserted during the run.
+
 CRM ID → Internal UUID resolution:
-  Every CRM stores its entities with its own ID format:
-    Zammad   → integer IDs  (owner_id=4, customer_id=8, organization_id=2)
-    EspoCRM  → string UUIDs (assignedUserId="abc123", contactId="xyz", accountId="aaa")
+  Zammad   → integer IDs  (owner_id=4, customer_id=8, organization_id=2)
+  EspoCRM  → string UUIDs (assignedUserId="abc123", contactId="xyz", accountId="aaa")
 
   These raw CRM IDs are stored as crm_agent_id / crm_customer_id / crm_company_id
   in the normalizer output. The sync service resolves them to internal UUIDs by
   querying agents / customers / companies tables using:
-    (crm_*_id, source_system_id) → internal UUID
+    (tenant_id, crm_*_id, source_system_id) → internal UUID
 
   All resolutions are cached in-memory per sync run to avoid N+1 DB queries.
 
   If an agent / customer / company is not yet in the DB the field is set to NULL
-  and a warning is logged. Run the respective sync first to populate those tables.
-
-  tenant_id is stored as NULL for now — isolation logic not yet decided.
+  and a warning is logged. Run the entity sync first to populate those tables.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SyncResult:
     source_system: str
+    tenant_id: uuid.UUID
     total_fetched: int
     created: int
     updated: int
@@ -54,28 +57,22 @@ class SyncResult:
 class SyncService:
 
     def __init__(self, db: AsyncSession) -> None:
-        self.db = db
+        self.db   = db
         self.repo = TicketRepository(db)
 
-        # ----------------------------------------------------------------
-        # In-memory caches — populated on first lookup, reused per sync run
-        # key pattern: (crm_id_string, source_system_id) → internal UUID
-        # ----------------------------------------------------------------
-        self._status_cache:   dict[str, int]                          = {}
-        self._priority_cache: dict[str, int]                          = {}
-        self._agent_cache:    dict[tuple[str, int], uuid.UUID | None] = {}
-        self._customer_cache: dict[tuple[str, int], uuid.UUID | None] = {}
-        self._company_cache:  dict[tuple[str, int], uuid.UUID | None] = {}
+        # In-memory caches — populated on first lookup, reused per sync run.
+        # Agent/customer/company keys include tenant_id to be safe when the
+        # same SyncService instance is (mistakenly) reused across tenants.
+        self._status_cache:   dict[str, int]                                   = {}
+        self._priority_cache: dict[str, int]                                   = {}
+        self._agent_cache:    dict[tuple[uuid.UUID, str, int], uuid.UUID | None] = {}
+        self._customer_cache: dict[tuple[uuid.UUID, str, int], uuid.UUID | None] = {}
+        self._company_cache:  dict[tuple[uuid.UUID, str, int], uuid.UUID | None] = {}
 
     # ------------------------------------------------------------------
     # Source system
     # ------------------------------------------------------------------
     async def _get_source_system_id(self, name: str) -> int | None:
-        """
-        Resolve source system name → internal integer ID.
-        Rolls back and returns None on any DB error so the caller can
-        decide whether to abort the whole sync.
-        """
         try:
             result = await self.db.execute(
                 select(SourceSystem).where(SourceSystem.system_name == name.lower())
@@ -87,7 +84,6 @@ class SyncService:
                 )
             return source.id if source else None
         except Exception as exc:
-            # Roll back the aborted transaction so the session stays usable
             await self.db.rollback()
             logger.exception(
                 "DB error while resolving source system '%s': %s", name, exc
@@ -100,32 +96,25 @@ class SyncService:
     async def _get_status_id(self, name: str) -> int | None:
         if name in self._status_cache:
             return self._status_cache[name]
-
         try:
             result = await self.db.execute(
                 select(TicketStatus).where(TicketStatus.status_name == name.lower())
             )
             status = result.scalars().first()
-
             if not status:
                 logger.warning("Status '%s' not found — falling back to 'open'", name)
                 result = await self.db.execute(
                     select(TicketStatus).where(TicketStatus.status_name == "open")
                 )
                 status = result.scalars().first()
-
             if status:
                 self._status_cache[name] = status.id
                 return status.id
-
             logger.error("Fallback status 'open' not found in DB — check seed data")
             return None
-
         except Exception as exc:
             await self.db.rollback()
-            logger.exception(
-                "DB error while resolving status '%s': %s", name, exc
-            )
+            logger.exception("DB error while resolving status '%s': %s", name, exc)
             return None
 
     # ------------------------------------------------------------------
@@ -136,7 +125,6 @@ class SyncService:
             return None
         if name in self._priority_cache:
             return self._priority_cache[name]
-
         try:
             result = await self.db.execute(
                 select(TicketPriority).where(
@@ -144,20 +132,14 @@ class SyncService:
                 )
             )
             priority = result.scalars().first()
-
             if priority:
                 self._priority_cache[name] = priority.id
                 return priority.id
-
-            # Priority is optional — warn but don't fail the ticket
             logger.warning("Priority '%s' not found — priority_id will be NULL", name)
             return None
-
         except Exception as exc:
             await self.db.rollback()
-            logger.exception(
-                "DB error while resolving priority '%s': %s", name, exc
-            )
+            logger.exception("DB error while resolving priority '%s': %s", name, exc)
             return None
 
     # ------------------------------------------------------------------
@@ -167,37 +149,35 @@ class SyncService:
         self,
         crm_agent_id: str | None,
         source_system_id: int,
+        tenant_id: uuid.UUID,
     ) -> uuid.UUID | None:
         if not crm_agent_id:
             return None
-
-        cache_key = (crm_agent_id, source_system_id)
+        cache_key = (tenant_id, crm_agent_id, source_system_id)
         if cache_key in self._agent_cache:
             return self._agent_cache[cache_key]
-
         try:
             result = await self.db.execute(
                 select(Agent).where(
-                    Agent.crm_agent_id == crm_agent_id,
+                    Agent.tenant_id        == tenant_id,
+                    Agent.crm_agent_id     == crm_agent_id,
                     Agent.source_system_id == source_system_id,
                 )
             )
-            agent = result.scalars().first()
+            agent       = result.scalars().first()
             internal_id = agent.id if agent else None
             self._agent_cache[cache_key] = internal_id
-
             if not internal_id:
                 logger.warning(
-                    "Agent crm_id=%r source=%d not found — agent_id will be NULL.",
-                    crm_agent_id, source_system_id,
+                    "Agent crm_id=%r source=%d tenant=%s not found — agent_id will be NULL.",
+                    crm_agent_id, source_system_id, tenant_id,
                 )
             return internal_id
-
         except Exception as exc:
             await self.db.rollback()
             logger.exception(
-                "DB error while resolving agent crm_id=%r source=%d: %s",
-                crm_agent_id, source_system_id, exc,
+                "DB error while resolving agent crm_id=%r source=%d tenant=%s: %s",
+                crm_agent_id, source_system_id, tenant_id, exc,
             )
             return None
 
@@ -208,90 +188,85 @@ class SyncService:
         self,
         crm_customer_id: str | None,
         source_system_id: int,
+        tenant_id: uuid.UUID,
     ) -> uuid.UUID | None:
         if not crm_customer_id:
             return None
-
-        cache_key = (crm_customer_id, source_system_id)
+        cache_key = (tenant_id, crm_customer_id, source_system_id)
         if cache_key in self._customer_cache:
             return self._customer_cache[cache_key]
-
         try:
             result = await self.db.execute(
                 select(Customer).where(
-                    Customer.crm_customer_id == crm_customer_id,
+                    Customer.tenant_id        == tenant_id,
+                    Customer.crm_customer_id  == crm_customer_id,
                     Customer.source_system_id == source_system_id,
                 )
             )
-            customer = result.scalars().first()
+            customer    = result.scalars().first()
             internal_id = customer.id if customer else None
             self._customer_cache[cache_key] = internal_id
-
             if not internal_id:
                 logger.warning(
-                    "Customer crm_id=%r source=%d not found — customer_id will be NULL.",
-                    crm_customer_id, source_system_id,
+                    "Customer crm_id=%r source=%d tenant=%s not found — customer_id will be NULL.",
+                    crm_customer_id, source_system_id, tenant_id,
                 )
             return internal_id
-
         except Exception as exc:
             await self.db.rollback()
             logger.exception(
-                "DB error while resolving customer crm_id=%r source=%d: %s",
-                crm_customer_id, source_system_id, exc,
+                "DB error while resolving customer crm_id=%r source=%d tenant=%s: %s",
+                crm_customer_id, source_system_id, tenant_id, exc,
             )
             return None
 
     # ------------------------------------------------------------------
-    # Company — returns just the company UUID.
-    # tenant_id is stored as NULL for now.
+    # Company
     # ------------------------------------------------------------------
     async def _get_company_uuid(
         self,
         crm_company_id: str | None,
         source_system_id: int,
+        tenant_id: uuid.UUID,
     ) -> uuid.UUID | None:
         if not crm_company_id:
             return None
-
-        cache_key = (crm_company_id, source_system_id)
+        cache_key = (tenant_id, crm_company_id, source_system_id)
         if cache_key in self._company_cache:
             return self._company_cache[cache_key]
-
         try:
             result = await self.db.execute(
                 select(Company).where(
-                    Company.crm_company_id == crm_company_id,
+                    Company.tenant_id        == tenant_id,
+                    Company.crm_company_id   == crm_company_id,
                     Company.source_system_id == source_system_id,
                 )
             )
-            company = result.scalars().first()
+            company     = result.scalars().first()
             internal_id = company.id if company else None
             self._company_cache[cache_key] = internal_id
-
             if not internal_id:
                 logger.warning(
-                    "Company crm_id=%r source=%d not found — company_id will be NULL.",
-                    crm_company_id, source_system_id,
+                    "Company crm_id=%r source=%d tenant=%s not found — company_id will be NULL.",
+                    crm_company_id, source_system_id, tenant_id,
                 )
             return internal_id
-
         except Exception as exc:
             await self.db.rollback()
             logger.exception(
-                "DB error while resolving company crm_id=%r source=%d: %s",
-                crm_company_id, source_system_id, exc,
+                "DB error while resolving company crm_id=%r source=%d tenant=%s: %s",
+                crm_company_id, source_system_id, tenant_id, exc,
             )
             return None
 
     # ------------------------------------------------------------------
-    # Save single ticket  (wrapped in a SAVEPOINT so one bad upsert
-    # cannot abort the outer transaction and block all remaining tickets)
+    # Save single ticket (wrapped in a SAVEPOINT)
     # ------------------------------------------------------------------
     async def _save_ticket(
         self,
         ticket: NormalizedTicket,
         source_system_id: int,
+        tenant_id: uuid.UUID,
         status_id: int,
         priority_id: int | None,
         agent_id: uuid.UUID | None,
@@ -300,36 +275,30 @@ class SyncService:
     ) -> bool:
         """
         Upsert one normalized ticket inside a SAVEPOINT.
-
-        Using a nested transaction (SAVEPOINT) means that if the upsert
-        fails, only that single ticket is rolled back — the outer
-        transaction and all previously committed tickets are unaffected.
-
         Returns True if created, False if updated.
-        Raises on error (caller increments failed counter).
         """
         data = {
-            "tenant_id": None,            # NULL for now — isolation logic not yet decided
-            "title": ticket.title,
-            "description": ticket.description,
-            "status_id": status_id,
-            "priority_id": priority_id,
-            "agent_id": agent_id,
-            "customer_id": customer_id,
-            "company_id": company_id,
-            "created_at": ticket.created_at,
-            "updated_at": ticket.updated_at,
-            "closed_at": ticket.closed_at,
-            "is_deleted": False,
+            "tenant_id":        tenant_id,
+            "title":            ticket.title,
+            "description":      ticket.description,
+            "status_id":        status_id,
+            "priority_id":      priority_id,
+            "agent_id":         agent_id,
+            "customer_id":      customer_id,
+            "company_id":       company_id,
+            "created_at":       ticket.created_at,
+            "updated_at":       ticket.updated_at,
+            "closed_at":        ticket.closed_at,
+            "is_deleted":       False,
             "is_deleted_by_crm": False,
         }
 
-        # SAVEPOINT — isolates this upsert from the outer transaction
         async with self.db.begin_nested():
             _, created = await self.repo.upsert(
-                crm_ticket_id=ticket.crm_ticket_id,
-                source_system_id=source_system_id,
-                data=data,
+                crm_ticket_id    = ticket.crm_ticket_id,
+                source_system_id = source_system_id,
+                tenant_id        = tenant_id,
+                data             = data,
             )
         return created
 
@@ -340,43 +309,48 @@ class SyncService:
         self,
         normalized_tickets: list[NormalizedTicket],
         source_system: str,
+        tenant_id: uuid.UUID,
     ) -> SyncResult:
         """
         Resolve all FK IDs and upsert a list of NormalizedTickets into the DB.
 
+        Args:
+            normalized_tickets: Tickets pre-filtered for this tenant's org.
+            source_system:      e.g. "zammad" or "espocrm".
+            tenant_id:          The tenant these tickets belong to.
+
         Resolution order per ticket:
           1. status_id    — from ticket_status table (required, falls back to open)
           2. priority_id  — from ticket_priority table (optional)
-          3. agent_id     — from agents table by (crm_agent_id, source_system_id)
-          4. customer_id  — from customers table by (crm_customer_id, source_system_id)
-          5. company_id   — from companies table by (crm_company_id, source_system_id)
-          6. tenant_id    — NULL for now (isolation logic not yet decided)
+          3. agent_id     — from agents table by (tenant_id, crm_agent_id, source_system_id)
+          4. customer_id  — from customers table by (tenant_id, crm_customer_id, source_system_id)
+          5. company_id   — from companies table by (tenant_id, crm_company_id, source_system_id)
         """
         result = SyncResult(
-            source_system=source_system,
-            total_fetched=len(normalized_tickets),
-            created=0,
-            updated=0,
-            failed=0,
+            source_system = source_system,
+            tenant_id     = tenant_id,
+            total_fetched = len(normalized_tickets),
+            created       = 0,
+            updated       = 0,
+            failed        = 0,
         )
 
         if not normalized_tickets:
-            logger.info("No tickets to sync for %s", source_system)
+            logger.info("No tickets to sync for %s tenant=%s", source_system, tenant_id)
             return result
 
         source_system_id = await self._get_source_system_id(source_system)
         if not source_system_id:
-            # Abort entire sync — every ticket would fail without a valid source system
             result.failed = len(normalized_tickets)
             logger.error(
-                "Aborting sync for '%s' — source system could not be resolved",
-                source_system,
+                "Aborting sync for '%s' tenant=%s — source system could not be resolved",
+                source_system, tenant_id,
             )
             return result
 
         logger.info(
-            "Syncing %d tickets from %s (source_system_id=%d)",
-            len(normalized_tickets), source_system, source_system_id,
+            "Syncing %d tickets from %s (source_system_id=%d, tenant_id=%s)",
+            len(normalized_tickets), source_system, source_system_id, tenant_id,
         )
 
         for ticket in normalized_tickets:
@@ -391,18 +365,25 @@ class SyncService:
                     continue
 
                 priority_id = await self._get_priority_id(ticket.priority)
-                agent_id    = await self._get_agent_uuid(ticket.crm_agent_id, source_system_id)
-                customer_id = await self._get_customer_uuid(ticket.crm_customer_id, source_system_id)
-                company_id  = await self._get_company_uuid(ticket.crm_company_id, source_system_id)
+                agent_id    = await self._get_agent_uuid(
+                    ticket.crm_agent_id, source_system_id, tenant_id
+                )
+                customer_id = await self._get_customer_uuid(
+                    ticket.crm_customer_id, source_system_id, tenant_id
+                )
+                company_id  = await self._get_company_uuid(
+                    ticket.crm_company_id, source_system_id, tenant_id
+                )
 
                 created = await self._save_ticket(
-                    ticket=ticket,
-                    source_system_id=source_system_id,
-                    status_id=status_id,
-                    priority_id=priority_id,
-                    agent_id=agent_id,
-                    customer_id=customer_id,
-                    company_id=company_id,
+                    ticket           = ticket,
+                    source_system_id = source_system_id,
+                    tenant_id        = tenant_id,
+                    status_id        = status_id,
+                    priority_id      = priority_id,
+                    agent_id         = agent_id,
+                    customer_id      = customer_id,
+                    company_id       = company_id,
                 )
 
                 if created:
@@ -411,18 +392,15 @@ class SyncService:
                     result.updated += 1
 
             except Exception as exc:
-                # SAVEPOINT in _save_ticket already rolled back the failed upsert.
-                # Roll back here as a safety net in case the error originated
-                # outside _save_ticket (e.g. a resolution helper re-raised).
                 await self.db.rollback()
                 logger.error(
-                    "Failed to save ticket %s: %s", ticket.crm_ticket_id, exc
+                    "Failed to save ticket %s tenant=%s: %s",
+                    ticket.crm_ticket_id, tenant_id, exc,
                 )
                 result.failed += 1
-                # Continue — do not let one bad ticket abort the rest
 
         logger.info(
-            "Sync complete for %s — created: %d, updated: %d, failed: %d",
-            source_system, result.created, result.updated, result.failed,
+            "Sync complete for %s tenant=%s — created: %d, updated: %d, failed: %d",
+            source_system, tenant_id, result.created, result.updated, result.failed,
         )
         return result

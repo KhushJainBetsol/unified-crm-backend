@@ -31,7 +31,7 @@ from app.routes.auth import router as auth_router
 from app.routes.invitations import router as invitations_router
 from app.routes.tenants import router as tenants_router
 from app.routes.super_admin import router as super_admin_router
-from app.services.scheduler import run_all_full_sync, start_scheduler, stop_scheduler
+from app.services.scheduler import run_all_tenants_full_sync, start_scheduler, stop_scheduler
 from app.utils.exceptions import register_exception_handlers
 from app.integrations.webhooks.router import router as webhook_router
 from app.integrations.webhooks.seeder import seed_crm_integrations
@@ -144,7 +144,7 @@ async def lifespan(app: FastAPI):
         raise
 
     logger.info("Running initial CRM full sync on startup...")
-    await run_all_full_sync()
+    await run_all_tenants_full_sync()
     start_scheduler()
     logger.info("CRM sync scheduler started.")
 
