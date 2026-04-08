@@ -22,6 +22,7 @@ def _to_response(agent) -> dict:
         name=agent.name,
         email=agent.email,
         is_active=agent.is_active,
+        invitation_status=agent.invitation.status if agent.invitation else None,
     ).model_dump()
 
 

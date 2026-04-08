@@ -3,7 +3,8 @@ app/routes/tenants.py
 
 Tenant-scoped endpoints accessible to admin and agent roles only.
 
-  GET /tenants/me  →  returns the tenant name for the currently logged-in user
+  GET /tenants/me                →  returns the tenant name for the currently logged-in user
+  GET /tenants/me/source-systems →  returns the CRM systems configured for this tenant
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ router = APIRouter(prefix="/tenants", tags=["Tenants"])
 
 
 # ---------------------------------------------------------------------------
-# Response schema
+# Response schemas
 # ---------------------------------------------------------------------------
 
 
@@ -32,6 +33,11 @@ class TenantMeResponse(BaseModel):
     id: str
     name: str
     slug: str
+
+
+class SourceSystemResponse(BaseModel):
+    id: int
+    system_name: str
 
 
 # ---------------------------------------------------------------------------
@@ -84,3 +90,42 @@ async def get_my_tenant(
         name=row[1].capitalize(),  # "betsol" → "Betsol"
         slug=row[2],
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /tenants/me/source-systems
+# ---------------------------------------------------------------------------
+
+
+@router.get("/me/source-systems", response_model=list[SourceSystemResponse])
+async def get_my_source_systems(
+    db: AsyncSession = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+) -> list[SourceSystemResponse]:
+    """
+    Returns the active source CRM systems (e.g., zammad, espocrm)
+    linked to the authenticated user's tenant.
+    """
+    if user.is_superadmin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Superadmins are not scoped to a tenant.",
+        )
+
+    tenant_id = user.require_tenant()
+
+    result = await db.execute(
+        text(
+            """
+            SELECT ss.id, ss.system_name
+            FROM tenant_source_systems tss
+            JOIN source_systems ss ON tss.source_system_id = ss.id
+            WHERE tss.tenant_id = :tenant_id
+            """
+        ),
+        {"tenant_id": tenant_id},
+    )
+
+    rows = result.fetchall()
+
+    return [SourceSystemResponse(id=row[0], system_name=row[1]) for row in rows]

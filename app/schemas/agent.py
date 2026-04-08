@@ -25,6 +25,7 @@ class AgentResponse(AgentBase):
     tenant_id: UUID
     crm_agent_id: str
     source_system: str
+    invitation_status: str | None = None
     model_config = {"from_attributes": True}
 
 

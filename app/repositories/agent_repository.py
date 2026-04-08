@@ -13,7 +13,10 @@ def _base_query(tenant_id: uuid.UUID):
     return (
         select(Agent)
         .where(Agent.tenant_id == tenant_id)
-        .options(joinedload(Agent.source_system))
+        .options(
+            joinedload(Agent.source_system),
+            joinedload(Agent.invitation),  # <-- ADD THIS
+        )
     )
 
 

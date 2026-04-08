@@ -9,6 +9,7 @@ Business logic for Super Admin operations:
   - list_admins
   - list_all_users
 """
+
 from __future__ import annotations
 
 import logging
@@ -21,7 +22,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.crm_clients import fetch_crm_org_id          # ← NEW
+from app.core.crm_clients import fetch_crm_org_id  # ← NEW
 from app.core.keycloak_admin import create_keycloak_user
 from app.core.settings import get_settings
 from app.models.dashboard_user import DashboardUser
@@ -38,10 +39,7 @@ logger = logging.getLogger(__name__)
 async def svc_list_source_systems(db: AsyncSession) -> list[dict]:
     """Return all supported source systems."""
     result = await db.execute(select(SourceSystem))
-    return [
-        {"id": s.id, "system_name": s.system_name}
-        for s in result.scalars().all()
-    ]
+    return [{"id": s.id, "system_name": s.system_name} for s in result.scalars().all()]
 
 
 async def svc_create_tenant(
@@ -133,14 +131,15 @@ async def svc_create_tenant(
                 logger.warning(
                     "Could not fetch CRM org id for tenant='%s' system='%s' — "
                     "crm_org_id will be NULL and must be back-filled manually.",
-                    name, ss.system_name,
+                    name,
+                    ss.system_name,
                 )
 
             row = TenantSourceSystem(
                 tenant_id=tenant.id,
                 source_system_id=ss.id,
                 is_active=True,
-                crm_org_id=crm_org_id,   # None if lookup failed
+                crm_org_id=crm_org_id,  # None if lookup failed
             )
             db.add(row)
             tss_rows.append(row)
@@ -160,7 +159,9 @@ async def svc_create_tenant(
 
     logger.info(
         "Created tenant '%s' (id=%s) with source systems %s",
-        slug, tenant.id, [s.system_name for s in found_systems],
+        slug,
+        tenant.id,
+        [s.system_name for s in found_systems],
     )
 
     return {
@@ -208,9 +209,7 @@ async def svc_invite_admin(
     """
     try:
         # Step 1 — tenant must exist and be active
-        tenant_result = await db.execute(
-            select(Tenant).where(Tenant.id == tenant_id)
-        )
+        tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
         tenant = tenant_result.scalars().first()
         if not tenant:
             raise HTTPException(
@@ -289,10 +288,7 @@ async def svc_invite_admin(
         "tenant": {"id": str(tenant.id), "name": tenant.name, "slug": tenant.slug},
         "admin_email": admin_email,
         "invite_link": invite_link,
-        "message": (
-            f"Invitation sent to {admin_email}. "
-            "Link expires in 24 hours."
-        ),
+        "message": (f"Invitation sent to {admin_email}. " "Link expires in 24 hours."),
     }
 
 
@@ -314,7 +310,9 @@ async def svc_list_tenants(db: AsyncSession) -> list[dict]:
 async def svc_list_admins(db: AsyncSession) -> list[dict]:
     """Return all admin-role dashboard users across all tenants."""
     result = await db.execute(
-        select(DashboardUser).where(DashboardUser.role == "admin")
+        select(DashboardUser, Tenant.name.label("tenant_name"))
+        .join(Tenant, Tenant.id == DashboardUser.tenant_id, isouter=True)
+        .where(DashboardUser.role == "admin")
     )
     return [
         {
@@ -323,10 +321,11 @@ async def svc_list_admins(db: AsyncSession) -> list[dict]:
             "email": a.email,
             "role": a.role,
             "tenant_id": str(a.tenant_id),
+            "tenant_name": tenant_name or "—",
             "is_active": a.is_active,
             "created_at": a.created_at,
         }
-        for a in result.scalars().all()
+        for a, tenant_name in result.all()
     ]
 
 
