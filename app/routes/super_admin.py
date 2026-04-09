@@ -57,7 +57,8 @@ class InviteAdminRequest(BaseModel):
     """Invite an admin to an already-existing tenant."""
     tenant_id: uuid.UUID
     admin_email: EmailStr
-    admin_name: str  # full name, split into first/last internally
+    first_name: str
+    last_name: str
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +111,7 @@ async def invite_admin(
         db=db,
         tenant_id=body.tenant_id,
         admin_email=body.admin_email,
-        admin_name=body.admin_name,
+        admin_name=f"{body.first_name} {body.last_name}".strip(),
     )
 
 

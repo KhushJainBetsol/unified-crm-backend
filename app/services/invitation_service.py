@@ -24,6 +24,8 @@ from app.core.settings import get_settings
 from app.models.dashboard_user import DashboardUser
 from app.models.invitation import Invitation
 from app.models.tenant import Tenant
+from app.models.user_agent_mapping import UserAgentMapping
+from app.models.agent import Agent
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -139,6 +141,30 @@ async def svc_accept_invite(db: AsyncSession, token: str, password: str) -> dict
             is_active=True,
         )
         db.add(db_user)
+        await db.flush()  # flush so db_user.id is populated
+
+        # Only create agent mappings for agent-role users
+        if invite.role == "agent":
+            agents_result = await db.execute(
+                select(Agent).where(
+                    Agent.email     == invite.email,
+                    Agent.tenant_id == invite.tenant_id,
+                )
+            )
+            matched_agents = agents_result.scalars().all()
+
+            for agent in matched_agents:
+                db.add(UserAgentMapping(
+                    dashboard_user_id = db_user.id,
+                    agent_id          = agent.id,
+                    source_system_id  = agent.source_system_id,
+                ))
+
+            if not matched_agents:
+                logger.warning(
+                    "No agents found for email=%s tenant=%s — user_agent_mapping skipped",
+                    invite.email, invite.tenant_id,
+                )
 
     await db.commit()
     return {

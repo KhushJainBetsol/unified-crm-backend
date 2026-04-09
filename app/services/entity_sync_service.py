@@ -15,9 +15,16 @@ Field mappings:
   Zammad agent     → id, firstname+lastname, email
   Zammad customer  → id, firstname+lastname, email
   Zammad org       → id, name
-  EspoCRM user     → id, firstName+lastName, emailAddress
-  EspoCRM contact  → id, firstName+lastName, emailAddress
+  EspoCRM user     → id, firstName+lastName, emailAddress  (from User API)
+  EspoCRM contact  → id, firstName+lastName, emailAddress, phoneNumber
   EspoCRM account  → id, name
+
+EspoCRM agent note:
+  get_agents_by_account() resolves Users by email (Contact.emailAddress →
+  GET /api/v1/User?emailAddress=<email>), so raw_users passed to
+  sync_espo_agents() are already full User detail dicts with all fields.
+  No separate contact enrichment is needed — the User record is the
+  source of truth for name, email, and the crm_agent_id.
 """
 
 from __future__ import annotations
@@ -237,13 +244,29 @@ class EntitySyncService:
     # EspoCRM sync methods
     # ------------------------------------------------------------------
     async def sync_espo_agents(self, raw_users: list[dict]) -> tuple[int, int]:
-        """Sync EspoCRM users → agents table. Returns (created, updated)."""
+        """
+        Sync EspoCRM users → agents table.
+
+        raw_users are User detail dicts already resolved by email via
+        EspoClient.get_agents_by_account() — they come from the User API
+        (GET /api/v1/User?emailAddress=<email>) so all fields are present
+        and no further enrichment is needed.
+
+        The crm_agent_id stored here is the User.id (not the Contact.id),
+        which matches what the ticket's assignedUserId field references.
+
+        Args:
+            raw_users: User dicts from get_agents_by_account().
+
+        Returns:
+            (created, updated) counts.
+        """
         created = updated = 0
         for raw in raw_users:
             try:
                 crm_agent_id = str(raw["id"])
                 first = raw.get("firstName") or ""
-                last  = raw.get("lastName") or ""
+                last  = raw.get("lastName")  or ""
                 name  = (
                     f"{first} {last}".strip()
                     or raw.get("userName")

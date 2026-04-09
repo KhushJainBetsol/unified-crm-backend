@@ -225,7 +225,7 @@ async def get_tickets_by_agent(
     current_user: CurrentUser = Depends(get_current_user),  # NEW
 ):
     tenant_id = current_user.require_tenant()  # NEW
-    tickets, total = await TicketService(db).get_tickets_by_agent(
+    tickets, total, agent = await TicketService(db).get_tickets_by_agent(
         agent_id=agent_id,
         page=page,
         page_size=page_size,

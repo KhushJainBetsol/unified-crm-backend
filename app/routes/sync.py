@@ -1,3 +1,13 @@
+"""
+app/routers/sync.py
+
+Key change vs previous version:
+  All EspoCRM entity-sync paths now call svc.sync_espo_agents(raw_agents)
+  without the raw_contacts= kwarg. The email-based resolution inside
+  EspoClient.get_agents_by_account() already returns complete User dicts,
+  so no separate contact enrichment pass is needed at this layer.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -64,10 +74,6 @@ async def _get_tss_or_404(
     source_system_name: str,
     db: AsyncSession,
 ) -> TenantSourceSystem:
-    """
-    Return the TenantSourceSystem row for (tenant, source_system) or raise 404.
-    Also raises 404 if crm_org_id is NULL (org not yet resolved).
-    """
     source_system_id = await _get_source_system_id(source_system_name, db)
     result = await db.execute(
         select(TenantSourceSystem).where(
@@ -120,17 +126,13 @@ async def sync_tenant_full(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Triggers a full sync (entities + tickets) for every active source system
-    registered for the given tenant, scoped to their crm_org_id.
-    """
     await _get_tenant_or_404(tenant_id, db)
     result = await run_tenant_full_sync(tenant_id, db=None)
     return success(f"Full sync completed for tenant {tenant_id}", result)
 
 
 # ===========================================================================
-# ZAMMAD — tenant-scoped
+# ZAMMAD — tenant-scoped  (unchanged)
 # ===========================================================================
 
 @router.post(
@@ -141,7 +143,6 @@ async def sync_zammad_entities_for_tenant(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Step 1 — populate agents, customers, and company for this tenant's Zammad org."""
     await _get_tenant_or_404(tenant_id, db)
     tss              = await _get_tss_or_404(tenant_id, "zammad", db)
     source_system_id = tss.source_system_id
@@ -182,7 +183,6 @@ async def sync_zammad_tickets_for_tenant(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Step 2 — run AFTER sync-entities. Syncs tickets scoped to this tenant's Zammad org."""
     await _get_tenant_or_404(tenant_id, db)
     tss        = await _get_tss_or_404(tenant_id, "zammad", db)
     crm_org_id = tss.crm_org_id
@@ -223,7 +223,6 @@ async def sync_zammad_full_for_tenant(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Entities + tickets in one call, scoped to this tenant's Zammad org."""
     await _get_tenant_or_404(tenant_id, db)
     tss              = await _get_tss_or_404(tenant_id, "zammad", db)
     source_system_id = tss.source_system_id
@@ -279,7 +278,14 @@ async def sync_espocrm_entities_for_tenant(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Step 1 — populate agents, customers, and company for this tenant's EspoCRM account."""
+    """
+    Step 1 — populate agents, customers, and company for this tenant's EspoCRM account.
+
+    get_agents_by_account() resolves agents via email:
+      Contact (accountId=crm_org_id) → emailAddress → GET /api/v1/User?emailAddress=<email>
+    Only contacts belonging to this account are resolved, and only users
+    whose title == "Agent" are kept. No extra API calls vs previous behaviour.
+    """
     await _get_tenant_or_404(tenant_id, db)
     tss              = await _get_tss_or_404(tenant_id, "espocrm", db)
     source_system_id = tss.source_system_id
@@ -406,12 +412,11 @@ async def sync_espocrm_full_for_tenant(
 
 
 # ===========================================================================
-# LEGACY — kept for backward compat, iterate all tenants
+# LEGACY — kept for backward compat
 # ===========================================================================
 
 @router.post("/zammad/full-sync", summary="Full Zammad sync — all tenants")
 async def sync_zammad_full(db: AsyncSession = Depends(get_db)):
-    """Triggers Zammad sync for every tenant that has a Zammad integration."""
     try:
         result = await run_zammad_full_sync(db=None)
     except (ZammadClientError, ZammadAuthError) as exc:
@@ -421,7 +426,6 @@ async def sync_zammad_full(db: AsyncSession = Depends(get_db)):
 
 @router.post("/espocrm/full-sync", summary="Full EspoCRM sync — all tenants")
 async def sync_espocrm_full(db: AsyncSession = Depends(get_db)):
-    """Triggers EspoCRM sync for every tenant that has an EspoCRM integration."""
     try:
         result = await run_espocrm_full_sync(db=None)
     except (EspoClientError, EspoAuthError) as exc:
