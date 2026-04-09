@@ -84,3 +84,11 @@ class AgentRepository:
         query = _base_query(tenant_id).where(Agent.id == agent_id)
         result = await self.db.execute(query)
         return result.scalars().first()
+    
+    async def get_by_email(self, email: str, tenant_id: uuid.UUID) -> Agent | None:
+        query = (
+            _base_query(tenant_id)
+            .where(Agent.email == email.lower())
+        )
+        result = await self.db.execute(query)
+        return result.scalars().first()

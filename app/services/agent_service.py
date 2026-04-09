@@ -80,3 +80,10 @@ class AgentService:
                 detail=f"Agent {agent_id} not found",
             )
         return agent
+    
+    async def get_agent_by_email(
+        self,
+        email: str,
+        tenant_id: uuid.UUID,
+    ) -> Agent | None:
+        return await self.repo.get_by_email(email=email, tenant_id=tenant_id)

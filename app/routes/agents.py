@@ -75,6 +75,23 @@ async def filter_agents(
         message="Agents fetched successfully",
     )
 
+@router.get("/by-email", summary="Get agent by email")
+async def get_agent_by_email(
+    email: str = Query(..., description="Agent's email address"),
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = uuid.UUID(current_user.require_tenant())
+    agent = await AgentService(db).get_agent_by_email(
+        email=email,
+        tenant_id=tenant_id,
+    )
+    if not agent:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Agent with email '{email}' not found",
+        )
+    return success("Agent fetched successfully", _to_response(agent))
 
 @router.get("/{agent_id}", summary="Get agent by ID")
 async def get_agent(
@@ -88,3 +105,5 @@ async def get_agent(
         tenant_id=tenant_id,
     )
     return success("Agent fetched successfully", _to_response(agent))
+
+
