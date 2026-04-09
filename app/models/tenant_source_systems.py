@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, ForeignKey, Integer
+from sqlalchemy import Boolean, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -47,6 +47,23 @@ class TenantSourceSystem(Base):
     )
 
     # ------------------------------------------------------------------
+    # CRM organisation identifier
+    # Populated at tenant-creation time by calling the CRM's own API.
+    # NULL means the lookup has not succeeded yet (CRM unreachable, org
+    # not found, etc.) — it does NOT block tenant creation.
+    # ------------------------------------------------------------------
+    crm_org_id: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+        default=None,
+        comment=(
+            "Organisation/Account ID returned by the external CRM "
+            "(Zammad organization id or EspoCRM Account id). "
+            "NULL until successfully fetched."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # Relationships
     # ------------------------------------------------------------------
     tenant: Mapped["Tenant"] = relationship(  # type: ignore[name-defined]
@@ -59,5 +76,6 @@ class TenantSourceSystem(Base):
     def __repr__(self) -> str:
         return (
             f"<TenantSourceSystem tenant_id={self.tenant_id} "
-            f"source_system_id={self.source_system_id} active={self.is_active}>"
+            f"source_system_id={self.source_system_id} "
+            f"active={self.is_active} crm_org_id={self.crm_org_id!r}>"
         )

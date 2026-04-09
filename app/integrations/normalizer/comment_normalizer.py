@@ -129,13 +129,14 @@ def normalize_zammad_comment(raw: dict) -> NormalizedComment | None:
         source_system="zammad",
     )
 
-
 def normalize_zammad_comments(raw_list: list[dict]) -> list[NormalizedComment]:
-    """Normalize a list of Zammad articles, skipping any that fail."""
+    if not raw_list:
+        return []
+    sorted_articles = sorted(raw_list, key=lambda a: a.get("created_at") or "")
     results = []
-    for raw in raw_list:
-        if raw.get("type") != "note":
-            continue
+    for i, raw in enumerate(sorted_articles):
+        if i == 0:
+            continue  # oldest article = ticket description
         comment = normalize_zammad_comment(raw)
         if comment:
             results.append(comment)

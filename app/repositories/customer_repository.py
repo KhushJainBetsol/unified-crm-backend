@@ -9,6 +9,12 @@ query, avoiding N+1 problems.
 Loaded relationships per query:
   - Customer.source_system → source_systems.system_name
   - Customer.company       → companies (optional, may be NULL)
+
+Multitenancy:
+  - Every query accepts an optional tenant_id: uuid.UUID | None.
+  - When provided it is always added as a WHERE clause — this is the
+    primary data-isolation guard. Never call these methods without
+    passing tenant_id in a multitenant context.
 """
 
 from __future__ import annotations
@@ -27,12 +33,9 @@ def _base_query():
     Base SELECT with all joinedloads applied.
     Every read query builds on top of this so joins are never forgotten.
     """
-    return (
-        select(Customer)
-        .options(
-            joinedload(Customer.source_system),
-            joinedload(Customer.company),
-        )
+    return select(Customer).options(
+        joinedload(Customer.source_system),
+        joinedload(Customer.company),
     )
 
 
@@ -44,31 +47,35 @@ class CustomerRepository:
     # ------------------------------------------------------------------
     # READ — list all
     # ------------------------------------------------------------------
+
     async def get_all(
         self,
+        tenant_id: uuid.UUID | None = None,
         offset: int = 0,
         limit: int = 20,
     ) -> tuple[list[Customer], int]:
         """
-        Fetch a paginated list of all customers with total count.
+        Fetch a paginated list of customers with total count.
 
         Args:
-            offset: Number of records to skip.
-            limit:  Max records to return.
+            tenant_id: Scope results to this tenant. Always pass this.
+            offset:    Number of records to skip.
+            limit:     Max records to return.
 
         Returns:
             Tuple of (list of Customer ORM objects, total count).
         """
         count_query = select(func.count()).select_from(Customer)
+        query = _base_query()
+
+        if tenant_id is not None:
+            query = query.where(Customer.tenant_id == tenant_id)
+            count_query = count_query.where(Customer.tenant_id == tenant_id)
+
         total_result = await self.db.execute(count_query)
         total = total_result.scalar_one()
 
-        query = (
-            _base_query()
-            .offset(offset)
-            .limit(limit)
-            .order_by(Customer.name.asc())
-        )
+        query = query.offset(offset).limit(limit).order_by(Customer.name.asc())
         result = await self.db.execute(query)
         customers = list(result.scalars().unique().all())
 
@@ -77,9 +84,11 @@ class CustomerRepository:
     # ------------------------------------------------------------------
     # READ — list by source system
     # ------------------------------------------------------------------
+
     async def get_by_source_system(
         self,
         source_system_id: int,
+        tenant_id: uuid.UUID | None = None,
         offset: int = 0,
         limit: int = 20,
     ) -> tuple[list[Customer], int]:
@@ -88,6 +97,7 @@ class CustomerRepository:
 
         Args:
             source_system_id: FK id of the source system.
+            tenant_id:        Scope results to this tenant. Always pass this.
             offset:           Number of records to skip.
             limit:            Max records to return.
 
@@ -99,16 +109,16 @@ class CustomerRepository:
             .select_from(Customer)
             .where(Customer.source_system_id == source_system_id)
         )
+        query = _base_query().where(Customer.source_system_id == source_system_id)
+
+        if tenant_id is not None:
+            query = query.where(Customer.tenant_id == tenant_id)
+            count_query = count_query.where(Customer.tenant_id == tenant_id)
+
         total_result = await self.db.execute(count_query)
         total = total_result.scalar_one()
 
-        query = (
-            _base_query()
-            .where(Customer.source_system_id == source_system_id)
-            .offset(offset)
-            .limit(limit)
-            .order_by(Customer.name.asc())
-        )
+        query = query.offset(offset).limit(limit).order_by(Customer.name.asc())
         result = await self.db.execute(query)
         customers = list(result.scalars().unique().all())
 
@@ -117,13 +127,24 @@ class CustomerRepository:
     # ------------------------------------------------------------------
     # READ — single by internal UUID
     # ------------------------------------------------------------------
-    async def get_by_id(self, customer_id: uuid.UUID) -> Customer | None:
+
+    async def get_by_id(
+        self,
+        customer_id: uuid.UUID,
+        tenant_id: uuid.UUID | None = None,
+    ) -> Customer | None:
         """
-        Fetch a single customer by internal UUID.
+        Fetch a single customer by internal UUID, scoped to tenant.
+
+        Args:
+            customer_id: Internal UUID of the customer.
+            tenant_id:   Scope to this tenant. Always pass this.
 
         Returns:
-            Customer ORM object or None if not found.
+            Customer ORM object or None if not found (or belongs to another tenant).
         """
         query = _base_query().where(Customer.id == customer_id)
+        if tenant_id is not None:
+            query = query.where(Customer.tenant_id == tenant_id)
         result = await self.db.execute(query)
         return result.scalars().first()

@@ -7,9 +7,14 @@ Responsibilities:
   - Source system resolution (name → DB row)
   - Agent existence validation
   - Filter orchestration (which repo method to call)
-  - Stats queries
-  - get_or_404 helpers
+  - Stats queries (tenant-scoped)
+  - get_or_404 helpers (tenant-scoped)
   - Role-gated ticket updates with CRM push (Zammad + EspoCRM)
+
+Multitenancy:
+  - Every public method accepts tenant_id: uuid.UUID | None.
+  - It is passed down to the repository and to every raw SQL query in
+    this file (stats). Never skip it in a multitenant request.
 
 Routes should only call this service and return the response.
 All DB-touching logic lives here or in the repository.
@@ -59,7 +64,7 @@ logger = logging.getLogger(__name__)
 # TOML config directory
 # ---------------------------------------------------------------------------
 
-_CONFIG_DIR = Path(__file__).parent.parent / "integrations/normalizer/config"  # → app/
+_CONFIG_DIR = Path(__file__).parent.parent / "integrations/normalizer/config"
 
 
 # ---------------------------------------------------------------------------
@@ -104,9 +109,6 @@ def _load_push_mappings(
 
 # ---------------------------------------------------------------------------
 # Load mappings at import time.
-# Both CRMs fail loudly at startup if a TOML is missing or broken —
-# rather than failing silently on the first push attempt.
-# Restart the server after editing either TOML file.
 # ---------------------------------------------------------------------------
 
 try:
@@ -234,15 +236,17 @@ class TicketService:
         self,
         page: int,
         page_size: int,
+        tenant_id: uuid.UUID | None = None,
         include_deleted: bool = False,
         status: str | None = None,
         priority: str | None = None,
     ) -> tuple[list, int]:
         """
-        Return paginated list of all tickets, with optional filters.
+        Return paginated list of all tickets for a tenant, with optional filters.
         """
         offset = (page - 1) * page_size
         return await self.repo.get_all(
+            tenant_id=tenant_id,
             include_deleted=include_deleted,
             status=status,
             priority=priority,
@@ -254,6 +258,7 @@ class TicketService:
         self,
         page: int,
         page_size: int,
+        tenant_id: uuid.UUID | None = None,
         include_deleted: bool = False,
         source: str | None = None,
         status: str | None = None,
@@ -269,6 +274,7 @@ class TicketService:
             source_obj = await self._resolve_source_system(source)
             return await self.repo.get_by_source_system(
                 source_system_id=source_obj.id,
+                tenant_id=tenant_id,
                 include_deleted=include_deleted,
                 status=status,
                 priority=priority,
@@ -277,6 +283,7 @@ class TicketService:
             )
 
         return await self.repo.get_all(
+            tenant_id=tenant_id,
             include_deleted=include_deleted,
             status=status,
             priority=priority,
@@ -289,18 +296,20 @@ class TicketService:
         agent_id: uuid.UUID,
         page: int,
         page_size: int,
+        tenant_id: uuid.UUID | None = None,
         include_deleted: bool = False,
         status: str | None = None,
         priority: str | None = None,
     ) -> tuple[list, int, Agent]:
         """
-        Validate agent exists, then return their tickets.
+        Validate agent exists, then return their tickets scoped to tenant.
         Returns (tickets, total, agent) so the route can use agent.name in the message.
         """
         agent = await self._get_agent_or_404(agent_id)
         offset = (page - 1) * page_size
         tickets, total = await self.repo.get_by_agent(
             agent_id=agent_id,
+            tenant_id=tenant_id,
             include_deleted=include_deleted,
             status=status,
             priority=priority,
@@ -313,11 +322,17 @@ class TicketService:
     # Single ticket
     # ------------------------------------------------------------------
 
-    async def get_ticket_or_404(self, ticket_id: uuid.UUID) -> Ticket:
+    async def get_ticket_or_404(
+        self,
+        ticket_id: uuid.UUID,
+        tenant_id: uuid.UUID | None = None,
+    ) -> Ticket:
         """
-        Fetch a single ticket by UUID or raise HTTP 404.
+        Fetch a single ticket by UUID, scoped to tenant, or raise HTTP 404.
+        Passing tenant_id ensures a ticket from another tenant returns 404
+        rather than leaking data.
         """
-        ticket = await self.repo.get_by_id(ticket_id)
+        ticket = await self.repo.get_by_id(ticket_id, tenant_id=tenant_id)
         if not ticket:
             raise HTTPException(
                 status_code=http_status.HTTP_404_NOT_FOUND,
@@ -332,79 +347,57 @@ class TicketService:
     async def update_ticket(
         self,
         ticket_id: uuid.UUID,
-        payload: TicketUpdateRequest,
-        role: str,
+        update: TicketUpdateRequest,
+        deleted_by_id: uuid.UUID | None = None,
+        tenant_id: uuid.UUID | None = None,
     ) -> Ticket:
         """
         Apply a partial update to a ticket, then push the change to the
         originating CRM (best-effort — CRM failures are logged, not raised).
 
-        Role gating:
-            agent → may only update `status`
-            admin → may update `status`, `priority`, `agent_id`
+        Role gating is enforced upstream via `require_admin` on the route.
+        This method trusts that the caller is an admin.
 
         Args:
-            ticket_id: Internal UUID of the ticket.
-            payload:   TicketUpdateRequest with human-readable field names.
-            role:      Caller's role — "admin" or "agent".
+            ticket_id:      Internal UUID of the ticket.
+            update:         TicketUpdateRequest with human-readable field names.
+            deleted_by_id:  Unused here; kept for signature consistency with
+                            other write methods.
+            tenant_id:      Scope the ticket lookup to this tenant.
 
         Returns:
             Updated Ticket ORM object (with all relationships loaded).
 
         Raises:
             HTTP 400 if the payload contains no updatable fields.
-            HTTP 403 if an agent tries to change a restricted field,
-                     or if the role is not recognised.
             HTTP 404 if the ticket or agent UUID is not found.
             HTTP 422 if the status or priority string is invalid.
         """
-        # ---- Guard: reject unknown roles early --------------------------
-        # TODO: remove this check once Keycloak is integrated —
-        #       role will come from the JWT and be validated upstream.
-        if role not in ("admin", "agent"):
-            raise HTTPException(
-                status_code=http_status.HTTP_403_FORBIDDEN,
-                detail=f"Unknown role '{role}'. Valid values: admin, agent",
-            )
-
-        # ---- Guard: agents cannot touch priority or agent assignment ----
-        if role == "agent":
-            if payload.priority is not None:
-                raise HTTPException(
-                    status_code=http_status.HTTP_403_FORBIDDEN,
-                    detail="Agents are not allowed to change ticket priority",
-                )
-            if payload.agent_id is not None:
-                raise HTTPException(
-                    status_code=http_status.HTTP_403_FORBIDDEN,
-                    detail="Agents are not allowed to reassign tickets",
-                )
-
-        # ---- Fetch ticket -----------------------------------------------
-        ticket = await self.get_ticket_or_404(ticket_id)
+        # ---- Fetch ticket (tenant-scoped) --------------------------------
+        ticket = await self.get_ticket_or_404(ticket_id, tenant_id=tenant_id)
 
         # ---- Build the DB update dict -----------------------------------
         update_data: dict = {}
 
-        if payload.status is not None:
-            status_obj = await self._resolve_status(payload.status)
+        if update.status is not None:
+            status_obj = await self._resolve_status(update.status)
             update_data["status_id"] = status_obj.id
 
             # Keep closed_at in sync with status automatically
-            if payload.status.lower() == "closed" and ticket.closed_at is None:
+            if update.status.lower() == "closed" and ticket.closed_at is None:
                 update_data["closed_at"] = datetime.utcnow()
-            elif payload.status.lower() != "closed" and ticket.closed_at is not None:
+            elif update.status.lower() != "closed" and ticket.closed_at is not None:
                 # Ticket is being reopened — clear closed_at directly on the
                 # ORM object because repo.update() skips None values by design.
                 ticket.closed_at = None
 
-        if payload.priority is not None:
-            priority_obj = await self._resolve_priority(payload.priority)
+        if update.priority is not None:
+            priority_obj = await self._resolve_priority(update.priority)
             update_data["priority_id"] = priority_obj.id
 
-        if payload.agent_id is not None:
-            await self._get_agent_or_404(payload.agent_id)  # validates existence
-            update_data["agent_id"] = payload.agent_id
+        if update.agent_id is not None:
+            await self._get_agent_or_404(update.agent_id)  # validates existence
+            update_data["agent_id"] = update.agent_id
 
         if not update_data:
             raise HTTPException(
@@ -416,7 +409,7 @@ class TicketService:
         updated_ticket = await self.repo.update(ticket, update_data)
 
         # ---- Push to source CRM (best-effort) ---------------------------
-        await self._push_update_to_crm(updated_ticket, payload)
+        await self._push_update_to_crm(updated_ticket, update)
 
         return updated_ticket
 
@@ -434,9 +427,8 @@ class TicketService:
 
         Failures are caught and logged — they never bubble up to the caller
         because the DB update has already been committed at this point.
-        If the CRM push fails, investigate and re-sync manually.
         """
-        source = ticket.source_system.system_name.lower()  # "zammad" | "espocrm"
+        source = ticket.source_system.system_name.lower()
         try:
             if source == "zammad":
                 await self._push_to_zammad(ticket, payload)
@@ -469,26 +461,10 @@ class TicketService:
         """
         Map internal field names → Zammad field names (via TOML), validate
         against the instance's live state/priority endpoints, then PUT to Zammad.
-
-        Field mapping (source: zammad_mappings.toml [push_status] / [push_priority]):
-            status   → state    (string, e.g. "open", "pending reminder", "closed")
-            priority → priority (string, e.g. "1 low", "2 normal", "3 high")
-            agent_id → owner_id (integer Zammad user ID from agent.crm_agent_id)
-
-        Two validation layers for status / priority:
-          1. TOML lookup   — catches keys missing from our mapping config.
-          2. Live metadata — catches TOML values that Zammad no longer accepts
-                             (e.g. an admin renamed or deactivated a state).
-
-        NOTE: owner_id is Zammad's integer user ID, read from agent.crm_agent_id.
-        Update that attribute name if your Agent model uses a different column.
         """
         async with ZammadClient() as client:
             service = ZammadService(client)
 
-            # ----------------------------------------------------------
-            # Step 1 — fetch live field options from Zammad
-            # ----------------------------------------------------------
             try:
                 field_options = await service.get_ticket_field_options()
                 valid_states = field_options.get("state", [])
@@ -508,9 +484,6 @@ class TicketService:
                 valid_states = []
                 valid_priorities = []
 
-            # ----------------------------------------------------------
-            # Step 2 — build CRM payload with validation
-            # ----------------------------------------------------------
             crm_data: dict = {}
 
             if payload.status is not None:
@@ -520,9 +493,7 @@ class TicketService:
                         "Zammad status mapping missing for ticket %s: "
                         "internal value '%s' has no entry in [push_status] of "
                         "zammad_mappings.toml. Valid keys: %s — skipping status field.",
-                        ticket.id,
-                        payload.status,
-                        list(_ZAMMAD_STATUS.keys()),
+                        ticket.id, payload.status, list(_ZAMMAD_STATUS.keys()),
                     )
                 elif valid_states and mapped_status.lower() not in valid_states:
                     logger.error(
@@ -530,10 +501,7 @@ class TicketService:
                         "mapped '%s' → '%s' but that state is not active on this instance. "
                         "Valid states: %s  "
                         "Update [push_status] in zammad_mappings.toml to fix this.",
-                        ticket.id,
-                        payload.status,
-                        mapped_status,
-                        valid_states,
+                        ticket.id, payload.status, mapped_status, valid_states,
                     )
                 else:
                     crm_data["state"] = mapped_status
@@ -545,9 +513,7 @@ class TicketService:
                         "Zammad priority mapping missing for ticket %s: "
                         "internal value '%s' has no entry in [push_priority] of "
                         "zammad_mappings.toml. Valid keys: %s — skipping priority field.",
-                        ticket.id,
-                        payload.priority,
-                        list(_ZAMMAD_PRIORITY.keys()),
+                        ticket.id, payload.priority, list(_ZAMMAD_PRIORITY.keys()),
                     )
                 elif valid_priorities and mapped_priority not in valid_priorities:
                     logger.error(
@@ -555,10 +521,7 @@ class TicketService:
                         "mapped '%s' → '%s' but that priority is not active on this instance. "
                         "Valid priorities: %s  "
                         "Update [push_priority] in zammad_mappings.toml to fix this.",
-                        ticket.id,
-                        payload.priority,
-                        mapped_priority,
-                        valid_priorities,
+                        ticket.id, payload.priority, mapped_priority, valid_priorities,
                     )
                 else:
                     crm_data["priority"] = mapped_priority
@@ -572,8 +535,7 @@ class TicketService:
                     logger.warning(
                         "Agent %s has no crm_agent_id — "
                         "skipping owner_id in Zammad push for ticket %s",
-                        payload.agent_id,
-                        ticket.id,
+                        payload.agent_id, ticket.id,
                     )
 
             if not crm_data:
@@ -583,9 +545,6 @@ class TicketService:
                 )
                 return
 
-            # ----------------------------------------------------------
-            # Step 3 — send the update
-            # ----------------------------------------------------------
             await service.update_ticket(ticket.crm_ticket_id, crm_data)
 
         logger.info(
@@ -606,27 +565,10 @@ class TicketService:
         """
         Map internal field names → EspoCRM field names (via TOML), validate
         against the instance's live metadata, then PUT to EspoCRM.
-
-        Mapping source: espo_mappings.toml [push_status] / [push_priority]
-            status   → status         (enum — also validated against EspoCRM metadata)
-            priority → priority       (enum — also validated against EspoCRM metadata)
-            agent_id → assignedUserId (EspoCRM user UUID from agent.crm_agent_id)
-
-        Two validation layers for status / priority:
-          1. TOML lookup    — catches keys missing from our mapping config.
-          2. Live metadata  — catches TOML values that EspoCRM no longer accepts
-                              (e.g. an admin renamed a status in the EspoCRM UI).
-
-        NOTE: assignedUserId is EspoCRM's user UUID, read from agent.crm_agent_id.
-        Update that attribute name if your Agent model uses a different column.
         """
         async with EspoClient() as client:
             service = EspoService(client)
 
-            # ----------------------------------------------------------
-            # Step 1 — fetch live field options from EspoCRM metadata
-            # Gives us the exact enum values this instance currently accepts.
-            # ----------------------------------------------------------
             try:
                 field_options = await service.get_case_field_options()
                 valid_statuses = field_options.get("status", [])
@@ -637,8 +579,6 @@ class TicketService:
                     valid_priorities,
                 )
             except Exception as exc:  # noqa: BLE001
-                # Metadata fetch failed — log and continue without live validation.
-                # TOML validation still runs; a bad value will surface as a 400.
                 logger.warning(
                     "Could not fetch EspoCRM metadata for ticket %s — "
                     "skipping live validation (TOML validation still applies): %s",
@@ -648,51 +588,36 @@ class TicketService:
                 valid_statuses = []
                 valid_priorities = []
 
-            # ----------------------------------------------------------
-            # Step 2 — build CRM payload with TOML + live validation
-            # ----------------------------------------------------------
             crm_data: dict = {}
 
             if payload.status is not None:
                 mapped_status = _ESPO_STATUS.get(payload.status.lower())
-
                 if mapped_status is None:
-                    # Key missing from TOML [push_status]
                     logger.error(
                         "EspoCRM status mapping missing for ticket %s: "
                         "internal value '%s' has no entry in [push_status] of "
                         "espo_mappings.toml. Valid keys: %s — skipping status field.",
-                        ticket.id,
-                        payload.status,
-                        list(_ESPO_STATUS.keys()),
+                        ticket.id, payload.status, list(_ESPO_STATUS.keys()),
                     )
                 elif valid_statuses and mapped_status not in valid_statuses:
-                    # TOML value doesn't match live EspoCRM options —
-                    # this is the exact error that was happening before
                     logger.error(
                         "EspoCRM status validation failed for ticket %s: "
                         "TOML maps '%s' → '%s' but EspoCRM rejects that value. "
                         "Valid EspoCRM status values for this instance: %s  "
                         "Update [push_status] in espo_mappings.toml to fix this.",
-                        ticket.id,
-                        payload.status,
-                        mapped_status,
-                        valid_statuses,
+                        ticket.id, payload.status, mapped_status, valid_statuses,
                     )
                 else:
                     crm_data["status"] = mapped_status
 
             if payload.priority is not None:
                 mapped_priority = _ESPO_PRIORITY.get(payload.priority.lower())
-
                 if mapped_priority is None:
                     logger.error(
                         "EspoCRM priority mapping missing for ticket %s: "
                         "internal value '%s' has no entry in [push_priority] of "
                         "espo_mappings.toml. Valid keys: %s — skipping priority field.",
-                        ticket.id,
-                        payload.priority,
-                        list(_ESPO_PRIORITY.keys()),
+                        ticket.id, payload.priority, list(_ESPO_PRIORITY.keys()),
                     )
                 elif valid_priorities and mapped_priority not in valid_priorities:
                     logger.error(
@@ -700,10 +625,7 @@ class TicketService:
                         "TOML maps '%s' → '%s' but EspoCRM rejects that value. "
                         "Valid EspoCRM priority values for this instance: %s  "
                         "Update [push_priority] in espo_mappings.toml to fix this.",
-                        ticket.id,
-                        payload.priority,
-                        mapped_priority,
-                        valid_priorities,
+                        ticket.id, payload.priority, mapped_priority, valid_priorities,
                     )
                 else:
                     crm_data["priority"] = mapped_priority
@@ -717,8 +639,7 @@ class TicketService:
                     logger.warning(
                         "Agent %s has no crm_agent_id — "
                         "skipping assignedUserId in EspoCRM push for ticket %s",
-                        payload.agent_id,
-                        ticket.id,
+                        payload.agent_id, ticket.id,
                     )
 
             if not crm_data:
@@ -728,9 +649,6 @@ class TicketService:
                 )
                 return
 
-            # ----------------------------------------------------------
-            # Step 3 — send the update
-            # ----------------------------------------------------------
             await service.update_ticket(ticket.crm_ticket_id, crm_data)
 
         logger.info(
@@ -743,27 +661,30 @@ class TicketService:
     # Stats
     # ------------------------------------------------------------------
 
-    async def get_stats(self) -> dict:
+    async def get_stats(self, tenant_id: uuid.UUID | None = None) -> dict:
         """
-        Aggregate ticket counts: total, active, deleted, by_status, by_priority.
+        Aggregate ticket counts for a tenant: total, active, deleted,
+        by_status, by_priority.
         """
+        base_filter = (
+            [Ticket.tenant_id == tenant_id] if tenant_id is not None else []
+        )
+
         result = await self.db.execute(
             select(
                 func.count(Ticket.id).label("total"),
-                func.sum(case((Ticket.is_deleted == False, 1), else_=0)).label(
-                    "active"
-                ),  # noqa: E712
-                func.sum(case((Ticket.is_deleted == True, 1), else_=0)).label(
-                    "deleted"
-                ),  # noqa: E712
-            )
+                func.sum(case((Ticket.is_deleted == False, 1), else_=0)).label("active"),  # noqa: E712
+                func.sum(case((Ticket.is_deleted == True, 1), else_=0)).label("deleted"),   # noqa: E712
+            ).where(*base_filter)
         )
         row = result.first()
+
+        active_filter = [*base_filter, Ticket.is_deleted == False]  # noqa: E712
 
         status_result = await self.db.execute(
             select(TicketStatus.status_name, func.count(Ticket.id).label("count"))
             .join(Ticket, Ticket.status_id == TicketStatus.id)
-            .where(Ticket.is_deleted == False)  # noqa: E712
+            .where(*active_filter)
             .group_by(TicketStatus.status_name)
         )
         by_status = {r.status_name: r.count for r in status_result}
@@ -771,7 +692,7 @@ class TicketService:
         priority_result = await self.db.execute(
             select(TicketPriority.priority_name, func.count(Ticket.id).label("count"))
             .join(Ticket, Ticket.priority_id == TicketPriority.id)
-            .where(Ticket.is_deleted == False)  # noqa: E712
+            .where(*active_filter)
             .group_by(TicketPriority.priority_name)
         )
         by_priority = {r.priority_name: r.count for r in priority_result}
@@ -790,27 +711,33 @@ class TicketService:
             "by_priority": by_priority,
         }
 
-    async def get_agent_stats(self, agent_id: uuid.UUID) -> dict:
+    async def get_agent_stats(
+        self,
+        agent_id: uuid.UUID,
+        tenant_id: uuid.UUID | None = None,
+    ) -> dict:
         """
-        Aggregate ticket counts for a specific agent.
+        Aggregate ticket counts for a specific agent, scoped to tenant.
         Raises HTTP 404 if agent doesn't exist.
         """
         await self._get_agent_or_404(agent_id)
 
+        base_filter = [
+            Ticket.agent_id == agent_id,
+            Ticket.is_deleted == False,  # noqa: E712
+        ]
+        if tenant_id is not None:
+            base_filter.append(Ticket.tenant_id == tenant_id)
+
         total_result = await self.db.execute(
-            select(func.count(Ticket.id)).where(
-                Ticket.agent_id == agent_id,
-                Ticket.is_deleted == False,  # noqa: E712
-            )
+            select(func.count(Ticket.id)).where(*base_filter)
         )
         total = total_result.scalar_one()
 
         status_result = await self.db.execute(
             select(TicketStatus.status_name, func.count(Ticket.id).label("count"))
             .join(Ticket, Ticket.status_id == TicketStatus.id)
-            .where(
-                Ticket.agent_id == agent_id, Ticket.is_deleted == False
-            )  # noqa: E712
+            .where(*base_filter)
             .group_by(TicketStatus.status_name)
         )
         by_status = {r.status_name: r.count for r in status_result}
@@ -818,9 +745,7 @@ class TicketService:
         priority_result = await self.db.execute(
             select(TicketPriority.priority_name, func.count(Ticket.id).label("count"))
             .join(Ticket, Ticket.priority_id == TicketPriority.id)
-            .where(
-                Ticket.agent_id == agent_id, Ticket.is_deleted == False
-            )  # noqa: E712
+            .where(*base_filter)
             .group_by(TicketPriority.priority_name)
         )
         by_priority = {r.priority_name: r.count for r in priority_result}

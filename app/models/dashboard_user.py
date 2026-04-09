@@ -38,6 +38,9 @@ class DashboardUser(Base):
         String(200), nullable=False, unique=True,
         comment="The sub claim from Keycloak's JWT",
     )
+    name: Mapped[str] = mapped_column(
+    String(255), nullable=True, comment="Full name of the user",
+    )
     email: Mapped[str] = mapped_column(
         String(255), nullable=False, comment="User email address",
     )
