@@ -3,23 +3,11 @@ app/services/scheduler.py
 
 Multitenant CRM sync scheduler.
 
-Sync loop (per tick):
-  1. Load all active tenants from DB.
-  2. For each tenant, load their active tenant_source_systems rows
-     (those with a non-NULL crm_org_id).
-  3. For each (tenant, source_system, crm_org_id):
-       a. Fetch agents / customers / company scoped to that org from the CRM.
-       b. Fetch tickets scoped to that org from the CRM.
-       c. Normalize everything.
-       d. Upsert with tenant_id stamped — isolated DB session per step.
-  4. Move to the next pair.
-
-Session isolation strategy (scheduler path):
-  Each step (entity sync, ticket sync) uses its own isolated async session.
-  A failure in one tenant/step cannot poison the transaction of another.
-
-Route path (db != None):
-  The caller owns the session and commits. Used by manual trigger endpoints.
+Key change vs previous version:
+  _sync_espo_entities_for_tenant no longer passes raw_customers to
+  svc.sync_espo_agents().  The email-based user resolution in
+  EspoClient.get_agents_by_account() now returns full User dicts
+  directly, so no separate contact enrichment step is needed.
 """
 
 from __future__ import annotations
@@ -49,11 +37,10 @@ scheduler = AsyncIOScheduler()
 
 
 # ---------------------------------------------------------------------------
-# DB helpers — each uses its own short-lived session
+# DB helpers
 # ---------------------------------------------------------------------------
 
 async def _get_all_active_tenants() -> list[Tenant]:
-    """Return all active tenants from DB."""
     async with async_session_maker() as db:
         result = await db.execute(
             select(Tenant).where(Tenant.is_active == True)  # noqa: E712
@@ -64,23 +51,18 @@ async def _get_all_active_tenants() -> list[Tenant]:
 async def _get_tenant_source_systems(
     tenant_id: uuid.UUID,
 ) -> list[TenantSourceSystem]:
-    """
-    Return active tenant_source_systems rows for a tenant that have a
-    resolved crm_org_id (NULL means the CRM org lookup hasn't succeeded yet).
-    """
     async with async_session_maker() as db:
         result = await db.execute(
             select(TenantSourceSystem).where(
                 TenantSourceSystem.tenant_id  == tenant_id,
-                TenantSourceSystem.is_active  == True,          # noqa: E712
-                TenantSourceSystem.crm_org_id != None,          # noqa: E711
+                TenantSourceSystem.is_active  == True,   # noqa: E712
+                TenantSourceSystem.crm_org_id != None,   # noqa: E711
             )
         )
         return list(result.scalars().all())
 
 
 async def _get_source_system_name(source_system_id: int) -> str | None:
-    """Resolve source_system_id → system_name."""
     async with async_session_maker() as db:
         result = await db.execute(
             select(SourceSystem).where(SourceSystem.id == source_system_id)
@@ -94,7 +76,6 @@ async def _get_source_system_name(source_system_id: int) -> str | None:
 
 # ---------------------------------------------------------------------------
 # Per-tenant per-source-system sync helpers
-# Each function owns its own isolated session.
 # ---------------------------------------------------------------------------
 
 async def _sync_zammad_entities_for_tenant(
@@ -102,12 +83,6 @@ async def _sync_zammad_entities_for_tenant(
     source_system_id: int,
     crm_org_id: str,
 ) -> tuple[int, int, int, int, int, int]:
-    """
-    Fetch and upsert Zammad agents, customers, and the single company
-    that corresponds to crm_org_id — all scoped to tenant_id.
-
-    Returns (agents_c, agents_u, customers_c, customers_u, companies_c, companies_u).
-    """
     async with ZammadClient() as client:
         raw_agents    = await client.get_agents_by_org(crm_org_id)
         raw_customers = await client.get_customers_by_org(crm_org_id)
@@ -118,7 +93,6 @@ async def _sync_zammad_entities_for_tenant(
             svc = EntitySyncService(db, source_system_id, tenant_id)
             agents_c,    agents_u    = await svc.sync_zammad_agents(raw_agents)
             customers_c, customers_u = await svc.sync_zammad_customers(raw_customers)
-            # Sync just this tenant's single org as a company record
             companies_c, companies_u = await svc.sync_zammad_companies([raw_org])
             await db.commit()
             return agents_c, agents_u, customers_c, customers_u, companies_c, companies_u
@@ -132,10 +106,6 @@ async def _sync_zammad_tickets_for_tenant(
     source_system_id: int,
     crm_org_id: str,
 ) -> object:
-    """
-    Fetch Zammad tickets scoped to crm_org_id, normalize, upsert for tenant.
-    Returns a SyncResult.
-    """
     async with ZammadClient() as client:
         raw_tickets = await client.get_tickets_by_org(crm_org_id)
         normalized  = ZammadService(client).normalize_raw_tickets(raw_tickets)
@@ -163,6 +133,11 @@ async def _sync_espo_entities_for_tenant(
     Fetch and upsert EspoCRM agents, contacts (customers), and the single
     Account that corresponds to crm_org_id — all scoped to tenant_id.
 
+    get_agents_by_account() now resolves Users via email:
+      Contact.emailAddress → GET /api/v1/User?emailAddress=<email>
+    so raw_agents are already full User dicts with correct IDs and all
+    fields. No contact enrichment pass is needed.
+
     Returns (agents_c, agents_u, customers_c, customers_u, companies_c, companies_u).
     """
     async with EspoClient() as client:
@@ -175,7 +150,6 @@ async def _sync_espo_entities_for_tenant(
             svc = EntitySyncService(db, source_system_id, tenant_id)
             agents_c,    agents_u    = await svc.sync_espo_agents(raw_agents)
             customers_c, customers_u = await svc.sync_espo_customers(raw_customers)
-            # Sync just this tenant's single account as a company record
             companies_c, companies_u = await svc.sync_espo_companies([raw_account])
             await db.commit()
             return agents_c, agents_u, customers_c, customers_u, companies_c, companies_u
@@ -189,10 +163,6 @@ async def _sync_espo_tickets_for_tenant(
     source_system_id: int,
     crm_org_id: str,
 ) -> object:
-    """
-    Fetch EspoCRM tickets scoped to crm_org_id, normalize, upsert for tenant.
-    Returns a SyncResult.
-    """
     async with EspoClient() as client:
         raw_tickets = await client.get_tickets_by_account(crm_org_id)
         normalized  = EspoService(client).normalize_raw_tickets(raw_tickets)
@@ -219,10 +189,6 @@ async def _sync_one_tenant_source_system(
     tenant_id: uuid.UUID,
     tss: TenantSourceSystem,
 ) -> dict:
-    """
-    Run a full sync (entities + tickets) for one (tenant, source_system, crm_org_id).
-    Returns a result dict. Never raises — errors are logged and returned in the dict.
-    """
     source_system_name = await _get_source_system_name(tss.source_system_id)
     if not source_system_name:
         return {"error": f"Unknown source_system_id={tss.source_system_id}"}
@@ -300,28 +266,18 @@ async def _sync_one_tenant_source_system(
 # ---------------------------------------------------------------------------
 
 async def run_all_tenants_full_sync() -> None:
-    """
-    Full multitenant sync.
-
-    For every active tenant → for every active source system with a resolved
-    crm_org_id → fetch + upsert entities + tickets scoped to that org.
-    """
     tenants = await _get_all_active_tenants()
     logger.info("Scheduler: starting full sync for %d active tenants", len(tenants))
-
     for tenant in tenants:
         tss_rows = await _get_tenant_source_systems(tenant.id)
-
         if not tss_rows:
             logger.debug(
                 "Tenant %s has no active source systems with crm_org_id — skipping",
                 tenant.id,
             )
             continue
-
         for tss in tss_rows:
             await _sync_one_tenant_source_system(tenant.id, tss)
-
     logger.info("Scheduler: full multitenant sync complete")
 
 
@@ -329,35 +285,21 @@ async def run_tenant_full_sync(
     tenant_id: uuid.UUID,
     db: AsyncSession | None = None,
 ) -> dict:
-    """
-    Full sync for a single tenant across all its registered source systems.
-
-    When called from a route (db != None), the caller owns the session.
-    When called from the scheduler (db=None), each step uses its own session.
-    """
     tss_rows = await _get_tenant_source_systems(tenant_id)
     if not tss_rows:
         logger.warning("Tenant %s has no active source systems with crm_org_id", tenant_id)
         return {}
-
     all_results: dict[str, dict] = {}
     for tss in tss_rows:
         source_system_name = await _get_source_system_name(tss.source_system_id)
         key = f"{source_system_name}:{tss.crm_org_id}"
         all_results[key] = await _sync_one_tenant_source_system(tenant_id, tss)
-
     return all_results
 
 
 async def run_zammad_full_sync(db: AsyncSession | None = None) -> dict:
-    """
-    Backward-compatible: sync all tenants that have a Zammad connection.
-    Scheduler path uses isolated sessions; route path (db != None) is
-    handled per-tenant inside _sync_one_tenant_source_system.
-    """
     tenants = await _get_all_active_tenants()
     all_results: dict = {}
-
     for tenant in tenants:
         tss_rows = await _get_tenant_source_systems(tenant.id)
         for tss in tss_rows:
@@ -366,17 +308,12 @@ async def run_zammad_full_sync(db: AsyncSession | None = None) -> dict:
                 continue
             key = f"tenant:{tenant.id}:zammad:{tss.crm_org_id}"
             all_results[key] = await _sync_one_tenant_source_system(tenant.id, tss)
-
     return all_results
 
 
 async def run_espocrm_full_sync(db: AsyncSession | None = None) -> dict:
-    """
-    Backward-compatible: sync all tenants that have an EspoCRM connection.
-    """
     tenants = await _get_all_active_tenants()
     all_results: dict = {}
-
     for tenant in tenants:
         tss_rows = await _get_tenant_source_systems(tenant.id)
         for tss in tss_rows:
@@ -385,12 +322,11 @@ async def run_espocrm_full_sync(db: AsyncSession | None = None) -> dict:
                 continue
             key = f"tenant:{tenant.id}:espocrm:{tss.crm_org_id}"
             all_results[key] = await _sync_one_tenant_source_system(tenant.id, tss)
-
     return all_results
 
 
 # ---------------------------------------------------------------------------
-# Private helper — shared result shape
+# Private helper
 # ---------------------------------------------------------------------------
 
 def _build_result(

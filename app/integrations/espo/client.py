@@ -16,6 +16,27 @@ EspoCRM API quirks vs Zammad:
   - Entity for tickets is "Case" not "Ticket"
   - Timestamps use camelCase: "createdAt", "modifiedAt"
 
+Agent-scoping quirk:
+  EspoCRM User records have no accountId FK — users are instance-level.
+  Contact records DO have an accountId FK, and Contact.emailAddress
+  matches User.emailAddress for the same person.
+
+  IMPORTANT: Contact.id != User.id — they are completely different records.
+  The only reliable bridge is the shared email address.
+
+  get_agents_by_account() therefore:
+    1. Fetches all Contacts for the account (already paginated)
+    2. Collects the set of email addresses from those contacts
+    3. For each email, queries:
+         GET /api/v1/User?where[0][type]=equals
+                         &where[0][attribute]=emailAddress
+                         &where[0][value]=<email>
+       to find the matching User record
+    4. Filters returned Users to those whose title == "Agent"
+
+  This ensures syncing TCS only pulls Rajnandini, not every agent
+  in the entire EspoCRM instance.
+
 EspoCRM API docs: https://docs.espocrm.com/development/api/
 """
 
@@ -183,6 +204,54 @@ class EspoClient:
         )
         return detailed_users
 
+    async def _get_user_by_email(self, email: str) -> dict | None:
+        """
+        Fetch a single EspoCRM User record by email address.
+
+        GET /api/v1/User
+          ?where[0][type]=equals
+          &where[0][attribute]=emailAddress
+          &where[0][value]=<email>
+
+        This is the correct Contact → User bridge because:
+          Contact.emailAddress == User.emailAddress  (same person)
+          Contact.id           != User.id            (different records)
+
+        Args:
+            email: Email address to look up.
+
+        Returns:
+            First matching User dict, or None if not found / on error.
+        """
+        logger.debug("EspoCRM: looking up user by email=%s", email)
+        try:
+            response = await self._get(
+                "/api/v1/User",
+                params={
+                    "where[0][type]":      "equals",
+                    "where[0][attribute]": "emailAddress",
+                    "where[0][value]":     email,
+                    "maxSize":             1,
+                },
+            )
+        except EspoClientError as exc:
+            logger.warning(
+                "EspoCRM: failed to look up user by email=%s: %s", email, exc
+            )
+            return None
+
+        users: list[dict] = response.get("list", [])
+        if not users:
+            logger.debug("EspoCRM: no user found for email=%s", email)
+            return None
+
+        user = users[0]
+        logger.debug(
+            "EspoCRM: resolved user id=%s name=%s for email=%s",
+            user.get("id"), user.get("name"), email,
+        )
+        return user
+
     # ------------------------------------------------------------------
     # Ticket (Case) endpoints
     # ------------------------------------------------------------------
@@ -321,37 +390,106 @@ class EspoClient:
         all_users = await self._get_all_users_with_detail()
         agents = [
             user for user in all_users
-            if any(
-                AGENT_ROLE_KEYWORD in role_name
-                for role_name in (user.get("rolesNames") or {}).values()
-            )
+            if user.get("title") == AGENT_ROLE_KEYWORD
         ]
         logger.info("EspoCRM: fetched %d agents total", len(agents))
         return agents
 
     async def get_agents_by_account(self, crm_org_id: str) -> list[dict]:
         """
-        Fetch EspoCRM users (agents) associated with a specific Account.
+        Fetch EspoCRM users (agents) that belong to a specific Account.
 
-        EspoCRM users don't have a direct accountId FK — the relationship
-        is through Contacts. For agents we search by their assigned account
-        via the Teams / Roles relationship. In practice most EspoCRM
-        deployments scope agents at the system level, not per account.
+        WHY THIS IS NON-TRIVIAL
+        -----------------------
+        EspoCRM User records carry no accountId FK — users are instance-level.
+        The account relationship lives on the Contact entity: each Contact has
+        an accountId pointing to its Account.
 
-        Strategy: fetch ALL users with detail and filter by role keyword.
-        Then return all agents (agents are shared across the CRM instance,
-        not per-account). Use get_contacts_by_account for customers.
+        CRITICAL: Contact.id != User.id — they are completely different records.
+        The only reliable bridge is: Contact.emailAddress == User.emailAddress.
+
+        STRATEGY
+        --------
+        1. Fetch all Contacts for this account via get_contacts_by_account.
+        2. Collect the email addresses from those contacts.
+        3. For each email, call:
+             GET /api/v1/User?where[0][type]=equals
+                             &where[0][attribute]=emailAddress
+                             &where[0][value]=<email>
+           to find the matching User record.
+        4. Keep only users whose title == "Agent".
+
+        Example: TCS account has contact Rajnandini (rajnandini@tcs.com).
+        We look up the User with emailAddress=rajnandini@tcs.com, confirm
+        their title is "Agent", and return only that user — not every agent
+        in the EspoCRM instance.
 
         Args:
-            crm_org_id: EspoCRM Account UUID string (informational; agents
-                        are instance-scoped, not account-scoped in EspoCRM).
+            crm_org_id: EspoCRM Account UUID string
+                        (crm_org_id from tenant_source_systems).
+
+        Returns:
+            List of User dicts for agents linked to this account.
         """
-        # Agents in EspoCRM are instance-level, not account-scoped.
-        # We still return all agents so ticket FK resolution works correctly.
+        # Step 1: contacts for this account carry the email addresses we need
+        contacts = await self.get_contacts_by_account(crm_org_id)
+
+        if not contacts:
+            logger.info(
+                "EspoCRM: no contacts found for account_id=%s — no agents to sync",
+                crm_org_id,
+            )
+            return []
+
+        # Step 2: collect non-empty email addresses from contacts
+        contact_emails: list[str] = [
+            c["emailAddress"]
+            for c in contacts
+            if c.get("emailAddress")
+        ]
+
+        if not contact_emails:
+            logger.warning(
+                "EspoCRM: contacts found for account_id=%s but none have emailAddress — "
+                "cannot resolve users",
+                crm_org_id,
+            )
+            return []
+
         logger.info(
-            "EspoCRM: fetching all agents (instance-scoped) for account_id=%s", crm_org_id
+            "EspoCRM: account_id=%s — resolving %d contact email(s) to User records",
+            crm_org_id, len(contact_emails),
         )
-        return await self.get_all_agents()
+
+        # Step 3 & 4: look up each email → User, keep only agents
+        agents: list[dict] = []
+        for email in contact_emails:
+            user = await self._get_user_by_email(email)
+            if user is None:
+                logger.warning(
+                    "EspoCRM: no User found for contact email=%s (account_id=%s) — skipping",
+                    email, crm_org_id,
+                )
+                continue
+
+            title = user.get("title", "")
+            if title == AGENT_ROLE_KEYWORD:
+                agents.append(user)
+                logger.debug(
+                    "EspoCRM: agent resolved — id=%s name=%s email=%s",
+                    user.get("id"), user.get("name"), email,
+                )
+            else:
+                logger.debug(
+                    "EspoCRM: user id=%s email=%s title=%r is not an agent — skipping",
+                    user.get("id"), email, title,
+                )
+
+        logger.info(
+            "EspoCRM: resolved %d agent(s) for account_id=%s from %d contact email(s)",
+            len(agents), crm_org_id, len(contact_emails),
+        )
+        return agents
 
     # ------------------------------------------------------------------
     # Customer (Contact) endpoints
@@ -360,10 +498,7 @@ class EspoClient:
         all_users = await self._get_all_users_with_detail()
         customers = [
             user for user in all_users
-            if any(
-                CUSTOMER_ROLE_KEYWORD in role_name
-                for role_name in (user.get("rolesNames") or {}).values()
-            )
+            if user.get("title") == CUSTOMER_ROLE_KEYWORD
         ]
         logger.info("EspoCRM: fetched %d customers total", len(customers))
         return customers
@@ -380,6 +515,11 @@ class EspoClient:
           ?where[0][type]=equals
           &where[0][attribute]=accountId
           &where[0][value]=<crm_org_id>
+
+        Also used internally by get_agents_by_account:
+          contact.emailAddress → GET /api/v1/User?emailAddress=<email>
+        is the only reliable Contact → User bridge in EspoCRM
+        (Contact.id != User.id).
 
         Args:
             crm_org_id: EspoCRM Account UUID string.
