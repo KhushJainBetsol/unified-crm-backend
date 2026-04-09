@@ -35,7 +35,6 @@ from app.services.scheduler import run_all_tenants_full_sync, start_scheduler, s
 from app.utils.exceptions import register_exception_handlers
 from app.integrations.webhooks.router import router as webhook_router
 from app.integrations.webhooks.seeder import seed_crm_integrations
-
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
