@@ -8,6 +8,7 @@ from the router. No new session opened here.
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -181,6 +182,7 @@ async def _handle_espo(payload: RawWebhookPayload, session: AsyncSession) -> Non
     sync = SyncService(session)
     repo = TicketRepository(session)
     source_system_id = payload.source_system_id
+    tenant_id = payload.tenant_id
 
     for raw in payload.records:
         crm_ticket_id = _extract_record_id(raw, source="espo")
@@ -190,12 +192,12 @@ async def _handle_espo(payload: RawWebhookPayload, session: AsyncSession) -> Non
         try:
             match payload.event_type:
                 case "Case.create":
-                    await _espo_create(raw, source_system_id, sync, repo)
+                    await _espo_create(raw, source_system_id, tenant_id, sync, repo)
                 case "Case.delete":
-                    await _espo_delete(crm_ticket_id, source_system_id, repo)
+                    await _espo_delete(crm_ticket_id, source_system_id, tenant_id, repo)
                 case _:
                     await _espo_partial_update(
-                        crm_ticket_id, raw, source_system_id, sync, repo
+                        crm_ticket_id, raw, source_system_id, tenant_id, sync, repo
                     )
         except (NormalizationError, UnresolvableStatusError) as exc:
             # Config/data errors: log clearly, no stack trace needed.
@@ -218,6 +220,7 @@ async def _handle_espo(payload: RawWebhookPayload, session: AsyncSession) -> Non
 async def _espo_create(
     raw: dict,
     source_system_id: int,
+    tenant_id: uuid.UUID | None,
     sync: SyncService,
     repo: TicketRepository,
 ) -> None:
@@ -244,18 +247,20 @@ async def _espo_create(
         )
 
     priority_id = await sync._get_priority_id(normalized.priority)
-    agent_id = await sync._get_agent_uuid(normalized.crm_agent_id, source_system_id)
+    agent_id = await sync._get_agent_uuid(normalized.crm_agent_id, source_system_id, tenant_id)
     customer_id = await sync._get_customer_uuid(
-        normalized.crm_customer_id, source_system_id
+        normalized.crm_customer_id, source_system_id, tenant_id
     )
     company_id = await sync._get_company_uuid(
-        normalized.crm_company_id, source_system_id
+        normalized.crm_company_id, source_system_id, tenant_id
     )
 
     _, created = await repo.upsert(
         crm_ticket_id=normalized.crm_ticket_id,
         source_system_id=source_system_id,
+        tenant_id=tenant_id,
         data={
+            "tenant_id": tenant_id,
             "title": normalized.title,
             "description": normalized.description,
             "status_id": status_id,
@@ -281,6 +286,7 @@ async def _espo_partial_update(
     crm_ticket_id: str,
     raw: dict,
     source_system_id: int,
+    tenant_id: uuid.UUID | None,
     sync: SyncService,
     repo: TicketRepository,
 ) -> None:
@@ -297,7 +303,7 @@ async def _espo_partial_update(
     full sync will fill it in. ERROR would create alert noise for a
     transient condition.
     """
-    existing = await repo.get_by_crm_id(crm_ticket_id, source_system_id)
+    existing = await repo.get_by_crm_id(crm_ticket_id, source_system_id, tenant_id=tenant_id)
     if not existing:
         logger.warning(
             "espo: Case.update id=%s not in DB — "
@@ -354,17 +360,17 @@ async def _espo_partial_update(
 
     if "assignedUserId" in raw:
         updates["agent_id"] = await sync._get_agent_uuid(
-            raw["assignedUserId"] or None, source_system_id
+            raw["assignedUserId"] or None, source_system_id, tenant_id
         )
 
     if "createdById" in raw:
         updates["customer_id"] = await sync._get_customer_uuid(
-            raw["createdById"] or None, source_system_id
+            raw["createdById"] or None, source_system_id, tenant_id
         )
 
     if "accountId" in raw:
         updates["company_id"] = await sync._get_company_uuid(
-            raw["accountId"] or None, source_system_id
+            raw["accountId"] or None, source_system_id, tenant_id
         )
 
     if not updates:
@@ -385,6 +391,7 @@ async def _espo_partial_update(
 async def _espo_delete(
     crm_ticket_id: str,
     source_system_id: int,
+    tenant_id: uuid.UUID | None,
     repo: TicketRepository,
 ) -> None:
     """
@@ -395,7 +402,7 @@ async def _espo_delete(
     the event multiple times. Idempotent handling (skip if already deleted)
     is correct behaviour, not an anomaly worth surfacing in alerts.
     """
-    existing = await repo.get_by_crm_id(crm_ticket_id, source_system_id)
+    existing = await repo.get_by_crm_id(crm_ticket_id, source_system_id, tenant_id=tenant_id)
     if not existing:
         logger.warning(
             "espo: Case.delete id=%s not in DB — nothing to delete",
@@ -412,7 +419,7 @@ async def _espo_delete(
     await repo.soft_delete(
         ticket=existing,
         deleted_by_id=None,
-        deleted_by_source=True,
+        is_deleted_by_crm=True,  # fixed: was deleted_by_source=True
     )
     logger.info("espo: Case.delete id=%s — soft deleted", crm_ticket_id)
 
@@ -429,7 +436,7 @@ async def _handle_zammad(payload: RawWebhookPayload, session: AsyncSession) -> N
     shapes but sends it flat in others. Falling back to raw itself handles
     both shapes without requiring separate handlers.
 
-    Why raise NormalizationError / UnresolvableStatusError up to here?
+    Why are NormalizationError / UnresolvableStatusError caught per-record?
     These are config/data issues. Logging them at ERROR here (rather than
     letting them propagate to handle_raw_webhook) gives us per-record
     context (crm_ticket_id, event) in the log line, which is far more
@@ -438,6 +445,7 @@ async def _handle_zammad(payload: RawWebhookPayload, session: AsyncSession) -> N
     sync = SyncService(session)
     repo = TicketRepository(session)
     source_system_id = payload.source_system_id
+    tenant_id = payload.tenant_id
 
     for raw in payload.records:
         ticket_raw = raw.get("ticket", raw)
@@ -445,33 +453,41 @@ async def _handle_zammad(payload: RawWebhookPayload, session: AsyncSession) -> N
         if crm_ticket_id is None:
             continue
 
+        # Both NormalizationError and UnresolvableStatusError must be raised
+        # and caught inside this single try/except so per-record context is
+        # preserved in the log line. Previously they were raised before the
+        # inner try, causing them to escape to handle_raw_webhook unhandled.
         try:
-            normalized = normalize_zammad_ticket(ticket_raw)
-        except (KeyError, ValueError) as exc:
-            raise NormalizationError(
-                f"zammad: normalisation failed for id={crm_ticket_id}", original=exc
-            ) from exc
+            try:
+                normalized = normalize_zammad_ticket(ticket_raw)
+            except (KeyError, ValueError) as exc:
+                raise NormalizationError(
+                    f"zammad: normalisation failed for id={crm_ticket_id}", original=exc
+                ) from exc
 
-        status_id = await sync._get_status_id(normalized.status)
-        if not status_id:
-            raise UnresolvableStatusError(
-                f"zammad: cannot resolve status={normalized.status!r} for id={crm_ticket_id}"
-            )
+            status_id = await sync._get_status_id(normalized.status)
+            if not status_id:
+                raise UnresolvableStatusError(
+                    f"zammad: cannot resolve status={normalized.status!r} for id={crm_ticket_id}"
+                )
 
-        try:
             priority_id = await sync._get_priority_id(normalized.priority)
-            agent_id = await sync._get_agent_uuid(normalized.crm_agent_id, source_system_id)
+            agent_id = await sync._get_agent_uuid(
+                normalized.crm_agent_id, source_system_id, tenant_id
+            )
             customer_id = await sync._get_customer_uuid(
-                normalized.crm_customer_id, source_system_id
+                normalized.crm_customer_id, source_system_id, tenant_id
             )
             company_id = await sync._get_company_uuid(
-                normalized.crm_company_id, source_system_id
+                normalized.crm_company_id, source_system_id, tenant_id
             )
 
             _, created = await repo.upsert(
                 crm_ticket_id=normalized.crm_ticket_id,
                 source_system_id=source_system_id,
+                tenant_id=tenant_id,
                 data={
+                    "tenant_id": tenant_id,
                     "title": normalized.title,
                     "description": normalized.description,
                     "status_id": status_id,
