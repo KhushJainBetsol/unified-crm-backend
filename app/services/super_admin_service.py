@@ -83,7 +83,7 @@ async def svc_create_tenant(
             )
 
         # Step 3 — insert tenant
-        tenant = Tenant(name=name, slug=slug)
+        tenant = Tenant(name=name, slug=slug, contact_email=contact_email)
         db.add(tenant)
         await db.flush()  # populate tenant.id
 
@@ -169,6 +169,7 @@ async def svc_create_tenant(
             "id": str(tenant.id),
             "name": tenant.name,
             "slug": tenant.slug,
+            "contact_email":tenant.contact_email,
             "is_active": tenant.is_active,
             "created_at": tenant.created_at,
         },
@@ -299,7 +300,7 @@ async def svc_list_tenants(db: AsyncSession) -> list[dict]:
         {
             "id": str(t.id),
             "name": t.name,
-            "slug": t.slug,
+            "contact_email": t.contact_email,
             "is_active": t.is_active,
             "created_at": t.created_at,
         }

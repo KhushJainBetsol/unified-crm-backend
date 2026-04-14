@@ -49,6 +49,12 @@ class Tenant(Base):
         comment="Status of the tenant's subscription",
     )
 
+    contact_email: Mapped[str] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Primary contact email for the tenant",
+    )
+
     # ------------------------------------------------------------------
     # Timestamps
     # ------------------------------------------------------------------
