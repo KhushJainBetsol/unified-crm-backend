@@ -1,13 +1,18 @@
 """
 app/models/ticket.py
 
-Table tickets
+Table: tickets
 
 tenant_id is nullable — isolation logic not yet decided.
 
 CHECK constraints:
   1. Soft-delete consistency
   2. Deletion-source exclusivity
+
+Migration note:
+  pending_until was added to support CRMs (e.g. Zammad) that require a
+  deadline timestamp when transitioning a ticket to a pending state.
+  Run: alembic revision --autogenerate -m "add_ticket_pending_until"
 """
 
 from __future__ import annotations
@@ -127,6 +132,15 @@ class Ticket(Base):
     )
     closed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None,
+    )
+    pending_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+        comment=(
+            "Deadline for the pending state. Required by some CRMs (e.g. Zammad "
+            "pending_time). NULL when the ticket is not in a pending state."
+        ),
     )
 
     # ------------------------------------------------------------------

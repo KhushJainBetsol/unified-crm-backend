@@ -108,6 +108,7 @@ def _to_detail(ticket) -> dict:
         created_at=ticket.created_at,
         updated_at=ticket.updated_at,
         closed_at=ticket.closed_at,
+        pending_until=ticket.pending_until,
         is_deleted=ticket.is_deleted,
         deleted_at=ticket.deleted_at,
     ).model_dump()

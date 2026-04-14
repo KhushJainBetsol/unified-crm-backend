@@ -1,6 +1,6 @@
 # app/integrations/normalizer/config/zammad_mappings.toml
 #
-# Zammad → UnifiedCRM field value mappings
+# Zammad ↔ UnifiedCRM field value mappings
 #
 # Rules:
 #   - Keys are Zammad raw values (lowercase)
@@ -79,3 +79,13 @@ priority = ""       # empty string = NULL in DB
 "high"   = "3 high"
 "urgent" = "3 high"
 
+# ---------------------------------------------------------------------------
+# Pending states — Zammad state names that require a `pending_time` timestamp
+# in the PUT payload. Zammad will reject or silently ignore a state change to
+# any of these without a valid pending_time.
+#
+# Add any custom pending state names your instance uses.
+# Values must exactly match the strings in [push_status] above.
+# ---------------------------------------------------------------------------
+[pending_states]
+values = ["pending reminder", "pending close"]

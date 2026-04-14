@@ -27,9 +27,19 @@ CRM push strategy:
 
 Push mapping strategy:
   - All internal → CRM value mappings live in TOML files, not in this file.
-  - Zammad : app/integrations/normalizer/config/zammad_mappings.toml [push_status] / [push_priority]
-  - EspoCRM: app/integrations/normalizer/config/espo_mappings.toml  [push_status] / [push_priority]
+  - Zammad : app/integrations/normalizer/config/zammad_mappings.toml
+             [push_status] / [push_priority] / [pending_states]
+  - EspoCRM: app/integrations/normalizer/config/espo_mappings.toml
+             [push_status] / [push_priority]
   - Mappings are loaded once at import time. Restart the server after editing a TOML.
+
+Pending state contract (Zammad-specific):
+  - Zammad requires a `pending_time` timestamp in the PUT payload whenever the
+    target state is listed in [pending_states] of zammad_mappings.toml.
+  - The service trusts that TicketUpdateRequest has already been validated by
+    its model_validator, so pending_until is guaranteed to be present when
+    status == "pending" by the time this service is called.
+  - pending_until is persisted to the DB and also forwarded to the CRM.
 """
 
 from __future__ import annotations
@@ -68,7 +78,7 @@ _CONFIG_DIR = Path(__file__).parent.parent / "integrations/normalizer/config"
 
 
 # ---------------------------------------------------------------------------
-# TOML loader — shared by both CRMs
+# TOML loaders
 # ---------------------------------------------------------------------------
 
 
@@ -95,7 +105,7 @@ def _load_push_mappings(
     with open(path, "rb") as f:
         data = tomllib.load(f)
 
-    push_status = {k.lower(): v for k, v in data["push_status"].items()}
+    push_status   = {k.lower(): v for k, v in data["push_status"].items()}
     push_priority = {k.lower(): v for k, v in data["push_priority"].items()}
 
     logger.info(
@@ -107,8 +117,34 @@ def _load_push_mappings(
     return push_status, push_priority
 
 
+def _load_zammad_pending_states(toml_filename: str) -> frozenset[str]:
+    """
+    Load [pending_states].values from the Zammad mappings TOML.
+
+    These are the exact Zammad state strings that require a `pending_time`
+    timestamp in the PUT payload. Stored as a frozenset for O(1) membership
+    checks and immutability.
+
+    Returns:
+        frozenset of lowercase Zammad state name strings.
+
+    Raises:
+        FileNotFoundError: if the TOML file does not exist.
+        KeyError:          if [pending_states] section or `values` key is absent.
+    """
+    path = _CONFIG_DIR / toml_filename
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    states = frozenset(s.lower() for s in data["pending_states"]["values"])
+    logger.info("Zammad pending states loaded: %s", states)
+    return states
+
+
 # ---------------------------------------------------------------------------
-# Load mappings at import time.
+# Load all mappings once at import time.
+# Failures degrade gracefully — CRM pushes are skipped with an error log
+# rather than crashing the entire service on startup.
 # ---------------------------------------------------------------------------
 
 try:
@@ -121,8 +157,20 @@ except Exception as exc:
         "CRM pushes for Zammad tickets will be skipped until this is fixed.",
         exc,
     )
-    _ZAMMAD_STATUS = {}
+    _ZAMMAD_STATUS   = {}
     _ZAMMAD_PRIORITY = {}
+
+try:
+    _ZAMMAD_PENDING_STATES: frozenset[str] = _load_zammad_pending_states(
+        "zammad_mappings.toml"
+    )
+except Exception as exc:
+    logger.error(
+        "Failed to load Zammad pending_states from zammad_mappings.toml: %s — "
+        "pending_time will never be sent in Zammad pushes until this is fixed.",
+        exc,
+    )
+    _ZAMMAD_PENDING_STATES = frozenset()
 
 try:
     _ESPO_STATUS, _ESPO_PRIORITY = _load_push_mappings("espo_mappings.toml", "EspoCRM")
@@ -132,7 +180,7 @@ except Exception as exc:
         "CRM pushes for EspoCRM tickets will be skipped until this is fixed.",
         exc,
     )
-    _ESPO_STATUS = {}
+    _ESPO_STATUS   = {}
     _ESPO_PRIORITY = {}
 
 
@@ -144,14 +192,14 @@ except Exception as exc:
 class TicketService:
 
     def __init__(self, db: AsyncSession) -> None:
-        self.db = db
+        self.db   = db
         self.repo = TicketRepository(db)
 
     # ------------------------------------------------------------------
     # Source system helpers
     # ------------------------------------------------------------------
 
-    async def _resolve_source_system(self, source: str):
+    async def _resolve_source_system(self, source: str) -> SourceSystem:
         """
         Resolve a source system name to its DB row.
         Raises HTTP 404 if not found.
@@ -172,11 +220,9 @@ class TicketService:
     # ------------------------------------------------------------------
 
     async def _get_agent_or_404(self, agent_id: uuid.UUID) -> Agent:
-        """
-        Fetch an agent by UUID or raise HTTP 404.
-        """
+        """Fetch an agent by UUID or raise HTTP 404."""
         result = await self.db.execute(select(Agent).where(Agent.id == agent_id))
-        agent = result.scalars().first()
+        agent  = result.scalars().first()
         if not agent:
             raise HTTPException(
                 status_code=http_status.HTTP_404_NOT_FOUND,
@@ -241,9 +287,7 @@ class TicketService:
         status: str | None = None,
         priority: str | None = None,
     ) -> tuple[list, int]:
-        """
-        Return paginated list of all tickets for a tenant, with optional filters.
-        """
+        """Return paginated list of all tickets for a tenant."""
         offset = (page - 1) * page_size
         return await self.repo.get_all(
             tenant_id=tenant_id,
@@ -264,10 +308,7 @@ class TicketService:
         status: str | None = None,
         priority: str | None = None,
     ) -> tuple[list, int]:
-        """
-        Return paginated tickets with all optional filters applied.
-        If source is provided it is resolved to a source_system_id first.
-        """
+        """Return paginated tickets with all optional filters applied."""
         offset = (page - 1) * page_size
 
         if source:
@@ -301,11 +342,8 @@ class TicketService:
         status: str | None = None,
         priority: str | None = None,
     ) -> tuple[list, int, Agent]:
-        """
-        Validate agent exists, then return their tickets scoped to tenant.
-        Returns (tickets, total, agent) so the route can use agent.name in the message.
-        """
-        agent = await self._get_agent_or_404(agent_id)
+        """Validate agent exists, then return their tickets scoped to tenant."""
+        agent  = await self._get_agent_or_404(agent_id)
         offset = (page - 1) * page_size
         tickets, total = await self.repo.get_by_agent(
             agent_id=agent_id,
@@ -356,47 +394,39 @@ class TicketService:
         originating CRM (best-effort — CRM failures are logged, not raised).
 
         Role gating is enforced upstream via `require_admin` on the route.
-        This method trusts that the caller is an admin.
 
-        Args:
-            ticket_id:      Internal UUID of the ticket.
-            update:         TicketUpdateRequest with human-readable field names.
-            deleted_by_id:  Unused here; kept for signature consistency with
-                            other write methods.
-            tenant_id:      Scope the ticket lookup to this tenant.
-
-        Returns:
-            Updated Ticket ORM object (with all relationships loaded).
-
-        Raises:
-            HTTP 400 if the payload contains no updatable fields.
-            HTTP 404 if the ticket or agent UUID is not found.
-            HTTP 422 if the status or priority string is invalid.
+        The pending_until contract is enforced by TicketUpdateRequest's
+        model_validator before this method is ever called:
+          - status="pending"  → pending_until is always present here
+          - status != "pending" → pending_until is always None here
         """
-        # ---- Fetch ticket (tenant-scoped) --------------------------------
         ticket = await self.get_ticket_or_404(ticket_id, tenant_id=tenant_id)
 
-        # ---- Build the DB update dict -----------------------------------
         update_data: dict = {}
 
         if update.status is not None:
             status_obj = await self._resolve_status(update.status)
             update_data["status_id"] = status_obj.id
+            new_status = update.status.lower()
 
-            # Keep closed_at in sync with status automatically
-            if update.status.lower() == "closed" and ticket.closed_at is None:
+            # --- closed_at lifecycle ---
+            if new_status == "closed" and ticket.closed_at is None:
                 update_data["closed_at"] = datetime.utcnow()
-            elif update.status.lower() != "closed" and ticket.closed_at is not None:
-                # Ticket is being reopened — clear closed_at directly on the
-                # ORM object because repo.update() skips None values by design.
+            elif new_status != "closed" and ticket.closed_at is not None:
                 ticket.closed_at = None
+
+            # --- pending_until lifecycle ---
+            if new_status == "pending":
+                update_data["pending_until"] = update.pending_until
+            elif ticket.pending_until is not None:
+                ticket.pending_until = None
 
         if update.priority is not None:
             priority_obj = await self._resolve_priority(update.priority)
             update_data["priority_id"] = priority_obj.id
 
         if update.agent_id is not None:
-            await self._get_agent_or_404(update.agent_id)  # validates existence
+            await self._get_agent_or_404(update.agent_id)
             update_data["agent_id"] = update.agent_id
 
         if not update_data:
@@ -405,10 +435,9 @@ class TicketService:
                 detail="Request body contained no updatable fields",
             )
 
-        # ---- Persist to DB ----------------------------------------------
         updated_ticket = await self.repo.update(ticket, update_data)
 
-        # ---- Push to source CRM (best-effort) ---------------------------
+        # Best-effort CRM push — never raises to the caller.
         await self._push_update_to_crm(updated_ticket, update)
 
         return updated_ticket
@@ -424,7 +453,6 @@ class TicketService:
     ) -> None:
         """
         Route the update to the correct CRM based on the ticket's source system.
-
         Failures are caught and logged — they never bubble up to the caller
         because the DB update has already been committed at this point.
         """
@@ -465,15 +493,11 @@ class TicketService:
         async with ZammadClient() as client:
             service = ZammadService(client)
 
+            # Fetch live field options for pre-validation.
             try:
-                field_options = await service.get_ticket_field_options()
-                valid_states = field_options.get("state", [])
+                field_options    = await service.get_ticket_field_options()
+                valid_states     = field_options.get("state", [])
                 valid_priorities = field_options.get("priority", [])
-                logger.debug(
-                    "Zammad ticket field options — states: %s | priorities: %s",
-                    valid_states,
-                    valid_priorities,
-                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Could not fetch Zammad field options for ticket %s — "
@@ -481,13 +505,15 @@ class TicketService:
                     ticket.id,
                     exc,
                 )
-                valid_states = []
+                valid_states     = []
                 valid_priorities = []
 
             crm_data: dict = {}
 
+            # ---- Status ------------------------------------------------
             if payload.status is not None:
                 mapped_status = _ZAMMAD_STATUS.get(payload.status.lower())
+
                 if mapped_status is None:
                     logger.error(
                         "Zammad status mapping missing for ticket %s: "
@@ -504,10 +530,47 @@ class TicketService:
                         ticket.id, payload.status, mapped_status, valid_states,
                     )
                 else:
+                    # Push by name — avoids instance-specific ID mismatches.
                     crm_data["state"] = mapped_status
 
+                    if mapped_status.lower() in _ZAMMAD_PENDING_STATES:
+                        if payload.pending_until is None:
+                            logger.error(
+                                "Zammad push for ticket %s: state '%s' requires "
+                                "pending_time but pending_until is None — "
+                                "dropping state field to avoid a malformed request. "
+                                "This is a bug; TicketUpdateRequest validator should "
+                                "have rejected this payload.",
+                                ticket.id, mapped_status,
+                            )
+                            del crm_data["state"]
+                        else:
+                            # FIX 1: Ensure timezone info is present. Naive datetimes are 
+                            # parsed as UTC by Zammad. If lacking tzinfo, append "Z" so 
+                            # Zammad doesn't evaluate the local time as being in the past.
+                            pt_str = payload.pending_until.isoformat()
+                            if payload.pending_until.tzinfo is None:
+                                pt_str += "Z"
+                            
+                            crm_data["pending_time"] = pt_str
+                    else:
+                        # FIX 2: Explicitly clear pending_time when moving to an open/closed state.
+                        # Zammad will reject the transition if the old pending_time is in the past.
+                        crm_data["pending_time"] = None
+                        
+            # FIX 3: Re-send pending_time if we aren't updating the status but the ticket is ALREADY pending.
+            # Zammad runs full model validation on PUT. If we update priority on a pending ticket
+            # whose pending_time has passed, Zammad rejects it with "Invalid value '3' for field 'state_id'!"
+            elif ticket.status.status_name == "pending" and ticket.pending_until:
+                pt_str = ticket.pending_until.isoformat()
+                if ticket.pending_until.tzinfo is None:
+                    pt_str += "Z"
+                crm_data["pending_time"] = pt_str
+
+            # ---- Priority ----------------------------------------------
             if payload.priority is not None:
                 mapped_priority = _ZAMMAD_PRIORITY.get(payload.priority.lower())
+
                 if mapped_priority is None:
                     logger.error(
                         "Zammad priority mapping missing for ticket %s: "
@@ -526,8 +589,9 @@ class TicketService:
                 else:
                     crm_data["priority"] = mapped_priority
 
+            # ---- Agent (owner) -----------------------------------------
             if payload.agent_id is not None:
-                agent = await self._get_agent_or_404(payload.agent_id)
+                agent        = await self._get_agent_or_404(payload.agent_id)
                 crm_agent_id = getattr(agent, "crm_agent_id", None)
                 if crm_agent_id:
                     crm_data["owner_id"] = int(crm_agent_id)
@@ -570,8 +634,8 @@ class TicketService:
             service = EspoService(client)
 
             try:
-                field_options = await service.get_case_field_options()
-                valid_statuses = field_options.get("status", [])
+                field_options    = await service.get_case_field_options()
+                valid_statuses   = field_options.get("status", [])
                 valid_priorities = field_options.get("priority", [])
                 logger.debug(
                     "EspoCRM Case field options — status: %s | priority: %s",
@@ -585,7 +649,7 @@ class TicketService:
                     ticket.id,
                     exc,
                 )
-                valid_statuses = []
+                valid_statuses   = []
                 valid_priorities = []
 
             crm_data: dict = {}
@@ -631,7 +695,7 @@ class TicketService:
                     crm_data["priority"] = mapped_priority
 
             if payload.agent_id is not None:
-                agent = await self._get_agent_or_404(payload.agent_id)
+                agent        = await self._get_agent_or_404(payload.agent_id)
                 crm_agent_id = getattr(agent, "crm_agent_id", None)
                 if crm_agent_id:
                     crm_data["assignedUserId"] = str(crm_agent_id)
@@ -698,17 +762,15 @@ class TicketService:
         by_priority = {r.priority_name: r.count for r in priority_result}
 
         return {
-            "total": row.total or 0,
-            "active": row.active or 0,
-            "deleted": row.deleted or 0,
-            "open": by_status.get("open", 0),
-            "closed": by_status.get("closed", 0),
-            "pending": by_status.get("pending", 0),
-            "high_priority": (
-                by_priority.get("high", 0) + by_priority.get("urgent", 0)
-            ),
-            "by_status": by_status,
-            "by_priority": by_priority,
+            "total":          row.total or 0,
+            "active":         row.active or 0,
+            "deleted":        row.deleted or 0,
+            "open":           by_status.get("open", 0),
+            "closed":         by_status.get("closed", 0),
+            "pending":        by_status.get("pending", 0),
+            "high_priority":  by_priority.get("high", 0) + by_priority.get("urgent", 0),
+            "by_status":      by_status,
+            "by_priority":    by_priority,
         }
 
     async def get_agent_stats(
@@ -723,7 +785,7 @@ class TicketService:
         await self._get_agent_or_404(agent_id)
 
         base_filter = [
-            Ticket.agent_id == agent_id,
+            Ticket.agent_id  == agent_id,
             Ticket.is_deleted == False,  # noqa: E712
         ]
         if tenant_id is not None:
@@ -751,13 +813,11 @@ class TicketService:
         by_priority = {r.priority_name: r.count for r in priority_result}
 
         return {
-            "total": total,
-            "open": by_status.get("open", 0),
-            "closed": by_status.get("closed", 0),
-            "pending": by_status.get("pending", 0),
-            "high_priority": (
-                by_priority.get("high", 0) + by_priority.get("urgent", 0)
-            ),
-            "by_status": by_status,
-            "by_priority": by_priority,
+            "total":         total,
+            "open":          by_status.get("open", 0),
+            "closed":        by_status.get("closed", 0),
+            "pending":       by_status.get("pending", 0),
+            "high_priority": by_priority.get("high", 0) + by_priority.get("urgent", 0),
+            "by_status":     by_status,
+            "by_priority":   by_priority,
         }
