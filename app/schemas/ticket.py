@@ -13,10 +13,11 @@ Update schemas:
   - TicketUpdateRequest : public PUT endpoint schema (role-gated at the route
                           via require_admin — no `role` field needed here)
 
-Response shapes:
-  - TicketResponse       : full flat response
-  - TicketDetailResponse : nested company / customer / agent objects
-  - TicketBriefResponse  : lightweight for paginated list views
+Pending state contract:
+  - When status = "pending", pending_until (datetime) is REQUIRED.
+  - When status != "pending", pending_until must be omitted (or null).
+  - This is validated at the schema layer so the service never receives
+    an inconsistent payload.
 """
 
 from __future__ import annotations
@@ -30,10 +31,18 @@ from app.schemas.agent import AgentBriefResponse
 from app.schemas.company import CompanyBriefResponse
 from app.schemas.customer import CustomerBriefResponse
 
+# ---------------------------------------------------------------------------
+# Internal constants
+# ---------------------------------------------------------------------------
+
+_VALID_STATUSES   = {"open", "pending", "closed"}
+_VALID_PRIORITIES = {"low", "normal", "high", "urgent"}
+
 
 # ---------------------------------------------------------------------------
 # Create — used by sync service only, not exposed as a public API endpoint
 # ---------------------------------------------------------------------------
+
 class TicketCreate(BaseModel):
     crm_ticket_id: str = Field(..., max_length=50)
     source_system_id: int
@@ -47,12 +56,13 @@ class TicketCreate(BaseModel):
     created_at: datetime
     updated_at: datetime
     closed_at: datetime | None = Field(default=None)
+    pending_until: datetime | None = Field(default=None)
 
 
 # ---------------------------------------------------------------------------
 # Agent update — only fields an agent is allowed to change
-# Cannot reassign company, customer, agent or change the title
 # ---------------------------------------------------------------------------
+
 class TicketAgentUpdate(BaseModel):
     description: str | None = Field(default=None)
     status_id: int | None = Field(default=None)
@@ -63,6 +73,7 @@ class TicketAgentUpdate(BaseModel):
 # ---------------------------------------------------------------------------
 # Admin update — full control over all editable ticket fields
 # ---------------------------------------------------------------------------
+
 class TicketAdminUpdate(BaseModel):
     title: str | None = Field(default=None, max_length=255)
     description: str | None = Field(default=None)
@@ -78,9 +89,14 @@ class TicketAdminUpdate(BaseModel):
 # Public update request — used by PUT /tickets/{id}
 #
 # Uses human-readable string names (not raw FK IDs).
-# Role enforcement is handled at the route level via `require_admin` —
-# the `role` field has been removed now that auth comes from the JWT.
+# Role enforcement is handled at the route level via `require_admin`.
+#
+# Pending state contract (validated by model_validator below):
+#   - status="pending"        → pending_until is REQUIRED
+#   - status != "pending"     → pending_until must be None
+#   - pending_until without status="pending" → rejected
 # ---------------------------------------------------------------------------
+
 class TicketUpdateRequest(BaseModel):
     status: str | None = Field(
         default=None,
@@ -94,11 +110,42 @@ class TicketUpdateRequest(BaseModel):
         default=None,
         description="UUID of the agent to assign this ticket to",
     )
+    pending_until: datetime | None = Field(
+        default=None,
+        description=(
+            "Required when status is 'pending'. "
+            "The deadline datetime for the pending state (timezone-aware recommended). "
+            "Must be omitted or null for all other statuses."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_pending_contract(self) -> "TicketUpdateRequest":
+        """
+        Enforce the pending state contract at the schema boundary so that
+        the service layer and CRM push logic can trust the payload is consistent.
+        """
+        status = self.status.lower() if self.status else None
+
+        if status == "pending" and self.pending_until is None:
+            raise ValueError(
+                "pending_until is required when status is 'pending'. "
+                "Provide a future datetime indicating when the pending period ends."
+            )
+
+        if status != "pending" and self.pending_until is not None:
+            raise ValueError(
+                f"pending_until may only be set when status is 'pending', "
+                f"got status='{self.status}'."
+            )
+
+        return self
 
 
 # ---------------------------------------------------------------------------
 # Soft delete — mirrors the DB CHECK constraint at schema level
 # ---------------------------------------------------------------------------
+
 class TicketSoftDelete(BaseModel):
     deleted_by_id: UUID | None = Field(
         default=None,
@@ -126,6 +173,7 @@ class TicketSoftDelete(BaseModel):
 # Full flat response
 # FK IDs for status, priority, source_system replaced with string names
 # ---------------------------------------------------------------------------
+
 class TicketResponse(BaseModel):
     id: UUID
     crm_ticket_id: str
@@ -140,6 +188,7 @@ class TicketResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     closed_at: datetime | None
+    pending_until: datetime | None
     is_deleted: bool
     deleted_at: datetime | None
     deleted_by_id: UUID | None
@@ -152,6 +201,7 @@ class TicketResponse(BaseModel):
 # Detail response — used on single ticket GET
 # Nested objects for company, customer, agent
 # ---------------------------------------------------------------------------
+
 class TicketDetailResponse(BaseModel):
     id: UUID
     crm_ticket_id: str
@@ -166,6 +216,7 @@ class TicketDetailResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     closed_at: datetime | None
+    pending_until: datetime | None
     is_deleted: bool
     deleted_at: datetime | None
 
@@ -175,6 +226,7 @@ class TicketDetailResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Brief response — used in paginated list views
 # ---------------------------------------------------------------------------
+
 class TicketBriefResponse(BaseModel):
     id: UUID
     source_system: str

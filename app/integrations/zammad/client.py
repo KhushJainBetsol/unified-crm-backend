@@ -253,20 +253,31 @@ class ZammadClient:
     async def update_ticket(self, crm_ticket_id: str | int, data: dict) -> dict:
         return await self._put(f"/api/v1/tickets/{crm_ticket_id}", data)
 
-    async def get_ticket_field_options(self) -> dict[str, list[str]]:
+    async def get_ticket_field_options(self) -> dict:
         states_response     = await self._get("/api/v1/ticket_states")
         priorities_response = await self._get("/api/v1/ticket_priorities")
+
         valid_states = [
-            s["name"].lower()
-            for s in states_response
-            if s.get("active", True)
+        s["name"].lower()
+        for s in states_response
+        if s.get("active", True)
         ]
         valid_priorities = [
-            p["name"]
-            for p in priorities_response
-            if p.get("active", True)
+        p["name"]
+        for p in priorities_response
+        if p.get("active", True)
         ]
-        return {"state": valid_states, "priority": valid_priorities}
+    # name → id lookup for push
+        state_name_to_id = {
+        s["name"].lower(): s["id"]
+        for s in states_response
+        if s.get("active", True)
+        }
+        return {
+        "state":          valid_states,
+        "priority":       valid_priorities,
+        "state_name_to_id": state_name_to_id,
+        }
 
     # ------------------------------------------------------------------
     # Comments (article) endpoints
