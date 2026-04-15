@@ -134,7 +134,7 @@ async def lifespan(app: FastAPI):
         await create_tables()
         await seed_lookup_tables()
         await seed_crm_integrations()
-        await seed_tenant_realms()  # NEW
+        await seed_tenant_realms() 
     except OperationalError:
         logger.critical(
             "Startup failed — cannot connect to database. "

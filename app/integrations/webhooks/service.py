@@ -436,7 +436,8 @@ async def _handle_zammad(payload: RawWebhookPayload, session: AsyncSession) -> N
     shapes but sends it flat in others. Falling back to raw itself handles
     both shapes without requiring separate handlers.
 
-    Why are NormalizationError / UnresolvableStatusError caught per-record?
+
+    Why raise NormalizationError / UnresolvableStatusError up to here?
     These are config/data issues. Logging them at ERROR here (rather than
     letting them propagate to handle_raw_webhook) gives us per-record
     context (crm_ticket_id, event) in the log line, which is far more
@@ -508,7 +509,6 @@ async def _handle_zammad(payload: RawWebhookPayload, session: AsyncSession) -> N
                 crm_ticket_id,
                 "inserted" if created else "updated",
             )
-
         except (NormalizationError, UnresolvableStatusError) as exc:
             logger.error(
                 "zammad: skipping id=%s event=%s — %s",
