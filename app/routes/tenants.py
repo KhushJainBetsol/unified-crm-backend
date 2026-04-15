@@ -4,7 +4,7 @@ app/routes/tenants.py
 Tenant-scoped endpoints accessible to admin and agent roles only.
 
   GET   /tenants/me                →  returns the tenant name for the currently logged-in user
-  PATCH /tenants/me                →  updates the tenant name/slug for the current tenant
+  PATCH /tenants/me                →  updates name/slug/contact_email and source systems
   GET   /tenants/me/source-systems →  returns the CRM systems configured for this tenant
 """
 
@@ -14,7 +14,7 @@ import logging
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, EmailStr, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,23 +31,43 @@ router = APIRouter(prefix="/tenants", tags=["Tenants"])
 # ---------------------------------------------------------------------------
 
 
-class TenantMeResponse(BaseModel):
-    id: str
-    name: str
-    slug: str
-
-
 class SourceSystemResponse(BaseModel):
     id: int
     system_name: str
 
 
+class TenantMeResponse(BaseModel):
+    id: str
+    name: str
+    slug: str
+    contact_email: str | None
+    source_systems: list[SourceSystemResponse]
+
+
+# ---------------------------------------------------------------------------
+# Request schema
+# ---------------------------------------------------------------------------
+
+
 class TenantUpdateRequest(BaseModel):
     """
     All fields are optional — only provided fields will be updated (partial update).
+
+    - ``name``              Human-readable tenant name.
+    - ``slug``              URL-friendly identifier; must be lowercase alphanumeric
+                            with internal hyphens (e.g. ``my-tenant-01``).
+    - ``contact_email``     Primary contact address for the tenant.
+    - ``source_system_ids`` When supplied, **replaces** the full set of linked CRM
+                            systems for the tenant.  Existing rows whose IDs are not
+                            in the new list are deleted; new IDs are inserted; rows
+                            present in both are left untouched (preserving
+                            ``crm_org_id`` and ``is_active``).
     """
+
     name: str | None = None
     slug: str | None = None
+    contact_email: EmailStr | None = None
+    source_system_ids: list[int] | None = None
 
     @field_validator("name")
     @classmethod
@@ -69,6 +89,122 @@ class TenantUpdateRequest(BaseModel):
                 )
         return v
 
+    @field_validator("source_system_ids")
+    @classmethod
+    def source_system_ids_not_empty(cls, v: list[int] | None) -> list[int] | None:
+        """Passing an empty list is almost certainly a caller mistake."""
+        if v is not None and len(v) == 0:
+            raise ValueError(
+                "source_system_ids must contain at least one ID, "
+                "or be omitted entirely to leave source systems unchanged."
+            )
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_tenant_with_source_systems(
+    db: AsyncSession,
+    tenant_id: str,
+) -> TenantMeResponse | None:
+    """
+    Fetches the tenant row together with its linked source systems in one round-trip.
+    Returns ``None`` when the tenant does not exist or is inactive.
+    """
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                t.id::text,
+                t.name,
+                t.slug,
+                t.contact_email,
+                ss.id          AS ss_id,
+                ss.system_name AS ss_name
+            FROM tenants t
+            LEFT JOIN tenant_source_systems tss ON tss.tenant_id = t.id
+            LEFT JOIN source_systems        ss  ON ss.id = tss.source_system_id
+            WHERE t.id = :tenant_id
+              AND t.is_active = true
+            """
+        ),
+        {"tenant_id": tenant_id},
+    )
+    rows = result.fetchall()
+
+    if not rows:
+        return None
+
+    first = rows[0]
+    source_systems = [
+        SourceSystemResponse(id=row.ss_id, system_name=row.ss_name)
+        for row in rows
+        if row.ss_id is not None
+    ]
+
+    return TenantMeResponse(
+        id=first.id,
+        name=first.name.capitalize(),
+        slug=first.slug,
+        contact_email=first.contact_email,
+        source_systems=source_systems,
+    )
+
+
+async def _replace_source_systems(
+    db: AsyncSession,
+    tenant_id: str,
+    new_ids: list[int],
+) -> None:
+    """
+    Replaces the tenant's source-system links inside the *caller's* transaction.
+
+    Strategy (preserves ``crm_org_id`` / ``is_active`` on retained rows):
+      1. Validate that every requested ID exists in ``source_systems``.
+      2. Delete rows whose ``source_system_id`` is NOT in the new set.
+      3. Insert missing rows with ``is_active = true`` (ON CONFLICT DO NOTHING
+         keeps existing rows intact).
+    """
+    # 1. Validate — catch unknown IDs before touching junction rows.
+    validation = await db.execute(
+        text("SELECT id FROM source_systems WHERE id = ANY(:ids)"),
+        {"ids": new_ids},
+    )
+    found_ids = {row[0] for row in validation.fetchall()}
+    unknown = set(new_ids) - found_ids
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unknown source_system_id(s): {sorted(unknown)}",
+        )
+
+    # 2. Remove de-listed systems.
+    await db.execute(
+        text(
+            """
+            DELETE FROM tenant_source_systems
+            WHERE tenant_id = :tenant_id
+              AND source_system_id <> ALL(:ids)
+            """
+        ),
+        {"tenant_id": tenant_id, "ids": new_ids},
+    )
+
+    # 3. Insert newly added systems (skip duplicates without touching existing rows).
+    await db.execute(
+        text(
+            """
+            INSERT INTO tenant_source_systems (tenant_id, source_system_id, is_active)
+            SELECT :tenant_id, unnest(:ids::int[]), true
+            ON CONFLICT (tenant_id, source_system_id) DO NOTHING
+            """
+        ),
+        {"tenant_id": tenant_id, "ids": new_ids},
+    )
+
 
 # ---------------------------------------------------------------------------
 # GET /tenants/me
@@ -81,7 +217,8 @@ async def get_my_tenant(
     user: CurrentUser = Depends(get_current_user),
 ) -> TenantMeResponse:
     """
-    Returns the tenant details for the currently authenticated user.
+    Returns the tenant details (including linked source systems) for the
+    currently authenticated user.
     Accessible to admin and agent roles only — superadmin has no tenant.
     """
     if user.is_superadmin:
@@ -90,23 +227,10 @@ async def get_my_tenant(
             detail="Superadmins are not scoped to a tenant.",
         )
 
-    tenant_id = user.require_tenant()  # raises 403 if missing
+    tenant_id = user.require_tenant()
 
-    result = await db.execute(
-        text(
-            """
-            SELECT id::text, name, slug
-            FROM tenants
-            WHERE id = :tenant_id
-            AND is_active = true
-            LIMIT 1
-        """
-        ),
-        {"tenant_id": tenant_id},
-    )
-    row = result.fetchone()
-
-    if not row:
+    tenant = await _fetch_tenant_with_source_systems(db, tenant_id)
+    if not tenant:
         logger.warning(
             "Tenant not found or inactive: tenant_id=%s sub=%s", tenant_id, user.sub
         )
@@ -115,11 +239,7 @@ async def get_my_tenant(
             detail="Tenant not found or inactive.",
         )
 
-    return TenantMeResponse(
-        id=row[0],
-        name=row[1].capitalize(),
-        slug=row[2],
-    )
+    return tenant
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +255,13 @@ async def update_my_tenant(
 ) -> TenantMeResponse:
     """
     Partially updates the authenticated user's tenant.
-    - Restricted to the **admin** role only (agents may not edit tenant details).
-    - At least one field (name or slug) must be provided.
+
+    - Restricted to the **admin** role (agents may not edit tenant details).
+    - At least one field must be provided.
+    - ``source_system_ids``, when supplied, fully **replaces** the existing set.
     - Slug uniqueness is enforced at the DB level; a 409 is returned on collision.
+    - All mutations execute inside a single transaction — either every change
+      commits or nothing does.
     """
     if user.is_superadmin:
         raise HTTPException(
@@ -153,35 +277,54 @@ async def update_my_tenant(
 
     tenant_id = user.require_tenant()
 
-    # Reject empty payloads early — nothing to do.
-    updates = payload.model_dump(exclude_none=True)
-    if not updates:
+    # Separate scalar tenant fields from the relationship field.
+    TENANT_COLUMNS = {"name", "slug", "contact_email"}
+    all_updates = payload.model_dump(exclude_none=True)
+    scalar_updates = {k: v for k, v in all_updates.items() if k in TENANT_COLUMNS}
+    new_source_ids: list[int] | None = all_updates.get("source_system_ids")
+
+    if not scalar_updates and new_source_ids is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="At least one field (name, slug) must be provided.",
+            detail="At least one field (name, slug, contact_email, source_system_ids) must be provided.",
         )
-
-    # Build SET clause dynamically from whichever fields were supplied.
-    set_clauses = ", ".join(f"{col} = :{col}" for col in updates)
-    params = {**updates, "tenant_id": tenant_id}
 
     try:
-        result = await db.execute(
-            text(
-                f"""
-                UPDATE tenants
-                SET {set_clauses}, updated_at = NOW()
-                WHERE id = :tenant_id
-                AND is_active = true
-                RETURNING id::text, name, slug
-                """
-            ),
-            params,
-        )
+        # -- 1. Update scalar tenant columns (when any were supplied) ----------
+        if scalar_updates:
+            set_clauses = ", ".join(f"{col} = :{col}" for col in scalar_updates)
+            params = {**scalar_updates, "tenant_id": tenant_id}
+
+            result = await db.execute(
+                text(
+                    f"""
+                    UPDATE tenants
+                    SET {set_clauses}, updated_at = NOW()
+                    WHERE id = :tenant_id
+                      AND is_active = true
+                    RETURNING id
+                    """
+                ),
+                params,
+            )
+            if not result.fetchone():
+                # Tenant was active at auth time but is now gone — very unlikely.
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Tenant not found or inactive.",
+                )
+
+        # -- 2. Replace source systems (when a new set was supplied) -----------
+        if new_source_ids is not None:
+            await _replace_source_systems(db, tenant_id, new_source_ids)
+
         await db.commit()
+
+    except HTTPException:
+        await db.rollback()
+        raise
     except Exception as exc:
         await db.rollback()
-        # Surface slug uniqueness violations as a clean 409 rather than a 500.
         if "unique" in str(exc).lower() and "slug" in str(exc).lower():
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -195,26 +338,22 @@ async def update_my_tenant(
             detail="An unexpected error occurred while updating the tenant.",
         ) from exc
 
-    row = result.fetchone()
-    if not row:
-        # Tenant existed at auth time but is gone/inactive now — very unlikely.
+    logger.info(
+        "Tenant updated: tenant_id=%s scalar_changes=%s source_systems_replaced=%s by user=%s",
+        tenant_id,
+        list(scalar_updates.keys()),
+        new_source_ids is not None,
+        user.sub,
+    )
+
+    # Re-fetch so the response always reflects the committed DB state.
+    tenant = await _fetch_tenant_with_source_systems(db, tenant_id)
+    if not tenant:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Tenant not found or inactive.",
         )
-
-    logger.info(
-        "Tenant updated: tenant_id=%s changes=%s by user=%s",
-        tenant_id,
-        list(updates.keys()),
-        user.sub,
-    )
-
-    return TenantMeResponse(
-        id=row[0],
-        name=row[1].capitalize(),
-        slug=row[2],
-    )
+    return tenant
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +390,4 @@ async def get_my_source_systems(
         {"tenant_id": tenant_id},
     )
 
-    rows = result.fetchall()
-
-    return [SourceSystemResponse(id=row[0], system_name=row[1]) for row in rows]
+    return [SourceSystemResponse(id=row[0], system_name=row[1]) for row in result.fetchall()]

@@ -435,8 +435,6 @@ async def _handle_zammad(payload: RawWebhookPayload, session: AsyncSession) -> N
     Zammad wraps the ticket object under a "ticket" key in some webhook
     shapes but sends it flat in others. Falling back to raw itself handles
     both shapes without requiring separate handlers.
-
-
     Why raise NormalizationError / UnresolvableStatusError up to here?
     These are config/data issues. Logging them at ERROR here (rather than
     letting them propagate to handle_raw_webhook) gives us per-record
@@ -489,6 +487,7 @@ async def _handle_zammad(payload: RawWebhookPayload, session: AsyncSession) -> N
                 tenant_id=tenant_id,
                 data={
                     "tenant_id": tenant_id,
+
                     "title": normalized.title,
                     "description": normalized.description,
                     "status_id": status_id,
