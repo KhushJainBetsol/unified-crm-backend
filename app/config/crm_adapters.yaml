@@ -1,0 +1,25 @@
+# crm_adapters.yaml
+# Master registry of all supported CRM adapters.
+# Each entry declares the adapter type, its config file path, and the
+# importable Python class that implements BaseCrmAdapter.
+
+adapters:
+  zammad:
+    display_name: "Zammad"
+    config_path: "zammad/config.yaml"
+    adapter_class: "app.adapters.zammad.adapter.ZammadAdapter"
+    supported_capabilities:
+      - fetch_tickets
+      - fetch_agents
+      - fetch_ticket_by_id
+      - fetch_organizations
+
+  espocrm:
+    display_name: "EspoCRM"
+    config_path: "espocrm/config.yaml"
+    adapter_class: "app.adapters.espocrm.adapter.EspoCrmAdapter"
+    supported_capabilities:
+      - fetch_tickets
+      - fetch_agents
+      - fetch_ticket_by_id
+      - fetch_contacts
