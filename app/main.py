@@ -1,12 +1,11 @@
 """
-app/main.py  — UPDATED for multitenancy
+app/main.py — Updated for Adapter Pattern Integration
 
-Changes from original:
-  + Import and register auth, invitations, super_admin routers
-  + Seed tenant_realms table on startup (shared unified-crm realm)
-  + Import new tenant models so create_all picks them up
-
-All existing startup logic (sync, scheduler, lookup seeding) is UNTOUCHED.
+Changes:
+  + Fixed Infisical boot by passing Pydantic settings directly (avoiding os.environ lookup)
+  + AsyncInfisicalCredentialManager initialized in lifespan and stored on app.state
+  + CrmAdapterFactory built from registry + credential manager
+  + Graceful shutdown: credential manager thread pool closed on teardown
 """
 
 from __future__ import annotations
@@ -35,12 +34,15 @@ from app.services.scheduler import run_all_tenants_full_sync, start_scheduler, s
 from app.utils.exceptions import register_exception_handlers
 from app.integrations.webhooks.router import router as webhook_router
 from app.integrations.webhooks.seeder import seed_crm_integrations
+
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
+# ── Unchanged seed helpers ─────────────────────────────────────────────────
+
 async def seed_lookup_tables() -> None:
-    """Unchanged from original — inserts source_systems, ticket_status, ticket_priority."""
+    """Unchanged — inserts source_systems, ticket_status, ticket_priority."""
     from app.models.source_system import SourceSystem
     from app.models.ticket_priority import TicketPriority
     from app.models.ticket_status import TicketStatus
@@ -48,33 +50,27 @@ async def seed_lookup_tables() -> None:
     async with async_session_maker() as db:
         try:
             if not (await db.execute(select(SourceSystem))).scalars().first():
-                db.add_all(
-                    [
-                        SourceSystem(system_name="zammad"),
-                        SourceSystem(system_name="espocrm"),
-                    ]
-                )
+                db.add_all([
+                    SourceSystem(system_name="zammad"),
+                    SourceSystem(system_name="espocrm"),
+                ])
                 logger.info("Seeded source_systems")
 
             if not (await db.execute(select(TicketStatus))).scalars().first():
-                db.add_all(
-                    [
-                        TicketStatus(status_name="open"),
-                        TicketStatus(status_name="pending"),
-                        TicketStatus(status_name="closed"),
-                    ]
-                )
+                db.add_all([
+                    TicketStatus(status_name="open"),
+                    TicketStatus(status_name="pending"),
+                    TicketStatus(status_name="closed"),
+                ])
                 logger.info("Seeded ticket_status")
 
             if not (await db.execute(select(TicketPriority))).scalars().first():
-                db.add_all(
-                    [
-                        TicketPriority(priority_name="low"),
-                        TicketPriority(priority_name="normal"),
-                        TicketPriority(priority_name="high"),
-                        TicketPriority(priority_name="urgent"),
-                    ]
-                )
+                db.add_all([
+                    TicketPriority(priority_name="low"),
+                    TicketPriority(priority_name="normal"),
+                    TicketPriority(priority_name="high"),
+                    TicketPriority(priority_name="urgent"),
+                ])
                 logger.info("Seeded ticket_priority")
 
             await db.commit()
@@ -86,10 +82,7 @@ async def seed_lookup_tables() -> None:
 
 
 async def seed_tenant_realms() -> None:
-    """
-    NEW — Seeds the shared Keycloak realm into tenant_realms on first boot.
-    Safe to call on every startup — skips if already seeded.
-    """
+    """Unchanged — seeds the shared Keycloak realm."""
     async with async_session_maker() as db:
         try:
             result = await db.execute(
@@ -98,73 +91,116 @@ async def seed_tenant_realms() -> None:
             )
             if not result.fetchone():
                 await db.execute(
-                    text(
-                        """
+                    text("""
                         INSERT INTO tenant_realms (id, tenant_id, realm_name, issuer_url, is_active, created_at)
                         VALUES (gen_random_uuid(), NULL, :realm, :issuer, true, now())
-                    """
-                    ),
+                    """),
                     {
                         "realm": settings.KEYCLOAK_REALM,
                         "issuer": f"{settings.KEYCLOAK_URL}/realms/{settings.KEYCLOAK_REALM}",
                     },
                 )
                 await db.commit()
-                logger.info(
-                    "Seeded tenant_realms with realm: %s", settings.KEYCLOAK_REALM
-                )
+                logger.info("Seeded tenant_realms with realm: %s", settings.KEYCLOAK_REALM)
             else:
                 logger.info("tenant_realms already seeded")
         except Exception as exc:
             logger.error("Failed to seed tenant_realms: %s", exc)
-            # Don't raise — app can still run, auth will fail gracefully
 
+
+# ── NEW: Adapter infrastructure bootstrap ─────────────────────────────────
+
+async def _bootstrap_adapter_factory(app: FastAPI) -> None:
+    """
+    Initialise the adapter-layer singletons.
+    FIXED: Uses the validated 'settings' object instead of os.environ.
+    """
+    from pathlib import Path
+    from app.config.registry import AdapterRegistry
+    from app.credentials.async_manager import AsyncInfisicalCredentialManager
+    from app.credentials.models import InfisicalSettings
+    from app.factory.adapter_factory import CrmAdapterFactory
+
+    # ── 1. Registry ───────────────────────────────────────────────────────
+    config_dir = Path(settings.CRM_CONFIG_DIR)
+    registry = AdapterRegistry(config_base_dir=config_dir)
+    registry.initialise()
+    app.state.adapter_registry = registry
+    logger.info("CRM adapter registry ready.")
+
+    # ── 2. Credential manager ─────────────────────────────────────────────
+    try:
+        # BRIDGE: Map Pydantic settings to the Infisical configuration model
+        infisical_settings = InfisicalSettings(
+            client_id=settings.INFISICAL_CLIENT_ID,
+            client_secret=settings.INFISICAL_CLIENT_SECRET,
+            project_id=settings.INFISICAL_PROJECT_ID,
+            environment=settings.INFISICAL_ENVIRONMENT,
+            host=settings.INFISICAL_HOST,
+            secret_path=settings.INFISICAL_SECRET_PATH,
+        )
+        
+        credential_manager = await AsyncInfisicalCredentialManager.create(
+            settings=infisical_settings,
+            max_workers=4,
+        )
+        app.state.credential_manager = credential_manager
+        logger.info("Infisical credential manager ready.")
+    except Exception as exc:
+        logger.critical("Infisical boot failed: %s", exc)
+        raise
+
+    # ── 3. Factory ────────────────────────────────────────────────────────
+    app.state.adapter_factory = CrmAdapterFactory(
+        registry=registry,
+        credential_manager=credential_manager,
+    )
+    logger.info("CRM adapter factory ready.")
+
+
+async def _shutdown_adapter_factory(app: FastAPI) -> None:
+    manager = getattr(app.state, "credential_manager", None)
+    if manager is not None:
+        await manager.close()
+        logger.info("Infisical credential manager shut down.")
+
+
+# ── Lifespan ───────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
-    logger.info(
-        "Starting %s v%s [%s]",
-        settings.APP_NAME,
-        settings.APP_VERSION,
-        settings.ENVIRONMENT,
-    )
+    logger.info("Starting %s v%s [%s]", settings.APP_NAME, settings.APP_VERSION, settings.ENVIRONMENT)
 
     try:
         await create_tables()
         await seed_lookup_tables()
         await seed_crm_integrations()
         await seed_tenant_realms()
-
-        # ── NEW: pre-warm the adapter registry once at startup ──────────
-        from app.adapter_dependencies.adapter_factory import get_registry
-        get_registry()   # lru_cache — runs initialise() exactly once
-        logger.info("CRM adapter registry pre-warmed.")
-        # ────────────────────────────────────────────────────────────────
+        
+        # Now boot the adapter layer with initialized credentials
+        await _bootstrap_adapter_factory(app)
 
     except OperationalError:
-        logger.critical(
-            "Startup failed — cannot connect to database. "
-            "Is PostgreSQL running? Check DATABASE_URL in .env"
-        )
+        logger.critical("Startup failed — check DATABASE_URL in .env")
         raise
 
-    logger.info("Running initial CRM full sync on startup...")
+    logger.info("Running initial CRM full sync...")
     await run_all_tenants_full_sync()
     start_scheduler()
-    logger.info("CRM sync scheduler started.")
-
-    yield
+    
+    yield  # Application runs here
 
     stop_scheduler()
+    await _shutdown_adapter_factory(app)
     logger.info("Shutting down %s", settings.APP_NAME)
+
+
+# ── App instance ───────────────────────────────────────────────────────────
 
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="Unified CRM — aggregates tickets from Zammad and EspoCRM",
-    docs_url="/docs",
-    redoc_url="/redoc",
     lifespan=lifespan,
 )
 
@@ -178,31 +214,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Routers ────────────────────────────────────────────────────────────────
-# NEW auth routers
-app.include_router(auth_router, prefix="/api/v1")
-app.include_router(invitations_router, prefix="/api/v1")
-app.include_router(super_admin_router, prefix="/api/v1")
-
-# Existing routers (unchanged)
-app.include_router(tickets.router, prefix="/api/v1")
-app.include_router(agents.router, prefix="/api/v1")
-app.include_router(customers.router, prefix="/api/v1")
-app.include_router(companies.router, prefix="/api/v1")
-app.include_router(sync.router, prefix="/api/v1")
-app.include_router(tenants_router, prefix="/api/v1")
+app.include_router(auth_router,           prefix="/api/v1")
+app.include_router(invitations_router,    prefix="/api/v1")
+app.include_router(super_admin_router,    prefix="/api/v1")
+app.include_router(tickets.router,        prefix="/api/v1")
+app.include_router(agents.router,         prefix="/api/v1")
+app.include_router(customers.router,      prefix="/api/v1")
+app.include_router(companies.router,      prefix="/api/v1")
+app.include_router(sync.router,           prefix="/api/v1")
+app.include_router(tenants_router,        prefix="/api/v1")
 app.include_router(webhook_router)
-
 
 @app.get("/health", tags=["Health"])
 async def health():
-    return {
-        "status": "ok",
-        "app": settings.APP_NAME,
-        "version": settings.APP_VERSION,
-        "environment": settings.ENVIRONMENT,
-    }
-
+    return {"status": "ok", "app": settings.APP_NAME}
 
 @app.get("/", tags=["Health"])
 async def root():

@@ -1,34 +1,45 @@
-# crm/credentials/async_manager.py
 """
-AsyncInfisicalCredentialManager
-================================
-A non-blocking async wrapper around ``InfisicalCredentialManager``.
+app/credentials/async_manager.py
+==================================
+AsyncInfisicalKeyManager
+------------------------
+Non-blocking async wrapper around ``InfisicalKeyManager``.
 
-The Infisical Python SDK is fully synchronous (it uses ``requests`` under the
-hood).  Running it directly inside an async FastAPI route would block the
-event loop, degrading throughput under concurrent load.
-
-This wrapper offloads every SDK call to a thread-pool executor via
-``asyncio.get_event_loop().run_in_executor()``, making the interface
-fully async-compatible without requiring a rewrite of the underlying manager.
+The Infisical Python SDK is fully synchronous (uses ``requests`` internally).
+Running it directly inside a FastAPI route blocks the event loop.
+This wrapper offloads every SDK call to a thread-pool executor so
+the interface is async-compatible without rewriting the underlying manager.
 
 Usage
 -----
-# At startup (lifespan hook)
-manager = await AsyncInfisicalCredentialManager.create()
+    # At startup (lifespan hook)
+    key_manager = await AsyncInfisicalKeyManager.create()
 
-# In a route / service
-envelope = await manager.get_credentials(integration_id)
-await manager.save_credentials(integration_id, envelope)
-await manager.delete_credentials(integration_id)
+    # In a route / service — encrypt a new credential
+    version, raw_key = await key_manager.get_active_key_and_version()
+    svc     = EncryptionService(raw_key=raw_key, key_version=version)
+    payload = svc.encrypt(api_token)
+    row.credential_enc = payload.to_db_string()
+    row.key_version    = version
+
+    # In a route / service — decrypt an existing credential
+    raw_key = await key_manager.get_encryption_key(row.key_version)
+    svc     = EncryptionService(raw_key=raw_key, key_version=row.key_version)
+    token   = svc.decrypt_from_db(row.credential_enc)
+
+Shutdown
+--------
+    await key_manager.close()      # in FastAPI shutdown lifespan hook
+    # or use as async context manager:
+    async with AsyncInfisicalKeyManager.create() as key_manager:
+        ...
 
 Thread-safety
 -------------
-The underlying synchronous ``InfisicalCredentialManager`` is called from
-worker threads.  The Infisical SDK client itself is not documented as
-thread-safe, so each high-level call acquires an ``asyncio.Lock`` to
-serialise SDK access.  This is conservative but correct; replace with a
-per-call client if throughput profiling shows lock contention.
+The underlying SDK client is not documented as thread-safe, so every call
+acquires a single ``asyncio.Lock`` before dispatching to the thread pool.
+Conservative but correct — replace with per-call clients if profiling shows
+lock contention under heavy load.
 """
 
 from __future__ import annotations
@@ -37,11 +48,11 @@ import asyncio
 import functools
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Optional, Tuple, TypeVar
 
 from app.credentials.exceptions import InfisicalConfigError
 from app.credentials.manager import InfisicalCredentialManager
-from app.credentials.models import CrmCredentialEnvelope, InfisicalSettings
+from app.credentials.models import InfisicalSettings
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -49,17 +60,16 @@ T = TypeVar("T")
 
 class AsyncInfisicalCredentialManager:
     """
-    Async façade over ``InfisicalCredentialManager``.
+    Async façade over ``InfisicalKeyManager``.
 
     Parameters
     ----------
     settings:
         Infisical configuration.  Use ``InfisicalSettings.from_env()`` for
-        production; pass a test double in unit tests.
+        production; inject a test double in unit tests.
     max_workers:
-        Size of the dedicated thread pool.  Defaults to 4, which is
-        sufficient for low-to-medium throughput.  Increase if profiling
-        shows thread starvation.
+        Size of the dedicated thread pool.  Default 4 is sufficient for
+        low-to-medium load.
     """
 
     def __init__(
@@ -82,11 +92,13 @@ class AsyncInfisicalCredentialManager:
         cls,
         settings: Optional[InfisicalSettings] = None,
         max_workers: int = 4,
-    ) -> "AsyncInfisicalCredentialManager":
+    ) -> "AsyncInfisicalKeyManager":
         """
-        Preferred factory method.  Reads settings from env if not provided,
-        constructs the sync manager in a thread (so SDK auth I/O doesn't
-        block the event loop), and returns a ready instance.
+        Preferred factory method.
+
+        Reads settings from env if not provided, constructs the sync manager
+        in a thread (so SDK auth I/O doesn't block the event loop), and
+        returns a ready-to-use instance.
 
         Raises
         ------
@@ -112,7 +124,7 @@ class AsyncInfisicalCredentialManager:
             lambda: InfisicalCredentialManager(self._settings),
         )
         logger.info(
-            "AsyncInfisicalCredentialManager ready (workers=%d).",
+            "AsyncInfisicalKeyManager ready (workers=%d).",
             self._max_workers,
         )
 
@@ -125,63 +137,66 @@ class AsyncInfisicalCredentialManager:
         if self._executor:
             self._executor.shutdown(wait=True)
             self._executor = None
-            logger.info("AsyncInfisicalCredentialManager thread pool shut down.")
+            logger.info("AsyncInfisicalKeyManager thread pool shut down.")
 
-    async def __aenter__(self) -> "AsyncInfisicalCredentialManager":
+    async def __aenter__(self) -> "AsyncInfisicalKeyManager":
         return self
 
     async def __aexit__(self, *_: Any) -> None:
         await self.close()
 
     # ------------------------------------------------------------------
-    # Public async API — mirrors InfisicalCredentialManager exactly
+    # Public async API — mirrors InfisicalKeyManager exactly
     # ------------------------------------------------------------------
 
-    async def save_credentials(
-        self,
-        integration_id: str,
-        envelope: CrmCredentialEnvelope,
-    ) -> None:
-        """Async version of ``InfisicalCredentialManager.save_credentials``."""
-        await self._run(
-            self._sync_manager.save_credentials,  # type: ignore[union-attr]
-            integration_id,
-            envelope,
-        )
+    async def get_active_key_version(self) -> str:
+        """
+        Async version of ``InfisicalKeyManager.get_active_key_version``.
 
-    async def get_credentials(
-        self, integration_id: str
-    ) -> CrmCredentialEnvelope:
-        """Async version of ``InfisicalCredentialManager.get_credentials``."""
+        Returns the active version tag (e.g. ``"v1"``).
+        """
         return await self._run(
-            self._sync_manager.get_credentials,  # type: ignore[union-attr]
-            integration_id,
+            self._sync_manager.get_active_key_version,  # type: ignore[union-attr]
         )
 
-    async def delete_credentials(self, integration_id: str) -> None:
-        """Async version of ``InfisicalCredentialManager.delete_credentials``."""
-        await self._run(
-            self._sync_manager.delete_credentials,  # type: ignore[union-attr]
-            integration_id,
-        )
+    async def get_encryption_key(self, version: str) -> str:
+        """
+        Async version of ``InfisicalKeyManager.get_encryption_key``.
 
-    async def rotate_credentials(
-        self,
-        integration_id: str,
-        new_envelope: CrmCredentialEnvelope,
-    ) -> CrmCredentialEnvelope:
-        """Async version of ``InfisicalCredentialManager.rotate_credentials``."""
+        Parameters
+        ----------
+        version:
+            Key version tag from a DB row's ``key_version`` column, e.g. ``"v1"``.
+
+        Returns
+        -------
+        str
+            Raw key string for use in ``EncryptionService``.
+        """
         return await self._run(
-            self._sync_manager.rotate_credentials,  # type: ignore[union-attr]
-            integration_id,
-            new_envelope,
+            self._sync_manager.get_encryption_key,  # type: ignore[union-attr]
+            version,
         )
 
-    async def credentials_exist(self, integration_id: str) -> bool:
-        """Async version of ``InfisicalCredentialManager.credentials_exist``."""
+    async def get_active_key_and_version(self) -> Tuple[str, str]:
+        """
+        Async version of ``InfisicalKeyManager.get_active_key_and_version``.
+
+        Returns
+        -------
+        (version, raw_key)
+            Ready to pass directly into ``EncryptionService``.
+
+        Example
+        -------
+            version, raw_key = await key_manager.get_active_key_and_version()
+            svc = EncryptionService(raw_key=raw_key, key_version=version)
+            payload = svc.encrypt(api_token)
+            row.credential_enc = payload.to_db_string()
+            row.key_version    = version
+        """
         return await self._run(
-            self._sync_manager.credentials_exist,  # type: ignore[union-attr]
-            integration_id,
+            self._sync_manager.get_active_key_and_version,  # type: ignore[union-attr]
         )
 
     # ------------------------------------------------------------------
@@ -204,7 +219,6 @@ class AsyncInfisicalCredentialManager:
     def _assert_ready(self) -> None:
         if self._sync_manager is None or self._executor is None:
             raise RuntimeError(
-                "AsyncInfisicalCredentialManager is not initialised. "
-                "Use `await AsyncInfisicalCredentialManager.create()` "
-                "or call `await instance._initialise()` first."
+                "AsyncInfisicalKeyManager is not initialised. "
+                "Use `await AsyncInfisicalKeyManager.create()` first."
             )

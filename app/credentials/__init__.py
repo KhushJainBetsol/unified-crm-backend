@@ -1,4 +1,3 @@
-# crm/credentials/__init__.py
 """
 Credential management layer public API.
 
@@ -16,24 +15,14 @@ from app.credentials.exceptions import (
     InfisicalConfigError,
 )
 from app.credentials.manager import InfisicalCredentialManager
-from app.credentials.models import (
-    ApiTokenCredentials,
-    BasicAuthCredentials,
-    CrmCredentialEnvelope,
-    InfisicalSettings,
-    OAuth2Credentials,
-)
+from app.credentials.models import InfisicalSettings
 
 __all__ = [
     # Managers
     "AsyncInfisicalCredentialManager",
     "InfisicalCredentialManager",
     # Models
-    "ApiTokenCredentials",
-    "BasicAuthCredentials",
-    "CrmCredentialEnvelope",
     "InfisicalSettings",
-    "OAuth2Credentials",
     # Exceptions
     "CredentialDecodeError",
     "CredentialDeleteError",

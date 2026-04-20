@@ -2,13 +2,11 @@
 app/core/settings.py
 
 Centralised environment configuration using pydantic-settings.
-
-New vars added for Keycloak multitenancy (marked with # KEYCLOAK NEW).
-All existing vars are unchanged.
+Includes a pre-validator to strip hidden carriage returns (\r) common in RHEL/Windows transfers.
 """
 
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Any
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,7 +20,16 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # App
+    # ── CLEANING DATA ────────────────────────────────────────────────────────
+    @field_validator("*", mode="before")
+    @classmethod
+    def strip_whitespace(cls, v: Any) -> Any:
+        """Strip hidden characters like \r and trailing spaces from all input values."""
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
+    # ── App ──────────────────────────────────────────────────────────────────
     APP_NAME: str = "UnifiedCRM"
     APP_VERSION: str = "0.1.0"
     ENVIRONMENT: Literal["development", "staging", "production"] = "development"
@@ -31,7 +38,7 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str
 
-    # JWT (legacy — keep for any existing helpers, not used for auth anymore)
+    # JWT (legacy)
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
@@ -61,16 +68,23 @@ class Settings(BaseSettings):
     # ── KEYCLOAK NEW ──────────────────────────────────────────────────────────
     KEYCLOAK_URL: str = "http://localhost:8080"
     KEYCLOAK_REALM: str = "unified-crm"
-    # Client used by the frontend (public PKCE client)
     KEYCLOAK_CLIENT_ID: str = "crm-frontend"
-    # Service-account client used by backend to call Keycloak Admin API
     KEYCLOAK_ADMIN_CLIENT_ID: str = "crm-admin-api"
     KEYCLOAK_ADMIN_CLIENT_SECRET: str = ""
-    # Frontend URL — used when generating invite links
     FRONTEND_URL: str = "http://localhost:5173"
-    # Super admin email — identified by this address until superadmin role is ready
     SUPER_ADMIN_EMAIL: str = ""
-    # ── END KEYCLOAK NEW ──────────────────────────────────────────────────────
+
+    # Adapter pattern
+    CRM_CONFIG_DIR: str = "app/config"
+    CRM_ADAPTER_ENGINE: str = "legacy"
+
+    # Infisical
+    INFISICAL_CLIENT_ID: str = ""    
+    INFISICAL_CLIENT_SECRET: str = ""
+    INFISICAL_PROJECT_ID: str = ""
+    INFISICAL_ENVIRONMENT: str = "prod"
+    INFISICAL_HOST: str = "https://app.infisical.com"
+    INFISICAL_SECRET_PATH: str = "/crm"
 
     @property
     def allowed_origins_list(self) -> list[str]:
