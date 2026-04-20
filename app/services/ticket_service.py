@@ -38,7 +38,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # NEW: Import the factory instead of specific CRM clients
-from crm.factory.adapter_factory import CrmAdapterFactory
+from app.factory.adapter_factory import CrmAdapterFactory
 
 from app.models.agent import Agent
 from app.models.source_system import SourceSystem
@@ -289,40 +289,36 @@ class TicketService:
         ticket: Ticket,
         payload: TicketUpdateRequest,
     ) -> None:
-        """
-        Dynamically fetches the correct CRM adapter for this tenant and delegates
-        the push logic to it.
-        """
         try:
-            # 1. Get the specific integration ID for this tenant and source system
-            # so we can fetch the credentials from the vault
             result = await self.db.execute(
                 select(CrmIntegration).where(
                     CrmIntegration.tenant_id == ticket.tenant_id,
                     CrmIntegration.source_system_id == ticket.source_system_id,
-                    CrmIntegration.is_active == True
+                    CrmIntegration.is_active == True,
                 )
             )
             integration = result.scalars().first()
-            
+
             if not integration:
                 logger.warning(
-                    "No active CRM integration found for tenant %s, system %s. Skipping push.",
-                    ticket.tenant_id, ticket.source_system_id
+                    "No active CRM integration for tenant=%s system=%s — skipping push.",
+                    ticket.tenant_id,
+                    ticket.source_system_id,
                 )
                 return
 
-            # 2. Ask the Factory for the fully-configured Adapter
-            adapter = self.factory.create(str(integration.id))
+            # Pass the ORM object so the factory doesn't need a second DB call
+            adapter = self.factory.create(
+                str(integration.id),
+                integration_obj=integration,   # ← the only change
+            )
 
-            # 3. Use the adapter to push the update
             async with adapter:
                 await adapter.push_ticket_update(ticket.crm_ticket_id, payload)
 
         except Exception as exc:
             logger.error(
-                "CRM push failed for ticket %s: %s — "
-                "DB is already updated; investigate CRM sync manually.",
+                "CRM push failed for ticket %s: %s — DB already updated.",
                 ticket.id,
                 exc,
             )

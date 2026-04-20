@@ -43,6 +43,9 @@ from app.services.ticket_service import TicketService
 from app.utils.response import paginated, success
 from app.schemas.comment import AddCommentRequest
 
+from app.adapter_dependencies.adapter_factory import get_ticket_service
+from app.services.ticket_service import TicketService
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tickets", tags=["Tickets"])
@@ -124,15 +127,15 @@ async def list_tickets(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     include_deleted: bool = Query(default=False),
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),  # NEW
+    current_user: CurrentUser = Depends(get_current_user),
+    service: TicketService = Depends(get_ticket_service),   # replaces db + TicketService(db)
 ):
-    tenant_id = current_user.require_tenant()  # NEW
-    tickets, total = await TicketService(db).get_tickets(
+    tenant_id = current_user.require_tenant()
+    tickets, total = await service.get_tickets(
         page=page,
         page_size=page_size,
         include_deleted=include_deleted,
-        tenant_id=uuid.UUID(tenant_id),  # NEW
+        tenant_id=uuid.UUID(tenant_id),
     )
     return paginated(
         items=[_to_brief(t) for t in tickets],
@@ -141,7 +144,6 @@ async def list_tickets(
         page_size=page_size,
         message="Tickets fetched successfully",
     )
-
 
 # ---------------------------------------------------------------------------
 # GET /tickets/filter
@@ -156,11 +158,11 @@ async def filter_tickets(
     status: str | None = Query(default=None),
     priority: str | None = Query(default=None),
     include_deleted: bool = Query(default=False),
-    db: AsyncSession = Depends(get_db),
+    service: TicketService = Depends(get_ticket_service),
     current_user: CurrentUser = Depends(get_current_user),  # NEW
 ):
     tenant_id = current_user.require_tenant()  # NEW
-    tickets, total = await TicketService(db).filter_tickets(
+    tickets, total = await service.filter_tickets(
         page=page,
         page_size=page_size,
         source=source,
@@ -185,11 +187,11 @@ async def filter_tickets(
 
 @router.get("/stats", summary="Dashboard stats for current tenant")
 async def get_stats(
-    db: AsyncSession = Depends(get_db),
+    service: TicketService = Depends(get_ticket_service),
     current_user: CurrentUser = Depends(get_current_user),  # NEW
 ):
     tenant_id = current_user.require_tenant()  # NEW
-    stats = await TicketService(db).get_stats(tenant_id=uuid.UUID(tenant_id))  # NEW
+    stats = await service.get_stats(tenant_id=uuid.UUID(tenant_id))  # NEW
     return success("Stats fetched successfully", stats)
 
 
@@ -201,11 +203,11 @@ async def get_stats(
 @router.get("/stats/agent/{agent_id}", summary="Stats for a specific agent")
 async def get_agent_stats(
     agent_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    service: TicketService = Depends(get_ticket_service),
     current_user: CurrentUser = Depends(get_current_user),  # NEW
 ):
     tenant_id = current_user.require_tenant()  # NEW
-    stats = await TicketService(db).get_agent_stats(
+    stats = await service.get_agent_stats(
         agent_id=agent_id,
         tenant_id=uuid.UUID(tenant_id),  # NEW
     )
@@ -222,11 +224,11 @@ async def get_tickets_by_agent(
     agent_id: uuid.UUID,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
+    service: TicketService = Depends(get_ticket_service),
     current_user: CurrentUser = Depends(get_current_user),  # NEW
 ):
     tenant_id = current_user.require_tenant()  # NEW
-    tickets, total, agent = await TicketService(db).get_tickets_by_agent(
+    tickets, total, agent = await service.get_tickets_by_agent(
         agent_id=agent_id,
         page=page,
         page_size=page_size,
@@ -249,11 +251,11 @@ async def get_tickets_by_agent(
 @router.get("/{ticket_id}", summary="Get ticket detail")
 async def get_ticket(
     ticket_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
+    service: TicketService = Depends(get_ticket_service),
     current_user: CurrentUser = Depends(get_current_user),  # NEW
 ):
     tenant_id = current_user.require_tenant()  # NEW
-    ticket = await TicketService(db).get_ticket_or_404(
+    ticket = await service.get_ticket_or_404(
         ticket_id,
         tenant_id=uuid.UUID(tenant_id),  # NEW
     )
@@ -269,11 +271,11 @@ async def get_ticket(
 async def update_ticket(
     ticket_id: uuid.UUID,
     body: TicketUpdateRequest,
-    db: AsyncSession = Depends(get_db),
+    service: TicketService = Depends(get_ticket_service),
     current_user: CurrentUser = Depends(require_admin),  # NEW (admin gate)
 ):
     tenant_id = current_user.require_tenant()  # NEW
-    ticket = await TicketService(db).update_ticket(
+    ticket = await service.update_ticket(
         ticket_id=ticket_id,
         update=body,
         deleted_by_id=None,
@@ -292,12 +294,13 @@ async def list_comments(
     ticket_id: uuid.UUID,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),  # NEW
+    service: TicketService = Depends(get_ticket_service),
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)# NEW
 ):
     tenant_id = current_user.require_tenant()  # NEW
     # Verify ticket belongs to this tenant before returning comments
-    await TicketService(db).get_ticket_or_404(ticket_id, tenant_id=uuid.UUID(tenant_id))
+    await service.get_ticket_or_404(ticket_id, tenant_id=uuid.UUID(tenant_id))
     comments, total = await CommentService(db).get_comments_for_ticket(
         ticket_id=ticket_id,
         page=page,
@@ -336,10 +339,11 @@ async def list_comments(
 @router.post("/{ticket_id}/comments/sync", summary="Sync comments from CRM")
 async def sync_comments(
     ticket_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(require_agent),  # NEW (agent or admin)
+    service: TicketService = Depends(get_ticket_service),
+    current_user: CurrentUser = Depends(require_agent),
+    db: AsyncSession = Depends(get_db)# NEW (agent or admin)
 ):
     tenant_id = current_user.require_tenant()  # NEW
-    await TicketService(db).get_ticket_or_404(ticket_id, tenant_id=uuid.UUID(tenant_id))
+    await service.get_ticket_or_404(ticket_id, tenant_id=uuid.UUID(tenant_id))
     result = await CommentService(db).sync_comments(ticket_id=ticket_id)
     return success("Comments synced", result)

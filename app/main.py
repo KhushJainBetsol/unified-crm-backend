@@ -134,7 +134,14 @@ async def lifespan(app: FastAPI):
         await create_tables()
         await seed_lookup_tables()
         await seed_crm_integrations()
-        await seed_tenant_realms() 
+        await seed_tenant_realms()
+
+        # ── NEW: pre-warm the adapter registry once at startup ──────────
+        from app.adapter_dependencies.adapter_factory import get_registry
+        get_registry()   # lru_cache — runs initialise() exactly once
+        logger.info("CRM adapter registry pre-warmed.")
+        # ────────────────────────────────────────────────────────────────
+
     except OperationalError:
         logger.critical(
             "Startup failed — cannot connect to database. "
@@ -151,7 +158,6 @@ async def lifespan(app: FastAPI):
 
     stop_scheduler()
     logger.info("Shutting down %s", settings.APP_NAME)
-
 
 app = FastAPI(
     title=settings.APP_NAME,
