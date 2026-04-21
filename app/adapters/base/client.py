@@ -6,7 +6,7 @@ An async HTTP wrapper that every concrete CRM client inherits from.
 
 Responsibilities
 ----------------
-- Inject auth headers at request time (populated from live credentials).
+- Inject auth headers at request time via a pluggable BaseAuthStrategy.
 - Execute GET / POST / PATCH / DELETE with exponential back-off retry.
 - Abstract over all three pagination strategies declared in config:
     * page   — ?page=N&per_page=P
@@ -20,7 +20,6 @@ Dependencies: httpx (async), tenacity (retry), jsonpath-ng (item extraction).
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
@@ -33,6 +32,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from app.adapters.base.auth import BaseAuthStrategy, get_auth_strategy
 from app.config.models import AdapterConfig, PaginationConfig
 
 logger = logging.getLogger(__name__)
@@ -111,6 +111,12 @@ class BaseCrmClient:
     pagination.  Concrete adapters call the high-level helpers
     ``paginate()`` and ``request()``; they never build httpx calls directly.
 
+    Auth is handled via the Strategy pattern — a ``BaseAuthStrategy``
+    instance is resolved once at construction time from the YAML config
+    and called during ``open()``.  To add a new auth method, add a new
+    ``BaseAuthStrategy`` subclass in ``adapters/base/auth.py`` and register
+    it in ``get_auth_strategy()``.  This class never needs to change.
+
     Parameters
     ----------
     base_url:
@@ -118,11 +124,14 @@ class BaseCrmClient:
     config:
         The validated AdapterConfig for this CRM type.
     credentials:
-        Plaintext credential dict retrieved from Infisical at runtime.
+        Plaintext credential dict retrieved from the DB / Infisical at runtime.
         Shape depends on the auth strategy declared in config:
-          api_token → {"token": "<value>"}
+          api_token → {"token": "<value>"} or {"api_key": "<value>"}
           basic     → {"username": "x", "password": "y"}
           oauth2    → {"access_token": "<value>"}
+    auth_strategy:
+        Optional — inject a custom BaseAuthStrategy directly (useful in tests).
+        If None (default), the strategy is resolved automatically from config.
     """
 
     def __init__(
@@ -130,22 +139,36 @@ class BaseCrmClient:
         base_url: str,
         config: AdapterConfig,
         credentials: Dict[str, Any],
+        auth_strategy: Optional[BaseAuthStrategy] = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._config = config
         self._credentials = credentials
         self._http: Optional[httpx.AsyncClient] = None
 
+        # Strategy pattern: resolved once, never changed (unless OAuth2 adapter
+        # calls update_auth_header() to inject a freshly exchanged token).
+        self._auth_strategy: BaseAuthStrategy = (
+            auth_strategy if auth_strategy is not None
+            else get_auth_strategy(config)
+        )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def open(self) -> None:
-        """Create and configure the underlying httpx.AsyncClient."""
+        """
+        Create and configure the underlying httpx.AsyncClient.
+
+        Auth headers are built by delegating to the injected strategy —
+        no auth logic lives in this method.
+        """
+        auth_headers = self._auth_strategy.build_headers(self._credentials)
         self._http = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=self._config.http.timeout_seconds,
-            headers=self._build_auth_headers(),
+            headers=auth_headers,
         )
         logger.debug("BaseCrmClient opened for '%s'.", self._base_url)
 
@@ -162,6 +185,28 @@ class BaseCrmClient:
 
     async def __aexit__(self, *_: Any) -> None:
         await self.close()
+
+    # ------------------------------------------------------------------
+    # Auth utility — used by OAuth2 adapters after token refresh
+    # ------------------------------------------------------------------
+
+    def update_auth_header(self, new_credentials: Dict[str, Any]) -> None:
+        """
+        Re-build and apply auth headers from *new_credentials*.
+
+        Intended for OAuth2 adapters that exchange a refresh token for a
+        new access_token inside ``authenticate()``.  After calling this,
+        all subsequent requests will carry the updated token.
+
+        Example (in an OAuth2 adapter's authenticate method)
+        -----------------------------------------------------
+        token_response = await self._client.request("POST", "/oauth/token", ...)
+        self._client.update_auth_header({"access_token": token_response["access_token"]})
+        """
+        self._ensure_open()
+        new_headers = self._auth_strategy.build_headers(new_credentials)
+        self._http.headers.update(new_headers)  # type: ignore[union-attr]
+        logger.debug("Auth headers updated via update_auth_header().")
 
     # ------------------------------------------------------------------
     # Public request interface
@@ -331,7 +376,6 @@ class BaseCrmClient:
             if not items:
                 break
             yield items
-            # Extract next cursor — look in the envelope, not the items
             cursor = self._extract_next_cursor(raw)
             if not cursor:
                 break
@@ -340,35 +384,13 @@ class BaseCrmClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_auth_headers(self) -> Dict[str, str]:
-        """Build the Authorization header from credentials + config."""
-        auth_cfg = self._config.auth
-        strategy = auth_cfg.strategy
-
-        if strategy == "api_token":
-            token = self._credentials.get("token", "")
-            prefix = auth_cfg.token_prefix or ""
-            return {auth_cfg.token_header or "Authorization": f"{prefix}{token}"}
-
-        if strategy == "basic":
-            import base64
-            raw = f"{self._credentials['username']}:{self._credentials['password']}"
-            encoded = base64.b64encode(raw.encode()).decode()
-            return {"Authorization": f"Basic {encoded}"}
-
-        if strategy == "oauth2":
-            token = self._credentials.get("access_token", "")
-            return {"Authorization": f"Bearer {token}"}
-
-        raise CrmClientError(f"Unsupported auth strategy: '{strategy}'")
-
     def _raise_for_status(self, response: httpx.Response) -> None:
         """Map HTTP error codes to typed exceptions."""
         code = response.status_code
         if code < 400:
             return
         url = str(response.url)
-        if code == 401 or code == 403:
+        if code in (401, 403):
             raise CrmAuthError(f"Auth error {code} from {url}")
         if code == 404:
             raise CrmNotFoundError(f"Resource not found (404): {url}")

@@ -82,9 +82,9 @@ class Settings(BaseSettings):
     INFISICAL_CLIENT_ID: str = ""    
     INFISICAL_CLIENT_SECRET: str = ""
     INFISICAL_PROJECT_ID: str = ""
-    INFISICAL_ENVIRONMENT: str = "prod"
+    INFISICAL_ENVIRONMENT: str = "dev"
     INFISICAL_HOST: str = "https://app.infisical.com"
-    INFISICAL_SECRET_PATH: str = "/crm"
+    INFISICAL_SECRET_PATH: str = "/"
 
     @property
     def allowed_origins_list(self) -> list[str]:

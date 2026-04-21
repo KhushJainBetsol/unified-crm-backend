@@ -232,3 +232,84 @@ async def health():
 @app.get("/", tags=["Health"])
 async def root():
     return {"message": f"Welcome to {settings.APP_NAME}", "docs": "/docs"}
+
+
+async def _bootstrap_adapter_factory(app: FastAPI) -> None:
+    """
+    Boot the adapter layer and attach three objects to app.state:
+ 
+      app.state.adapter_registry       → AdapterRegistry
+      app.state.credential_service     → AsyncDbBackedCredentialService
+      app.state.adapter_factory        → CrmAdapterFactory
+ 
+    The factory's credential_manager parameter now receives the
+    AsyncDbBackedCredentialService which:
+      - reads CrmIntegration rows from PostgreSQL
+      - fetches the AES key from Infisical
+      - decrypts credential_enc in-memory
+      - returns a CrmCredentialEnvelope to the factory
+ 
+    No credentials are stored in Infisical.
+    Infisical stores only ENCRYPTION_KEY_<version> and ACTIVE_KEY_VERSION.
+    """
+    from app.config.registry import AdapterRegistry
+    from app.credentials.manager import InfisicalCredentialManager
+    from app.credentials.models import InfisicalSettings
+    from app.credentials.exceptions import InfisicalConfigError
+    from app.credentials.db_credential_service import AsyncDbBackedCredentialService
+    from app.factory.adapter_factory import CrmAdapterFactory
+    from app.core.database import async_session_maker
+    from app.core.settings import get_settings
+ 
+    settings = get_settings()
+ 
+    # ── 1. Registry ───────────────────────────────────────────────────────
+    config_dir = Path(settings.CRM_CONFIG_DIR)
+    registry = AdapterRegistry(config_base_dir=config_dir)
+    registry.initialise()
+    app.state.adapter_registry = registry
+    logger.info(
+        "CRM adapter registry ready. Adapters: %s",
+        registry.list_adapter_keys(),
+    )
+ 
+    # ── 2. Infisical key manager (AES keys only) ──────────────────────────
+    try:
+        infisical_settings = InfisicalSettings.from_env()
+        key_manager = InfisicalCredentialManager(infisical_settings)
+    except InfisicalConfigError as exc:
+        logger.critical(
+            "Infisical configuration error — app cannot start: %s", exc
+        )
+        raise
+ 
+    # ── 3. Thread pool for sync SDK + AES calls ───────────────────────────
+    executor = ThreadPoolExecutor(
+        max_workers=4,
+        thread_name_prefix="infisical-worker",
+    )
+    app.state.infisical_executor = executor
+ 
+    # ── 4. Async credential service — DB + Infisical bridge ──────────────
+    credential_service = AsyncDbBackedCredentialService(
+        key_manager=key_manager,
+        async_session_factory=async_session_maker,
+        executor=executor,
+    )
+    app.state.credential_service = credential_service
+    logger.info("DB-backed credential service ready.")
+ 
+    # ── 5. Factory ────────────────────────────────────────────────────────
+    app.state.adapter_factory = CrmAdapterFactory(
+        registry=registry,
+        credential_manager=credential_service,
+    )
+    logger.info("CRM adapter factory ready.")
+ 
+ 
+async def _shutdown_adapter_factory(app: FastAPI) -> None:
+    """Shut down the thread pool on app teardown."""
+    executor = getattr(app.state, "infisical_executor", None)
+    if executor is not None:
+        executor.shutdown(wait=True)
+        logger.info("Infisical thread pool shut down.")
