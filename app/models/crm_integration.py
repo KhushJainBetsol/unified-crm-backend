@@ -1,27 +1,51 @@
 """
 app/models/crm_integration.py
 
-Stores CRM integration config with AES-256 encrypted sensitive fields.
+Stores CRM integration config with AES-256-GCM encrypted credentials.
 
-Encrypted columns (_enc suffix)
----------------------------------
-All three _enc columns hold a JSON string produced by EncryptionService:
-    {
-        "iv":        "<base64>",
-        "data":      "<base64>",
-        "algorithm": "AES-256-CBC",
-        "key_version": "v1"
-    }
-The key used to decrypt is fetched from Infisical at runtime using key_version.
+STORAGE DESIGN (v3 — normalised columns)
+------------------------------------------
+Non-secret fields are top-level columns (queryable, indexable):
+    auth_type, key_version, base_url
 
-Non-encrypted columns
----------------------
-base_url    — CRM host URL; not a secret.
-auth_type   — discriminator so the adapter knows how to build the auth header.
-key_version — which Infisical key version was used; safe to store in plain text.
+Secrets live in TWO separate encrypted columns:
+    credential_enc      — outbound auth secrets (shape varies by auth_type)
+    webhook_secrets_enc — inbound webhook verification secrets
 
-FUTURE: tenant_id FK constraint is enforced here. Add Alembic migration if
-the tenants table is created after this one.
+Both _enc columns store AES-256-GCM encrypted JSON.
+The decrypted value is a CRM-specific dict, e.g.:
+
+  auth_type=api_key / bearer_token / access_token:
+      credential_enc  -> {"token": "abc123"}
+
+  auth_type=basic_auth:
+      credential_enc  -> {"username": "u", "password": "p"}
+
+  auth_type=oauth2:
+      credential_enc  -> {
+          "access_token": "...",
+          "refresh_token": "...",
+          "expires_at": 1700000000
+      }
+
+  auth_type=hmac:
+      credential_enc        -> {"api_token": "..."}          # outbound
+      webhook_secrets_enc   -> {                             # inbound
+          "webhook_secret": "s1",
+          "per_event_secrets": {"Case.create": "s2"}
+      }
+
+WHY SEPARATE _ENC COLUMNS
+---------------------------
+  + Principle of least privilege: services that only verify inbound webhooks
+    never need to decrypt outbound credentials, and vice-versa.
+  + Simpler rotation: each column can be re-keyed independently.
+  + Clearer semantics vs. one opaque blob.
+
+WHY DEDICATED PLAIN COLUMNS (auth_type, key_version, base_url)
+----------------------------------------------------------------
+  + Directly filterable/indexable in PostgreSQL without decryption.
+  + No need to deserialise a JSONB envelope just to read the discriminator.
 """
 
 from __future__ import annotations
@@ -30,7 +54,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.base import Base
@@ -39,9 +63,7 @@ from app.core.base import Base
 class CrmIntegration(Base):
     __tablename__ = "crm_integrations"
 
-    # ------------------------------------------------------------------
-    # Identity
-    # ------------------------------------------------------------------
+    # ── Identity ───────────────────────────────────────────────────────────
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -52,7 +74,7 @@ class CrmIntegration(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         nullable=False,
-        comment="FK → tenants.id (ON DELETE CASCADE). Add constraint via Alembic migration.",
+        comment="FK -> tenants.id (ON DELETE CASCADE). Enforce via Alembic.",
     )
 
     source_system_id: Mapped[int] = mapped_column(
@@ -60,69 +82,24 @@ class CrmIntegration(Base):
         nullable=False,
     )
 
-    # ------------------------------------------------------------------
-    # Webhook routing
-    # ------------------------------------------------------------------
+    # ── Webhook routing ────────────────────────────────────────────────────
 
     webhook_uuid: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         unique=True,
         nullable=False,
         default=uuid.uuid4,
-        comment="Opaque UUID embedded in the ingest URL: /webhooks/ingest/{webhook_uuid}",
+        comment="Opaque UUID in ingest URL: /webhooks/ingest/{webhook_uuid}",
     )
 
-    # ------------------------------------------------------------------
-    # Encrypted sensitive fields
-    # ------------------------------------------------------------------
-    # Each column stores a JSON string:
-    #   {"iv": "<b64>", "data": "<b64>", "algorithm": "AES-256-CBC", "key_version": "v1"}
-    # Decrypt by: fetch ENCRYPTION_KEY_<key_version> from Infisical → AES-256-CBC decrypt.
-
-    webhook_secret_enc: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-        default=None,
-        comment=(
-            "AES-256-CBC encrypted webhook secret. "
-            "Zammad: single shared token in X-Zammad-Token. "
-            "EspoCRM: NULL (per-event secrets live in webhook_secrets_enc)."
-        ),
-    )
-
-    webhook_secrets_enc: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-        default=None,
-        comment=(
-            "AES-256-CBC encrypted JSON mapping event → secret. "
-            'EspoCRM: {"Case.create": "s1", "Case.update": "s2", ...}. '
-            "Zammad: NULL."
-        ),
-    )
-
-    credential_enc: Mapped[str | None] = mapped_column(
-        Text,
-        nullable=True,
-        default=None,
-        comment=(
-            "AES-256-CBC encrypted credential payload. "
-            "Replaces api_key / token / username+password etc. "
-            "Shape depends on auth_type (see auth_type column)."
-        ),
-    )
-
-    # ------------------------------------------------------------------
-    # Credential metadata (plaintext — not secrets)
-    # ------------------------------------------------------------------
+    # ── Auth discriminator & key tracking (plain — queryable) ──────────────
 
     auth_type: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
         comment=(
-            "Discriminator for credential kind. "
-            "Values: api_key | hmac | bearer_token | access_token | basic_auth | oauth2. "
-            "Drives how the auth header is constructed at request time."
+            "Discriminator for credential shape. "
+            "One of: api_key | hmac | bearer_token | access_token | basic_auth | oauth2"
         ),
     )
 
@@ -130,46 +107,68 @@ class CrmIntegration(Base):
         String(20),
         nullable=False,
         default="v1",
+        comment="Tracks which AES key version encrypted the _enc columns.",
+    )
+
+    # ── Non-secret base address (plain — queryable) ────────────────────────
+
+    base_url: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        default=None,
+        comment="Non-secret CRM base address. Not encrypted.",
+    )
+
+    # ── Outbound auth secrets ──────────────────────────────────────────────
+    # Stores AES-256-GCM encrypted JSON.
+    # Decrypted shape depends on auth_type (see module docstring).
+
+    credential_enc: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        default=None,
         comment=(
-            "Tracks which Infisical key version encrypted the _enc columns. "
-            "Used during rotation to select the correct decryption key. "
-            "Example values: 'v1', 'v2'."
+            "AES-256-GCM encrypted JSON blob holding outbound auth secrets. "
+            "Decrypted shape varies by auth_type (see module docstring)."
         ),
     )
+
+    # ── Inbound webhook verification secrets ──────────────────────────────
+    # Stores AES-256-GCM encrypted JSON.
+    # Decrypted shape for hmac: {"webhook_secret": "...", "per_event_secrets": {}}
+
+    webhook_secrets_enc: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        default=None,
+        comment=(
+            "AES-256-GCM encrypted JSON blob holding inbound webhook secrets. "
+            "Decrypted shape varies by CRM (see module docstring)."
+        ),
+    )
+
+    # ── Token expiry (plaintext — not a secret) ────────────────────────────
 
     token_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
         default=None,
-        comment=(
-            "NULL = no expiry (EspoCRM API key; Zammad token without expiry). "
-            "Set for: Zammad tokens with expiry, OAuth2 access tokens. "
-            "Background job checks this to proactively re-provision before expiry."
-        ),
-    )
-
-    base_url: Mapped[str | None] = mapped_column(
-        String(500),
-        nullable=True,
-        comment="CRM instance URL — not a secret, stored in plain text.",
+        comment="NULL = no expiry. Set for OAuth2 / expiring tokens.",
     )
 
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
         default=True,
-        comment="Soft-disable an integration without deleting it.",
+        comment="Soft-disable without deleting.",
     )
 
-    # ------------------------------------------------------------------
-    # Audit timestamps
-    # ------------------------------------------------------------------
+    # ── Audit ──────────────────────────────────────────────────────────────
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
-        comment="Row creation time (set by DB).",
     )
 
     updated_at: Mapped[datetime] = mapped_column(
@@ -177,35 +176,29 @@ class CrmIntegration(Base):
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
-        comment="Last update time. Keep in sync with a DB trigger or use onupdate.",
     )
 
-    # ------------------------------------------------------------------
-    # Relationships
-    # ------------------------------------------------------------------
+    # ── Relationships ──────────────────────────────────────────────────────
 
     source_system: Mapped["SourceSystem"] = relationship(  # type: ignore[name-defined]
         "SourceSystem",
         lazy="joined",
     )
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    # ── Convenience helpers ────────────────────────────────────────────────
 
     def has_credentials(self) -> bool:
-        """Return True if any encrypted credential column is populated."""
-        return any([
-            self.credential_enc,
-            self.webhook_secret_enc,
-            self.webhook_secrets_enc,
-        ])
+        """True when outbound auth secrets are present."""
+        return bool(self.credential_enc)
+
+    def has_webhook_secrets(self) -> bool:
+        """True when inbound webhook verification secrets are present."""
+        return bool(self.webhook_secrets_enc)
 
     def __repr__(self) -> str:
         return (
             f"<CrmIntegration id={self.id} "
             f"tenant={self.tenant_id} "
-            f"source_system_id={self.source_system_id} "
             f"auth_type={self.auth_type} "
             f"key_version={self.key_version} "
             f"active={self.is_active}>"

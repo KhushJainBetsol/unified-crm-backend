@@ -2,17 +2,26 @@
 """
 Credential models for the credential management layer.
 
-CrmCredentialEnvelope  — full envelope stored in Infisical (new adapter pattern)
-InfisicalSettings      — SDK configuration, populated from env vars
+CrmCredentialEnvelope  — full envelope built in-memory at request time
+InfisicalSettings      — SDK configuration
+
+CONSTRUCTION RULES
+------------------
+Inside FastAPI:      InfisicalSettings.from_app_settings(get_settings())
+Standalone scripts:  InfisicalSettings.from_env()
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.credentials.exceptions import InfisicalConfigError
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -21,33 +30,17 @@ from app.credentials.exceptions import InfisicalConfigError
 
 class CrmCredentialEnvelope(BaseModel):
     """
-    The complete credential package serialised as a single Infisical secret.
-
-    Fields
-    ------
-    crm_type   : matches a key in crm_adapters.yaml  (e.g. "zammad", "espocrm")
-    base_url   : tenant-specific CRM instance URL  (NOT stored in the DB)
-    credentials: auth-strategy dict — must contain a 'strategy' key
-    metadata   : optional free-form dict (rate-limit tier, region, etc.)
-
-    Secret name in Infisical: CREDS_<integration_id>
-    Database stores         : integration_id only
+    The complete credential package built in-memory at request time.
+    Never persisted — lives only for the duration of one request/operation.
     """
 
     crm_type: str = Field(..., min_length=1)
     base_url: str = Field(..., min_length=1)
     credentials: Dict[str, Any] = Field(
         ...,
-        description=(
-            "Auth credentials dict. Must include 'strategy' key. "
-            "Strategies: api_token | basic | oauth2"
-        ),
+        description="Auth credentials dict. Must include 'strategy' key.",
     )
     metadata: Dict[str, Any] = Field(default_factory=dict)
-
-    # ------------------------------------------------------------------
-    # Validators
-    # ------------------------------------------------------------------
 
     @field_validator("crm_type")
     @classmethod
@@ -59,35 +52,20 @@ class CrmCredentialEnvelope(BaseModel):
     def base_url_must_have_scheme(cls, v: str) -> str:
         v = v.strip()
         if not v.startswith(("http://", "https://")):
-            raise ValueError(
-                f"base_url must start with http:// or https://, got: '{v}'"
-            )
+            raise ValueError(f"base_url must start with http:// or https://, got: '{v}'")
         return v.rstrip("/")
 
     @model_validator(mode="after")
     def credentials_must_have_strategy(self) -> "CrmCredentialEnvelope":
-        if "strategy" not in self.credentials:
-            raise ValueError(
-                "credentials dict must contain a 'strategy' key. "
-                "Valid values: api_token, basic, oauth2"
-            )
         allowed = {"api_token", "basic", "oauth2"}
-        strat = self.credentials["strategy"]
-        if strat not in allowed:
-            raise ValueError(
-                f"credentials.strategy must be one of {allowed}, got '{strat}'"
-            )
+        if "strategy" not in self.credentials:
+            raise ValueError(f"credentials dict must contain a 'strategy' key. Valid: {allowed}")
+        if self.credentials["strategy"] not in allowed:
+            raise ValueError(f"credentials.strategy must be one of {allowed}")
         return self
 
-    # ------------------------------------------------------------------
-    # Helper used by CrmAdapterFactory
-    # ------------------------------------------------------------------
-
     def to_credential_dict(self) -> Dict[str, Any]:
-        """
-        Return a clean credential dict for injection into BaseCrmClient.
-        Strips 'strategy' — the client reads strategy from AdapterConfig, not here.
-        """
+        """Strip 'strategy' — safe for injection into BaseCrmClient."""
         return {k: v for k, v in self.credentials.items() if k != "strategy"}
 
 
@@ -99,40 +77,96 @@ class InfisicalSettings(BaseModel):
     """
     SDK configuration for InfisicalCredentialManager.
 
-    Required env vars
-    -----------------
-    INFISICAL_CLIENT_ID
-    INFISICAL_CLIENT_SECRET
-    INFISICAL_PROJECT_ID
-
-    Optional env vars (defaults shown)
-    -----------------------------------
-    INFISICAL_ENVIRONMENT   prod
-    INFISICAL_HOST          https://app.infisical.com
-    INFISICAL_SITE_URL      (alias for INFISICAL_HOST, takes priority)
-    INFISICAL_SECRET_PATH   /crm
+    Always prefer from_app_settings() inside FastAPI.
+    Use from_env() only in standalone scripts.
     """
 
     client_id: str = Field(..., min_length=1)
     client_secret: str = Field(..., min_length=1)
     project_id: str = Field(..., min_length=1)
-    environment: str = Field(default="prod")
+    environment: str = Field(default="dev")
     host: str = Field(default="https://app.infisical.com")
-    secret_path: str = Field(default="/crm")
+    secret_path: str = Field(default="/")
+
+    # ------------------------------------------------------------------
+    # PREFERRED — use inside FastAPI
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_app_settings(cls, app_settings: Any) -> "InfisicalSettings":
+        """
+        Build from the app's already-loaded pydantic-settings Settings object.
+
+        pydantic-settings reads and validates .env at startup. This method
+        maps the already-resolved values across — no os.getenv() calls.
+
+        Logs the resolved values (secrets masked) so misconfiguration is
+        immediately visible in startup logs.
+        """
+        # Read directly from the Settings attributes — these are already
+        # validated and stripped by the Settings field_validator.
+        client_id     = str(app_settings.INFISICAL_CLIENT_ID).strip()
+        client_secret = str(app_settings.INFISICAL_CLIENT_SECRET).strip()
+        project_id    = str(app_settings.INFISICAL_PROJECT_ID).strip()
+        environment   = str(app_settings.INFISICAL_ENVIRONMENT).strip()
+        host          = str(app_settings.INFISICAL_HOST).strip()
+        secret_path   = str(getattr(app_settings, "INFISICAL_SECRET_PATH", "/")).strip()
+
+        # Log resolved values so startup issues are immediately visible.
+        # Secrets are masked — only first 6 chars shown.
+        logger.info(
+            "InfisicalSettings resolved from app_settings: "
+            "host=%s project_id=%s environment=%s secret_path=%s "
+            "client_id=%s... client_secret=%s...",
+            host, project_id, environment, secret_path,
+            client_id[:6] if client_id else "EMPTY",
+            client_secret[:6] if client_secret else "EMPTY",
+        )
+
+        # Fail with a clear message if any required field is empty.
+        # With required fields (no default="") in Settings, pydantic would
+        # have already raised at startup — this is a last-resort safety net.
+        missing = [
+            name for name, val in [
+                ("INFISICAL_CLIENT_ID",     client_id),
+                ("INFISICAL_CLIENT_SECRET", client_secret),
+                ("INFISICAL_PROJECT_ID",    project_id),
+            ]
+            if not val
+        ]
+        if missing:
+            raise InfisicalConfigError(
+                f"Missing or empty Infisical settings after resolution: {missing}. "
+                "Check your .env file and ensure pydantic-settings is reading it correctly."
+            )
+
+        return cls(
+            client_id=client_id,
+            client_secret=client_secret,
+            project_id=project_id,
+            environment=environment,
+            host=host,
+            secret_path=secret_path,
+        )
+
+    # ------------------------------------------------------------------
+    # FALLBACK — use only in standalone scripts / CLI tools
+    # ------------------------------------------------------------------
 
     @classmethod
     def from_env(cls) -> "InfisicalSettings":
         """
-        Build from environment variables.
-        Strips whitespace to handle shell export formatting quirks.
-        Raises InfisicalConfigError (not ValidationError) on missing vars.
+        Build from os.getenv().
+
+        Use ONLY in standalone scripts (migrate_credential_columns.py,
+        demo_credential_flow.py) that run outside FastAPI and load dotenv
+        themselves. Inside FastAPI, use from_app_settings() instead.
         """
         required = {
             "client_id":     "INFISICAL_CLIENT_ID",
             "client_secret": "INFISICAL_CLIENT_SECRET",
             "project_id":    "INFISICAL_PROJECT_ID",
         }
-
         values = {k: os.getenv(env, "").strip() for k, env in required.items()}
         missing = [env for k, env in required.items() if not values[k]]
 
@@ -142,7 +176,6 @@ class InfisicalSettings(BaseModel):
                 "Set them in your .env file or export them in your shell."
             )
 
-        # INFISICAL_SITE_URL takes priority over INFISICAL_HOST
         host = (
             os.getenv("INFISICAL_SITE_URL", "").strip()
             or os.getenv("INFISICAL_HOST", "https://app.infisical.com").strip()

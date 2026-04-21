@@ -6,7 +6,7 @@ Includes a pre-validator to strip hidden carriage returns (\r) common in RHEL/Wi
 """
 
 from functools import lru_cache
-from typing import Literal, Any
+from typing import Literal, Any, Optional
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=False,
+        case_sensitive=True,   # ← FIXED: False caused RHEL env var matching issues
         extra="ignore",
     )
 
@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     SYNC_INTERVAL_MINUTES: int = 15
 
-    # ── KEYCLOAK NEW ──────────────────────────────────────────────────────────
+    # ── KEYCLOAK ──────────────────────────────────────────────────────────────
     KEYCLOAK_URL: str = "http://localhost:8080"
     KEYCLOAK_REALM: str = "unified-crm"
     KEYCLOAK_CLIENT_ID: str = "crm-frontend"
@@ -78,10 +78,12 @@ class Settings(BaseSettings):
     CRM_CONFIG_DIR: str = "app/config"
     CRM_ADAPTER_ENGINE: str = "legacy"
 
-    # Infisical
-    INFISICAL_CLIENT_ID: str = ""    
-    INFISICAL_CLIENT_SECRET: str = ""
-    INFISICAL_PROJECT_ID: str = ""
+    # ── Infisical ─────────────────────────────────────────────────────────────
+    # No empty-string defaults — if these are missing pydantic raises a clear
+    # ValidationError at startup rather than silently passing "" to the SDK.
+    INFISICAL_CLIENT_ID: str
+    INFISICAL_CLIENT_SECRET: str
+    INFISICAL_PROJECT_ID: str
     INFISICAL_ENVIRONMENT: str = "dev"
     INFISICAL_HOST: str = "https://app.infisical.com"
     INFISICAL_SECRET_PATH: str = "/"
