@@ -349,14 +349,14 @@ class CredentialProvisioningService:
                 "integration_id": str(integration_id),
                 "old_key_version": old_version,
                 "new_key_version": new_version,
-                "rotated_webhook_secrets": decrypted_webhook is not None,
+                "updated_webhook_secrets": decrypted_webhook is not None,
             },
         )
         return {
             "integration_id": str(integration_id),
             "old_key_version": old_version,
             "new_key_version": new_version,
-            "rotated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
     # ── REVOKE ─────────────────────────────────────────────────────────────

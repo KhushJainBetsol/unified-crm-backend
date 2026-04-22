@@ -151,7 +151,7 @@ async def run() -> None:
         print(f"\n  {'─' * 56}")
         info(f"integration_id : {integration_id}")
         info(f"tenant_id      : {tenant_id}")
-        info(f"crm_type       : {crm_type}")
+        #info(f"crm_type       : {crm_type}")
         info(f"auth_type      : {auth_type}")
         info(f"base_url       : {base_url}")
         info(f"key_version    : {row_kv}")

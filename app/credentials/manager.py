@@ -150,7 +150,7 @@ class InfisicalCredentialManager:
     def get_active_key_version(self) -> str:
         """Fetch the ACTIVE_KEY_VERSION secret from Infisical."""
         raw = self._fetch_secret(
-            secret_name=_ACTIVE_VERSION_SECRET,
+            secret_name="ACTIVE_KEY_VERSION",
             context="ACTIVE_KEY_VERSION",
         )
         return raw.strip().lower()
