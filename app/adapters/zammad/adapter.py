@@ -73,6 +73,14 @@ class ZammadAdapter(BaseCrmAdapter):
         raw_list = await self._client.paginate_all(path, extra_params=params)
         mapped_items = self._mapper.map_agents(raw_list)
         return PaginatedResult(items=mapped_items, page=1, per_page=per_page, has_more=False)
+    
+    async def fetch_customers(self, page: int = 1, per_page: int = 100) -> PaginatedResult:
+        self._assert_authenticated()
+        path = self._get_endpoint("customers")
+        params = self._get_endpoint_params("customers")
+        raw_list = await self._client.paginate_all(path, extra_params=params)
+        mapped_items = self._mapper.map_customers(raw_list)
+        return PaginatedResult(items=mapped_items, page=1, per_page=per_page, has_more=False)
 
     async def fetch_organizations(self, page: int = 1, per_page: int = 100) -> PaginatedResult:
         self._assert_authenticated()

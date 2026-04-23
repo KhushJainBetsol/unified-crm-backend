@@ -184,6 +184,10 @@ class CrmIntegration(Base):
         "SourceSystem",
         lazy="joined",
     )
+    tenant_source_systems: Mapped[list["TenantSourceSystem"]] = relationship(
+        "TenantSourceSystem",
+        back_populates="integration",
+    )
 
     # ── Convenience helpers ────────────────────────────────────────────────
 

@@ -49,6 +49,12 @@ endpoints:
     default_params:
       role: "Agent"
 
+  customers:
+    path: "/api/v1/users"
+    method: "GET"
+    default_params:
+      role: "Customer"
+
   organizations:
     path: "/api/v1/organizations"
     method: "GET"

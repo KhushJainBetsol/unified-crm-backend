@@ -39,6 +39,7 @@ import app.models.user_agent_mapping
 import app.models.ticket_comment
 import app.models.invitation
 import app.models.activity_log # 3. Import your async engine from your database config
+import app.models.crm_integrations
 from app.core.database import engine
 
 # 4. Point Alembic to the metadata

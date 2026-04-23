@@ -83,6 +83,7 @@ from uuid import UUID, uuid4
 
 import httpx
 from sqlalchemy import select
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.credentials.async_manager import AsyncInfisicalCredentialManager
@@ -93,6 +94,7 @@ from app.credentials.exceptions import (
 )
 from app.credentials.models import CrmCredentialEnvelope
 from app.models.crm_integration import CrmIntegration
+from app.models.tenant_source_systems import TenantSourceSystem
 from app.schemas.credentials import (
     CredentialStatusResponse,
     ProvisionCredentialsRequest,
@@ -209,6 +211,13 @@ class CredentialProvisioningService:
             base_url=base_url,
             credential_enc=credential_enc,
             webhook_secrets_enc=webhook_secrets_enc,
+        )
+
+        
+        await self._db.execute(
+            update(TenantSourceSystem)
+            .where(TenantSourceSystem.tenant_id == tenant_id)
+            .values(integration_id=integration_id)
         )
 
         await self._db.commit()

@@ -135,6 +135,39 @@ class UnifiedAgent(BaseModel):
     def full_name(self) -> str:
         parts = filter(None, [self.first_name, self.last_name])
         return " ".join(parts) or self.email or self.id
+    
+class UnifiedCustomer(BaseModel):
+    """A normalised CRM customer / user."""
+
+    id: str
+    crm_type: str
+    integration_id: str
+
+    email: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    active: bool = True
+    role: Optional[str] = None
+
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    raw: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("created_at", "updated_at", mode="before")
+    @classmethod
+    def normalise_tz(cls, v: Any) -> Optional[datetime]:
+        if isinstance(v, str):
+            try:
+                v = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        return _ensure_utc(v) if isinstance(v, datetime) else v
+
+    @property
+    def full_name(self) -> str:
+        parts = filter(None, [self.first_name, self.last_name])
+        return " ".join(parts) or self.email or self.id
 
 
 class UnifiedOrganization(BaseModel):

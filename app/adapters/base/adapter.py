@@ -184,6 +184,22 @@ class BaseCrmAdapter(ABC):
         """
 
     @abstractmethod
+    async def fetch_customers(
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 100,
+    ) -> PaginatedResult:
+        """
+        Fetch a page of customers / users.
+
+        Returns
+        -------
+        PaginatedResult
+            ``.items`` is a ``List[UnifiedAgent]``.
+        """
+
+    @abstractmethod
     async def fetch_organizations(
         self,
         *,

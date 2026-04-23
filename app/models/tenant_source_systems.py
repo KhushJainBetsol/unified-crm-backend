@@ -20,62 +20,64 @@ from app.core.base import Base
 class TenantSourceSystem(Base):
     __tablename__ = "tenant_source_systems"
 
-    # ------------------------------------------------------------------
     # Composite primary key
-    # ------------------------------------------------------------------
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("tenants.id", ondelete="CASCADE"),
         primary_key=True,
-        comment="FK → tenants",
     )
+
     source_system_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("source_systems.id", ondelete="CASCADE"),
         primary_key=True,
-        comment="FK → source_systems",
     )
 
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
+    # ✅ Nullable FK (NOT part of PK)
+    integration_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("crm_integrations.id", ondelete="SET NULL"),  # ✅ correct table name
+        nullable=True,
+        default=None,
+        comment="FK → crm_integrations (specific CRM integration instance)",
+    )
+# Remove primary_key=True — it's nullable, can't be part of PK
+
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
         default=True,
-        comment="Status of the CRM integration for this tenant",
     )
 
-    # ------------------------------------------------------------------
-    # CRM organisation identifier
-    # Populated at tenant-creation time by calling the CRM's own API.
-    # NULL means the lookup has not succeeded yet (CRM unreachable, org
-    # not found, etc.) — it does NOT block tenant creation.
-    # ------------------------------------------------------------------
     crm_org_id: Mapped[str | None] = mapped_column(
         String,
         nullable=True,
-        default=None,
-        comment=(
-            "Organisation/Account ID returned by the external CRM "
-            "(Zammad organization id or EspoCRM Account id). "
-            "NULL until successfully fetched."
-        ),
     )
 
-    # ------------------------------------------------------------------
     # Relationships
-    # ------------------------------------------------------------------
-    tenant: Mapped["Tenant"] = relationship(  # type: ignore[name-defined]
-        "Tenant", back_populates="tenant_source_systems"
+    tenant: Mapped["Tenant"] = relationship(
+        "Tenant",
+        back_populates="tenant_source_systems",
     )
-    source_system: Mapped["SourceSystem"] = relationship(  # type: ignore[name-defined]
-        "SourceSystem", back_populates="tenant_source_systems"
+
+    source_system: Mapped["SourceSystem"] = relationship(
+        "SourceSystem",
+        back_populates="tenant_source_systems",
     )
+
+    integration: Mapped["CrmIntegration"] = relationship(
+        "CrmIntegration",
+        back_populates="tenant_source_systems",
+    )
+
+
+
 
     def __repr__(self) -> str:
         return (
             f"<TenantSourceSystem tenant_id={self.tenant_id} "
             f"source_system_id={self.source_system_id} "
-            f"active={self.is_active} crm_org_id={self.crm_org_id!r}>"
+            f"active={self.is_active} "
+            f"crm_org_id={self.crm_org_id!r} "
+            f"integration_id={self.integration_id!r}>"  # ✅ fixed duplicate
         )
