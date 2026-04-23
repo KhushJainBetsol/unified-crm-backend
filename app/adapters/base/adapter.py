@@ -199,6 +199,41 @@ class BaseCrmAdapter(ABC):
             ``.items`` is a ``List[UnifiedOrganization]``.
         """
 
+    @abstractmethod
+    async def push_ticket_update(
+        self,
+        crm_ticket_id: str,
+        update_payload: Any,
+    ) -> None:
+        """
+        Push an update to the CRM.
+        The adapter is responsible for translating the unified domain payload
+        (e.g., status="open") into the CRM's native JSON format using its config.
+        """
+
+    @abstractmethod
+    async def verify_connection(self) -> Dict[str, Any]:
+        """
+        Perform a lightweight, read-only call to the CRM to confirm the
+        stored credentials are accepted.
+
+        Called by the integrations router immediately after provisioning or
+        rotating credentials — before the DB record is committed — so a bad
+        token is caught early and the caller gets a clear 502 rather than a
+        silent write of unusable creds.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Raw response from the CRM's token-validation (or whoami) endpoint.
+            The router discards this; it is returned so adapters can log it.
+
+        Raises
+        ------
+        AuthenticationError
+            If the CRM returns a non-2xx response or rejects the token.
+        """
+
     # ------------------------------------------------------------------
     # Concrete helpers available to all subclasses
     # ------------------------------------------------------------------
@@ -259,19 +294,6 @@ class BaseCrmAdapter(ABC):
         model_dict["crm_type"] = self.crm_type
         model_dict["integration_id"] = self._integration_id
         return model_dict
-    
-    
-    @abstractmethod
-    async def push_ticket_update(
-        self, 
-        crm_ticket_id: str, 
-        update_payload: Any  # (Your TicketUpdateRequest)
-    ) -> None:
-        """
-        Push an update to the CRM. 
-        The adapter is responsible for translating the unified domain payload 
-        (e.g., status="open") into the CRM's native JSON format using its config.
-        """
 
     # ------------------------------------------------------------------
     # Dunder

@@ -35,6 +35,11 @@ endpoints:
     method: "GET"
     default_params: {}
 
+  token-validation:
+    path: "/api/v1/App/user?"
+    method: "GET"
+    default_params: {}
+
 field_mappings:
   ticket:
     id: "id"

@@ -12,36 +12,30 @@ Architecture recap
                                     │Service              │
                                     │  1. DB lookup       │──► CrmIntegration row
                                     │  2. Infisical fetch │──► ENCRYPTION_KEY_<v>
-                                    │  3. AES decrypt     │──► plaintext token
-                                    │  4. Build envelope  │──► CrmCredentialEnvelope
+                                    │  3. AES decrypt     │──► plaintext JSON
+                                    │  4. Parse JSON      │──► token / creds dict
+                                    │  5. Build envelope  │──► CrmCredentialEnvelope
                                     └─────────────────────┘
                                              │
                                              ▼
                                     factory builds adapter
                                     (BaseCrmClient + adapter)
 
-This class implements the exact same interface as the mock vault used in
-the test scripts — it exposes get_credentials(integration_id) — so the
-factory requires zero changes.
-
 Why not store creds in Infisical?
 ---------------------------------
-The team's architecture intentionally keeps credentials in PostgreSQL
-(encrypted with AES-256-CBC).  Infisical holds only the encryption keys.
-This gives:
-  - Full audit trail of integration records in the DB
-  - Tenant-scoped credential lifecycle (FK → tenants)
-  - Key rotation without credential re-entry (just rotate the AES key)
-  - Infisical used for what it's best at: key management, not data storage
+Infisical holds only the AES encryption keys.
+PostgreSQL holds the AES-encrypted credential blobs.
+This gives full audit trail, tenant-scoped lifecycle, and key rotation
+without credential re-entry.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Optional
 from uuid import UUID
 
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.credentials.encryption import EncryptionService
@@ -69,16 +63,6 @@ class DbBackedCredentialService:
         An initialised InfisicalCredentialManager (key fetching only).
     db_session_factory:
         A callable that returns a sync SQLAlchemy session.
-        For async usage, use AsyncDbBackedCredentialService instead.
-
-    Usage (sync — for scheduler, scripts, CLI)
-    -------------------------------------------
-    service = DbBackedCredentialService(
-        key_manager=InfisicalCredentialManager(settings),
-        db_session_factory=sync_session_maker,
-    )
-    envelope = service.get_credentials("550e8400-e29b-41d4-...")
-    adapter  = factory.create("550e8400-e29b-41d4-...")
     """
 
     def __init__(
@@ -93,13 +77,11 @@ class DbBackedCredentialService:
         """
         READ FLOW
         ---------
-        1. Look up CrmIntegration row by integration_id (= row.id).
+        1. Look up CrmIntegration row by integration_id.
         2. Fetch the AES key for row.key_version from Infisical.
-        3. Decrypt row.credential_enc using EncryptionService.
-        4. Build and return a CrmCredentialEnvelope in memory.
-
-        Nothing is stored — the envelope lives only for the duration of
-        the request / sync operation.
+        3. Decrypt row.credential_enc → JSON string.
+        4. Parse JSON → secret dict.
+        5. Build and return a CrmCredentialEnvelope.
 
         Raises
         ------
@@ -118,10 +100,6 @@ class DbBackedCredentialService:
 
         return self._build_envelope(row, integration_id)
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
     def _build_envelope(
         self, row: Any, integration_id: str
     ) -> CrmCredentialEnvelope:
@@ -132,7 +110,6 @@ class DbBackedCredentialService:
             else "unknown"
         )
 
-        # Step 1 — fetch AES key for this row's key_version from Infisical
         try:
             raw_key = self._key_manager.get_encryption_key(row.key_version)
         except Exception as exc:
@@ -145,7 +122,6 @@ class DbBackedCredentialService:
             raw_key=raw_key, key_version=row.key_version
         )
 
-        # Step 2 — decrypt credential_enc
         if not row.credential_enc:
             raise CredentialDecodeError(
                 integration_id,
@@ -153,17 +129,15 @@ class DbBackedCredentialService:
             )
 
         try:
-            decrypted_token = enc_service.decrypt_from_db(row.credential_enc)
+            decrypted_json = enc_service.decrypt_from_db(row.credential_enc)
         except Exception as exc:
             raise CredentialDecodeError(
                 integration_id,
                 f"AES decryption failed: {exc}",
             ) from exc
 
-        # Step 3 — build credentials dict from auth_type + decrypted value
-        credentials_dict = _build_credentials_dict(row.auth_type, decrypted_token)
+        credentials_dict = _build_credentials_dict(row.auth_type, decrypted_json)
 
-        # Step 4 — build and validate envelope
         try:
             envelope = CrmCredentialEnvelope(
                 crm_type=crm_type,
@@ -190,35 +164,21 @@ class DbBackedCredentialService:
         return envelope
 
 
-# ---------------------------------------------------------------------------
-# Async version — used by FastAPI routes and the async factory
-# ---------------------------------------------------------------------------
-
 class AsyncDbBackedCredentialService:
     """
-    Async version of DbBackedCredentialService for FastAPI routes.
+    Async version of DbBackedCredentialService for FastAPI routes and the
+    async adapter factory.
 
-    The Infisical SDK is sync, so key fetching is offloaded to the
-    thread pool (same pattern as AsyncInfisicalCredentialManager).
+    The Infisical SDK is sync, so key fetching is offloaded to a thread pool.
 
     Parameters
     ----------
     key_manager:
-        Sync InfisicalCredentialManager (key fetching).
+        Sync InfisicalCredentialManager (key fetching only).
     async_session_factory:
-        Callable that returns an AsyncSession (your async_session_maker).
-
-    Usage (in FastAPI — stored on app.state)
-    -----------------------------------------
-    service = AsyncDbBackedCredentialService(
-        key_manager=InfisicalCredentialManager(settings),
-        async_session_factory=async_session_maker,
-    )
-    # Store on app.state at startup:
-    app.state.credential_service = service
-
-    # In factory / route:
-    envelope = await service.get_credentials(integration_id)
+        Callable that returns an AsyncSession (async_session_maker).
+    executor:
+        ThreadPoolExecutor — reuse the one from AsyncInfisicalCredentialManager.
     """
 
     def __init__(
@@ -229,12 +189,24 @@ class AsyncDbBackedCredentialService:
     ) -> None:
         self._key_manager = key_manager
         self._async_session_factory = async_session_factory
-        self._executor = executor  # ThreadPoolExecutor from app.state
+        self._executor = executor
 
     async def get_credentials(self, integration_id: str) -> CrmCredentialEnvelope:
         """
-        Async READ FLOW — same logic as DbBackedCredentialService.get_credentials
-        but with async DB access and thread-pool Infisical calls.
+        Async READ FLOW
+        ---------------
+        1. Async DB lookup by integration_id.
+        2. Fetch AES key from Infisical via thread pool (sync SDK).
+        3. Decrypt credential_enc in thread pool (CPU work).
+        4. Parse decrypted JSON → secret dict.
+        5. Build and return CrmCredentialEnvelope.
+
+        Raises
+        ------
+        CredentialNotFoundError
+            If no active row matches integration_id.
+        CredentialDecodeError
+            If decryption, JSON parse, or envelope construction fails.
         """
         import asyncio
         import functools
@@ -280,12 +252,12 @@ class AsyncDbBackedCredentialService:
                 f"Infisical key fetch failed for version='{row.key_version}': {exc}",
             ) from exc
 
-        # ── 3. Decrypt in thread pool (CPU work, non-blocking) ────────────
+        # ── 3. Decrypt in thread pool ─────────────────────────────────────
         enc_service = EncryptionService(
             raw_key=raw_key, key_version=row.key_version
         )
         try:
-            decrypted_token = await loop.run_in_executor(
+            decrypted_json = await loop.run_in_executor(
                 self._executor,
                 functools.partial(enc_service.decrypt_from_db, row.credential_enc),
             )
@@ -295,8 +267,8 @@ class AsyncDbBackedCredentialService:
                 f"AES decryption failed: {exc}",
             ) from exc
 
-        # ── 4. Build envelope ─────────────────────────────────────────────
-        credentials_dict = _build_credentials_dict(row.auth_type, decrypted_token)
+        # ── 4. Parse JSON + build envelope ────────────────────────────────
+        credentials_dict = _build_credentials_dict(row.auth_type, decrypted_json)
         try:
             envelope = CrmCredentialEnvelope(
                 crm_type=crm_type,
@@ -323,7 +295,7 @@ class AsyncDbBackedCredentialService:
 
 
 # ---------------------------------------------------------------------------
-# Shared helper — maps auth_type → credentials dict shape
+# Shared helper — maps auth_type + decrypted JSON → credentials dict
 # ---------------------------------------------------------------------------
 
 _AUTH_TYPE_TO_STRATEGY = {
@@ -341,22 +313,74 @@ def _build_credentials_dict(auth_type: str, decrypted_value: str) -> dict:
     """
     Build the credentials dict for a CrmCredentialEnvelope.
 
-    The decrypted_value is the raw string from credential_enc
-    (API key, bearer token, or "username:password" for basic auth).
+    ``decrypted_value`` is the AES-decrypted string from credential_enc.
+    CredentialProvisioningService always stores this as JSON
+    (json.dumps(secret_dict)), so we parse it first.
+
+    Falls back to treating the raw string as a token if JSON parsing fails
+    (handles any legacy rows that stored a plain token string).
+
+    Parameters
+    ----------
+    auth_type:
+        The raw auth_type column value from CrmIntegration
+        (e.g. "api_token", "access_token", "basic_auth").
+    decrypted_value:
+        The AES-decrypted string from credential_enc — expected to be a
+        JSON object like ``{"token": "abc123", "auth_type": "access_token"}``.
+
+    Returns
+    -------
+    dict
+        Credentials dict with a ``"strategy"`` key, ready for
+        CrmCredentialEnvelope and BaseCrmClient.build_headers().
     """
+    # ── Parse the stored JSON ─────────────────────────────────────────────
+    # CredentialProvisioningService.provision() stores json.dumps(secret_dict).
+    # The old DbBackedCredentialService passed the raw string directly, which
+    # caused the auth header to become e.g. 'Token token={"token":"abc123"}'.
+    try:
+        secret_dict: dict = json.loads(decrypted_value)
+        if not isinstance(secret_dict, dict):
+            raise ValueError("Parsed JSON is not a dict")
+    except (json.JSONDecodeError, ValueError):
+        # Legacy fallback: raw token string stored without JSON wrapping
+        logger.warning(
+            "credential_enc did not contain valid JSON for auth_type='%s'; "
+            "treating raw decrypted value as token string. "
+            "Re-provision this integration to store credentials in the correct format.",
+            auth_type,
+        )
+        secret_dict = {"token": decrypted_value}
+
     strategy = _AUTH_TYPE_TO_STRATEGY.get(auth_type, "api_token")
 
     if strategy == "api_token":
-        return {"strategy": "api_token", "token": decrypted_value}
+        # Covers api_token, bearer_token, access_token, api_key, hmac
+        token = secret_dict.get("token") or secret_dict.get("api_key", "")
+        return {"strategy": "api_token", "token": token}
 
     if strategy == "basic":
-        # Stored format: "username:password"
-        if ":" in decrypted_value:
-            username, _, password = decrypted_value.partition(":")
-        else:
-            username = decrypted_value
-            password = ""
-        return {"strategy": "basic", "username": username, "password": password}
+        return {
+            "strategy": "basic",
+            "username": secret_dict.get("username", ""),
+            "password": secret_dict.get("password", ""),
+        }
 
-    # oauth2 — future: credential_enc would store JSON with refresh_token etc.
-    return {"strategy": "api_token", "token": decrypted_value}
+    if strategy == "oauth2":
+        return {
+            "strategy": "oauth2",
+            "access_token": secret_dict.get("access_token", ""),
+            "refresh_token": secret_dict.get("refresh_token"),
+            "token_type": secret_dict.get("token_type", "Bearer"),
+            "expires_at": secret_dict.get("expires_at"),
+        }
+
+    # Unknown strategy — best-effort fallback
+    logger.warning(
+        "Unrecognised auth_type '%s', falling back to api_token strategy.", auth_type
+    )
+    return {
+        "strategy": "api_token",
+        "token": secret_dict.get("token") or secret_dict.get("api_key", ""),
+    }

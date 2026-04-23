@@ -87,6 +87,31 @@ class IntegrationResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Internal helper
+# ---------------------------------------------------------------------------
+
+async def _verify_adapter_connection(
+    integration_id: str,
+    factory: CrmAdapterFactory,
+) -> None:
+    """
+    Open the adapter (which calls authenticate()) then call verify_connection().
+
+    Extracted so provision, rotate, and the on-demand verify endpoint all share
+    identical verification logic — no duplicated try/except blocks.
+
+    Raises
+    ------
+    Exception
+        Propagates any AuthenticationError, CrmAuthError, or network error
+        from the adapter. The caller translates this into an HTTPException.
+    """
+    adapter = await factory.create(integration_id)   # async — fetches live creds
+    async with adapter:                              # open() → authenticate()
+        await adapter.verify_connection()            # explicit token-validation
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -100,16 +125,17 @@ async def provision_integration(
     body: ProvisionIntegrationRequest,
     registry: AdapterRegistry = Depends(get_adapter_registry),
     cred_manager: AsyncInfisicalCredentialManager = Depends(get_credential_manager),
+    factory: CrmAdapterFactory = Depends(get_adapter_factory),
 ):
     """
     Steps
     -----
-    1. Validate that crm_type exists in the adapter registry.
+    1. Validate crm_type exists in the adapter registry.
     2. Validate the credential envelope (Pydantic rejects bad strategy/URL).
     3. Generate a new integration_id UUID.
     4. Write credentials to Infisical under CREDS_<integration_id>.
-    5. Persist integration_id + crm_type to PostgreSQL.
-    6. Return integration_id to the caller — this is the only handle they need.
+    5. Verify credentials against the live CRM — roll back Infisical on failure.
+    6. Persist integration_id + crm_type to PostgreSQL only if step 5 passes.
     """
     # Step 1 — crm_type must be registered
     try:
@@ -121,7 +147,7 @@ async def provision_integration(
                    f"Available: {registry.list_adapter_keys()}",
         )
 
-    # Step 2 — build and validate the envelope
+    # Step 2 — validate the credential envelope
     try:
         envelope = CrmCredentialEnvelope(
             crm_type=body.crm_type,
@@ -148,12 +174,34 @@ async def provision_integration(
             detail="Failed to store credentials. Try again.",
         )
 
-    # Step 5 — persist to DB
-    # TODO: Replace with your IntegrationRepository.create() call.
-    # Example:
-    #   async with async_session_maker() as db:
-    #       await integration_repo.create(db, integration_id=integration_id, crm_type=body.crm_type)
-    #       await db.commit()
+    # Step 5 — verify the credentials work against the live CRM.
+    # On any failure: roll back the Infisical write so no orphaned secret is left.
+    # The DB record is never written, so there is nothing to clean up there.
+    try:
+        await _verify_adapter_connection(integration_id, factory)
+    except Exception as exc:
+        logger.warning(
+            "Credential verification failed for new integration_id='%s'; "
+            "rolling back Infisical write. Reason: %s",
+            integration_id,
+            exc,
+        )
+        try:
+            await cred_manager.delete_credentials(integration_id)
+        except Exception as cleanup_exc:
+            # Log but do not mask the original auth failure
+            logger.error(
+                "Rollback of Infisical secret failed for integration_id='%s': %s",
+                integration_id,
+                cleanup_exc,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"CRM rejected the provided credentials: {exc}",
+        )
+
+    # Step 6 — only reached when creds are confirmed good
+    # TODO: await integration_repo.create(db, integration_id=integration_id, crm_type=body.crm_type)
     logger.info(
         "Provisioned integration_id='%s' for crm_type='%s'.",
         integration_id,
@@ -164,7 +212,7 @@ async def provision_integration(
         integration_id=integration_id,
         crm_type=body.crm_type,
         base_url=envelope.base_url,
-        message="Integration provisioned successfully.",
+        message="Integration provisioned and credentials verified successfully.",
     )
 
 
@@ -180,12 +228,15 @@ async def rotate_credentials(
     factory: CrmAdapterFactory = Depends(get_adapter_factory),
 ):
     """
-    Replaces the stored credentials in Infisical with the new ones and
-    immediately reads them back to confirm the write succeeded.
+    Replaces the stored credentials in Infisical with the new ones, then
+    immediately verifies them against the live CRM before returning success.
 
     The integration_id and crm_type stay unchanged — only the secrets rotate.
+
+    Note: if verify fails after rotate, the old secret is already gone.
+    The error message tells the admin to rotate again with valid credentials.
     """
-    # Fetch the existing envelope to preserve crm_type
+    # Fetch the existing envelope to preserve crm_type and metadata
     try:
         existing = await cred_manager.get_credentials(integration_id)
     except CredentialNotFoundError:
@@ -207,18 +258,39 @@ async def rotate_credentials(
             detail=f"Invalid credentials: {exc}",
         )
 
-    # rotate_credentials = save + verified read-back
+    # Overwrite the secret in Infisical and read it back to confirm the write
     confirmed = await cred_manager.rotate_credentials(integration_id, new_envelope)
 
-    # Bust the factory's class cache so the next create() re-verifies auth
+    # Bust the factory cache so the next create() picks up the new secret
     factory.clear_class_cache()
 
-    logger.info("Rotated credentials for integration_id='%s'.", integration_id)
+    # Verify the new credentials actually work against the live CRM
+    try:
+        await _verify_adapter_connection(integration_id, factory)
+    except Exception as exc:
+        logger.warning(
+            "New credentials rejected by CRM for integration_id='%s': %s",
+            integration_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Credentials were written to the secret store but the CRM "
+                f"rejected them: {exc}. "
+                f"The previous credentials have been overwritten — "
+                f"please rotate again with valid credentials."
+            ),
+        )
+
+    logger.info(
+        "Rotated and verified credentials for integration_id='%s'.", integration_id
+    )
     return IntegrationResponse(
         integration_id=integration_id,
         crm_type=confirmed.crm_type,
         base_url=confirmed.base_url,
-        message="Credentials rotated successfully.",
+        message="Credentials rotated and verified successfully.",
     )
 
 
@@ -235,14 +307,12 @@ async def delete_integration(
     Removes the Infisical secret and the DB record for this integration.
     Idempotent — deleting a non-existent integration returns 204.
     """
-    # Delete from Infisical (idempotent — no-op if already gone)
     await cred_manager.delete_credentials(integration_id)
 
     # TODO: Delete from PostgreSQL
-    # Example:
-    #   async with async_session_maker() as db:
-    #       await integration_repo.delete(db, integration_id)
-    #       await db.commit()
+    # async with async_session_maker() as db:
+    #     await integration_repo.delete(db, integration_id)
+    #     await db.commit()
 
     logger.info("De-provisioned integration_id='%s'.", integration_id)
 
@@ -256,16 +326,14 @@ async def verify_integration(
     factory: CrmAdapterFactory = Depends(get_adapter_factory),
 ):
     """
-    Attempts to open the adapter (authenticate with the CRM) and immediately
-    closes it.  Returns 200 if successful, propagates CrmAuthError → 502
-    via the exception handler if credentials are rejected.
+    On-demand health check — runs both authenticate() and verify_connection()
+    against the live CRM. Returns 200 if both pass, 502 if either fails.
 
-    Useful as a health check after provisioning or rotation.
+    Runs the same _verify_adapter_connection() path used at provision and
+    rotation time, so behaviour is consistent across all three call sites.
     """
     try:
-        adapter = factory.create(integration_id)
-        async with adapter:
-            pass   # authenticate() is called inside open() inside async with
+        await _verify_adapter_connection(integration_id, factory)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

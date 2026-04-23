@@ -2,30 +2,17 @@
 """
 FastAPI Dependency Injection — Adapter Layer
 ============================================
-These dependency functions are the ONLY sanctioned way for routes and services
-to access the adapter factory, credential manager, and registry.
-
-Pattern
--------
-Routes declare what they need via Depends():
-
-    @router.get("/tickets")
-    async def list_tickets(
-        factory: CrmAdapterFactory = Depends(get_adapter_factory),
-    ):
-        adapter = factory.create(integration_id)
-        async with adapter:
-            result = await adapter.fetch_tickets()
+These dependency functions are the ONLY sanctioned way for routes and
+services to access the adapter factory, credential manager, and registry.
 
 Why not import app.state directly?
-    Importing `app` in a route module creates a circular dependency
-    (routes are registered ON the app). Pulling from `request.app.state`
-    via a Depends() function breaks that cycle cleanly.
+    Importing `app` in a route module creates a circular dependency.
+    Pulling from `request.app.state` via Depends() breaks that cycle.
 
 Why not use lru_cache / module-level singletons?
-    The singletons already live on app.state (initialised in lifespan).
-    Reading them through Depends() keeps the dependency graph explicit and
-    makes unit testing trivial — inject a mock factory via app.dependency_overrides.
+    The singletons live on app.state (initialised in lifespan).
+    Depends() keeps the dependency graph explicit and makes unit testing
+    trivial — inject mocks via app.dependency_overrides.
 """
 
 from __future__ import annotations
@@ -42,48 +29,40 @@ from app.factory.adapter_factory import AdapterFactoryError, CrmAdapterFactory
 # ---------------------------------------------------------------------------
 
 def get_adapter_registry(request: Request) -> AdapterRegistry:
-    """
-    Return the pre-warmed AdapterRegistry from app.state.
-
-    Raises 503 if the registry was never initialised (boot failure).
-    """
-    registry: AdapterRegistry | None = getattr(request.app.state, "adapter_registry", None)
+    """Return the pre-warmed AdapterRegistry from app.state."""
+    registry: AdapterRegistry | None = getattr(
+        request.app.state, "adapter_registry", None
+    )
     if registry is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="CRM adapter registry is not initialised. The service is starting up.",
+            detail="CRM adapter registry is not initialised.",
         )
     return registry
 
 
 def get_credential_manager(request: Request) -> AsyncInfisicalCredentialManager:
-    """
-    Return the AsyncInfisicalCredentialManager from app.state.
-
-    Raises 503 if not initialised.
-    """
+    """Return the AsyncInfisicalCredentialManager (key manager) from app.state."""
     manager: AsyncInfisicalCredentialManager | None = getattr(
-        request.app.state, "credential_manager", None
+        request.app.state, "key_manager", None
     )
     if manager is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Credential manager is not initialised. The service is starting up.",
+            detail="Credential manager is not initialised.",
         )
     return manager
 
 
 def get_adapter_factory(request: Request) -> CrmAdapterFactory:
-    """
-    Return the CrmAdapterFactory from app.state.
-
-    Raises 503 if not initialised.
-    """
-    factory: CrmAdapterFactory | None = getattr(request.app.state, "adapter_factory", None)
+    """Return the CrmAdapterFactory from app.state."""
+    factory: CrmAdapterFactory | None = getattr(
+        request.app.state, "adapter_factory", None
+    )
     if factory is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="CRM adapter factory is not initialised. The service is starting up.",
+            detail="CRM adapter factory is not initialised.",
         )
     return factory
 
@@ -99,27 +78,20 @@ async def get_adapter_for_integration(
     """
     Build and yield a fully-authenticated adapter for *integration_id*.
 
-    This is an async generator dependency — FastAPI opens the adapter before
-    the route handler runs and closes it after, even if an exception occurs.
+    Async generator — FastAPI opens the adapter before the route handler
+    runs and closes it after, even on exception.
 
-    Usage in a route
-    ----------------
-    from typing import Annotated
-    from app.adapters.base.adapter import BaseCrmAdapter
-
+    Usage
+    -----
     @router.get("/integrations/{integration_id}/tickets")
     async def list_tickets(
         adapter: Annotated[BaseCrmAdapter, Depends(get_adapter_for_integration)],
     ):
         result = await adapter.fetch_tickets()
         return result.items
-
-    Note: integration_id is extracted from the path param automatically by
-    FastAPI because the dependency signature declares it as a plain str param
-    that matches the route path parameter name.
     """
     try:
-        adapter = factory.create(integration_id)
+        adapter = await factory.create(integration_id)   # ← async
     except AdapterFactoryError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -139,28 +111,22 @@ async def get_verified_adapter(
     """
     Like get_adapter_for_integration but validates a required capability first.
 
-    Usage in a route that needs a specific capability
-    -------------------------------------------------
+    Usage
+    -----
     from functools import partial
-    from fastapi import Depends
-
-    require_ticket_fetch = partial(get_verified_adapter, required_capability="fetch_tickets")
+    require_ticket_fetch = partial(
+        get_verified_adapter, required_capability="fetch_tickets"
+    )
 
     @router.get("/integrations/{integration_id}/tickets")
-    async def list_tickets(
-        adapter = Depends(require_ticket_fetch),
-    ):
+    async def list_tickets(adapter=Depends(require_ticket_fetch)):
         result = await adapter.fetch_tickets()
         return result.items
     """
     from app.config.registry import CapabilityNotSupportedError
 
-    # Look up crm_type from the credential envelope to check the registry
     try:
-        cred_mgr: AsyncInfisicalCredentialManager = getattr(
-            factory._cred_manager, "__wrapped__", factory._cred_manager
-        )
-        envelope = await cred_mgr.get_credentials(integration_id)
+        envelope = await factory._cred_manager.get_credentials(integration_id)
         crm_type = envelope.crm_type
     except Exception as exc:
         raise HTTPException(
@@ -177,7 +143,7 @@ async def get_verified_adapter(
         )
 
     try:
-        adapter = factory.create(
+        adapter = await factory.create(                  # ← async
             integration_id,
             required_capabilities=[required_capability],
         )

@@ -54,6 +54,12 @@ endpoints:
     method: "GET"
     default_params: {}
 
+  token-validation:
+    path: "/api/v1/user_access_token"
+    method: "GET"
+    default_params: {}
+
+
 # ---------------------------------------------------------------------------
 # Schema field mappings
 # Format:  unified_field_name: "raw.json.path"
