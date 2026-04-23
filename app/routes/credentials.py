@@ -1,5 +1,6 @@
-# app/routes/credentials.py
 """
+app/routes/credentials.py
+
 REST API for CRM credential lifecycle.
 
 Endpoints
@@ -16,12 +17,21 @@ All write endpoints require a valid Keycloak JWT.
 tenant_id is extracted from the JWT claims — never from the request body.
 Secrets are NEVER returned in any response.
 
+Permission gate (provision + update)
+-------------------------------------
+Before any encryption or DB write, provision() calls the CRM's permission
+endpoint with the supplied raw credentials and validates the response.
+
+  • Missing permissions  →  403 with a structured JSON body listing
+                            exactly which checks failed. Nothing is written.
+  • Sufficient perms     →  normal encrypt → DB write → adapter verify flow.
+
 Verification gate (provision)
 -----------------------------
-After encrypting and writing to DB, provision() immediately opens the
-CRM adapter and calls verify_connection(). If the CRM rejects the
-credentials the DB row is wiped (revoke wipe=True) and a 502 is returned.
-The admin never ends up with an integration row pointing to bad creds.
+After encrypting and writing to DB, provision() opens the CRM adapter and
+calls verify_connection(). If the CRM rejects the credentials the DB row
+is wiped (revoke wipe=True) and a 502 is returned. The admin never ends up
+with an integration row pointing to bad creds.
 """
 
 from __future__ import annotations
@@ -47,6 +57,7 @@ from app.schemas.credentials import (
     UpdateCredentialsRequest,
 )
 from app.services.credential_service import CredentialProvisioningService
+from app.adapters.base.permission_validator import PermissionValidationError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/integrations", tags=["Credentials"])
@@ -59,16 +70,10 @@ router = APIRouter(prefix="/integrations", tags=["Credentials"])
 async def get_credential_manager(
     request: Request,
 ) -> AsyncInfisicalCredentialManager:
-    """
-    Returns the AsyncInfisicalCredentialManager (key manager) from app.state.
-    Used by CredentialProvisioningService to call get_active_key_and_version().
-    Distinct from app.state.credential_service (AsyncDbBackedCredentialService).
-    """
     return request.app.state.key_manager
 
 
 async def get_adapter_factory(request: Request) -> CrmAdapterFactory:
-    """Return the CrmAdapterFactory from app.state."""
     factory: CrmAdapterFactory | None = getattr(
         request.app.state, "adapter_factory", None
     )
@@ -97,9 +102,8 @@ async def _verify_adapter_connection(
 ) -> None:
     """
     Open the adapter (authenticate()) then call verify_connection().
-
-    Raises the underlying exception on failure so the route can translate
-    it into the correct HTTPException and roll back if needed.
+    Raises on failure so the route can translate it into the correct
+    HTTPException and roll back if needed.
     """
     try:
         adapter = await factory.create(str(integration_id))
@@ -117,12 +121,34 @@ async def _verify_adapter_connection(
 # ---------------------------------------------------------------------------
 
 def _handle_service_error(exc: Exception, integration_id: UUID | None) -> None:
-    """Centralised exception → HTTPException mapping."""
+    """
+    Centralised exception → HTTPException mapping.
+
+    PermissionValidationError is mapped to 403 with a structured body that
+    lists every failed check so the frontend can surface it clearly.
+    """
+    if isinstance(exc, PermissionValidationError):
+        # Return a structured 403 so the frontend can display each failure
+        # individually rather than just a generic error string.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "insufficient_crm_permissions",
+                "message": (
+                    "The supplied credentials do not have the required permissions. "
+                    "Please review the failed checks below and update the API token "
+                    "or user role in your CRM before retrying."
+                ),
+                "failed_checks": exc.failures,
+            },
+        )
+
     if isinstance(exc, CredentialNotFoundError):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No integration found with id={integration_id}",
         )
+
     if isinstance(exc, (CredentialDecodeError, CredentialSaveError)):
         logger.error(
             "Credential operation failed",
@@ -132,11 +158,13 @@ def _handle_service_error(exc: Exception, integration_id: UUID | None) -> None:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Credential operation failed. Check server logs.",
         )
+
     if isinstance(exc, ValueError):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         )
+
     logger.exception(
         "Unexpected error", extra={"integration_id": str(integration_id)}
     )
@@ -156,11 +184,17 @@ def _handle_service_error(exc: Exception, integration_id: UUID | None) -> None:
     status_code=status.HTTP_201_CREATED,
     summary="Provision credentials for a new integration",
     description=(
-        "Creates a new CRM integration. The integration_id is generated "
-        "server-side and returned in the response. "
-        "After storing credentials, the endpoint immediately verifies them "
-        "against the live CRM. If the CRM rejects them the row is wiped and "
-        "a 502 is returned — no orphaned integration rows are left behind. "
+        "Creates a new CRM integration.\n\n"
+        "**Step 1 — Permission check (before any write):** The supplied credentials "
+        "are used to call the CRM's permission-inspection endpoint. If the token "
+        "lacks any required permission a **403** is returned immediately with a "
+        "`failed_checks` list describing exactly what is missing. Nothing is "
+        "stored in the database.\n\n"
+        "**Step 2 — Encrypt and store:** If permissions pass, credentials are "
+        "encrypted and written to the database.\n\n"
+        "**Step 3 — Live verification:** The adapter opens a connection to the CRM "
+        "and calls `verify_connection()`. If the CRM rejects the credentials the "
+        "DB row is wiped and a **502** is returned.\n\n"
         "Raw secrets are NEVER logged or returned."
     ),
 )
@@ -173,12 +207,14 @@ async def provision_credentials(
     """
     Steps
     -----
-    1. Encrypt and write credentials to DB (via CredentialProvisioningService).
-    2. Open the CRM adapter and call verify_connection() against the live CRM.
-    3a. On success: return 201 with integration metadata.
-    3b. On CRM rejection: wipe the DB row and return 502.
+    1. Permission gate  — validate CRM permissions before any DB write.
+       PermissionValidationError → 403 with failed_checks list.
+    2. Encrypt + write credentials to DB.
+    3. Open the CRM adapter and call verify_connection() against the live CRM.
+       On rejection: wipe the DB row → 502.
+    4. Return 201 with integration metadata.
     """
-    # ── Step 1: Provision (encrypt → DB write) ────────────────────────────
+    # ── Steps 1 + 2: Permission check then provision (encrypt → DB write) ─
     try:
         result = await service.provision(
             tenant_id=current_user.tenant_id,
@@ -189,9 +225,7 @@ async def provision_credentials(
 
     integration_id: UUID = result.integration_id
 
-    # ── Step 2: Verify credentials against the live CRM ──────────────────
-    # If this fails we roll back the DB row so the admin is never left with
-    # an integration record that points to credentials the CRM rejects.
+    # ── Step 3: Verify credentials against the live CRM ──────────────────
     try:
         await _verify_adapter_connection(integration_id, factory)
     except Exception as exc:
@@ -201,7 +235,6 @@ async def provision_credentials(
             integration_id,
             exc,
         )
-        # Best-effort wipe — log but don't mask the original auth error
         try:
             await service.revoke(integration_id=integration_id, wipe=True)
         except Exception as cleanup_exc:
@@ -219,7 +252,7 @@ async def provision_credentials(
             ),
         )
 
-    # ── Step 3: Return the already-built status response ──────────────────
+    # ── Step 4: Return the status response ────────────────────────────────
     logger.info(
         "Provisioned and verified integration_id='%s' crm_type='%s'.",
         integration_id,
@@ -250,8 +283,6 @@ async def update_credentials(
     except Exception as exc:
         _handle_service_error(exc, integration_id)
 
-    # Only verify if credentials themselves changed — no point hitting the
-    # CRM if only base_url metadata was updated without new secrets.
     if body.credentials is not None:
         try:
             await _verify_adapter_connection(integration_id, factory)

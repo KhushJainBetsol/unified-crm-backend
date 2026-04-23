@@ -4,7 +4,7 @@ app/services/credential_service.py
 CredentialProvisioningService
 ==============================
 Orchestrates the full lifecycle of CRM credentials:
-  PROVISION  — generate integration_id → encrypt secrets → store in DB
+  PROVISION  — verify permissions → generate integration_id → encrypt secrets → store in DB
   UPDATE     — partial update of credentials / metadata / webhook secrets
   RETRIEVE   — DB lookup → Infisical key fetch → AES decrypt → envelope
   ROTATE     — re-encrypt BOTH _enc columns with current active key
@@ -18,6 +18,18 @@ Two-column secret model
 Both columns are encrypted independently with the same key version so a
 single rotate() call re-encrypts both atomically.
 
+Permission gate (PROVISION)
+----------------------------
+Before any encryption or DB write, provision() calls _check_permissions()
+which hits the CRM's permission-inspection endpoint and validates the
+response using the appropriate CrmPermissionValidator subclass.
+
+  If permissions are INSUFFICIENT  →  PermissionValidationError is raised
+                                       immediately with a list of exactly which
+                                       checks failed.  Nothing is written to DB.
+
+  If permissions are SUFFICIENT    →  normal encryption + DB write proceeds.
+
 Flow diagram (PROVISION)
 ------------------------
 
@@ -25,6 +37,12 @@ Flow diagram (PROVISION)
        │
        ▼  ProvisionCredentialsRequest + tenant_id (from JWT)
   CredentialProvisioningService.provision()
+       │
+       ├─► _check_permissions(crm_type, base_url, credentials)
+       │       │
+       │       ├─► HTTP GET <crm_permission_url>  (using the caller's raw creds)
+       │       └─► EspoCrmPermissionValidator / ZammadPermissionValidator
+       │               └─► PermissionValidationError if any check fails  ◄─ STOPS HERE
        │
        ├─► uuid4()  ← integration_id generated HERE, never from caller
        │
@@ -51,6 +69,8 @@ Architecture notes
 - auth_type / key_version / base_url are plain columns — queryable without decryption.
 - crm_type is accessed via row.source_system.system_name (relationship, lazy=joined).
 - Both _enc columns are re-keyed together in rotate() for atomicity.
+- Permission check uses the raw credentials from the request (before encryption)
+  so no Infisical round-trip is needed at validation time.
 """
 
 from __future__ import annotations
@@ -61,6 +81,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from uuid import UUID, uuid4
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -77,8 +98,31 @@ from app.schemas.credentials import (
     ProvisionCredentialsRequest,
     UpdateCredentialsRequest,
 )
+from app.adapters.base.permission_validator import (
+    EspoCrmPermissionValidator,
+    PermissionValidationError,
+    ZammadPermissionValidator,
+)
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# CRM permission-check endpoint registry
+#
+# Maps crm_type (lowercase, as stored in source_systems.system_name) to the
+# path that returns the permission/ACL payload for the authenticated user.
+# The full URL is assembled as:  base_url + path
+# ---------------------------------------------------------------------------
+_PERMISSION_ENDPOINT: Dict[str, str] = {
+    "espocrm": "/api/v1/App/user",
+    "zammad":  "/api/v1/user_access_token",
+}
+
+# Maps crm_type → validator class
+_PERMISSION_VALIDATOR = {
+    "espocrm": EspoCrmPermissionValidator,
+    "zammad":  ZammadPermissionValidator,
+}
 
 
 class CredentialProvisioningService:
@@ -109,31 +153,42 @@ class CredentialProvisioningService:
         request: ProvisionCredentialsRequest,
     ) -> CredentialStatusResponse:
         """
-        Encrypt and store credentials for a NEW integration.
+        Validate permissions, then encrypt and store credentials for a NEW integration.
 
-        The integration_id is generated here — callers never supply it.
-        Both credential_enc (outbound) and webhook_secrets_enc (inbound) are
-        encrypted with the same active key in a single round-trip to Infisical.
+        The permission check runs BEFORE any encryption or DB write.
+        If the API token/credentials lack the required permissions a
+        PermissionValidationError is raised immediately and nothing is stored.
 
         Steps
         -----
-        1. Generate a fresh integration_id (uuid4).
-        2. Fetch the active AES key + version from Infisical.
-        3. Encrypt outbound secret dict → credential_enc.
-        4. Build webhook secret dict from request; encrypt if present, else NULL.
-        5. Insert a new CrmIntegration row with direct plain columns.
+        1. Check CRM permissions using the raw (un-encrypted) credentials.
+        2. Generate a fresh integration_id (uuid4).
+        3. Fetch the active AES key + version from Infisical.
+        4. Encrypt outbound secret dict → credential_enc.
+        5. Build webhook secret dict from request; encrypt if present, else NULL.
+        6. Insert a new CrmIntegration row with direct plain columns.
         """
+        crm_type = request.crm_type.strip().lower()
+        base_url = str(request.base_url).rstrip("/")
+
+        # ── 1. Permission gate — nothing is written if this raises ─────────
+        await self._check_permissions(
+            crm_type=crm_type,
+            base_url=base_url,
+            request=request,
+        )
+
         integration_id = uuid4()
 
-        # ── 1. Fetch AES key ──────────────────────────────────────────────
+        # ── 2. Fetch AES key ──────────────────────────────────────────────
         version, raw_key = await self._key_manager.get_active_key_and_version()
         enc_service = EncryptionService(raw_key=raw_key, key_version=version)
 
-        # ── 2. Encrypt outbound credentials ───────────────────────────────
+        # ── 3. Encrypt outbound credentials ───────────────────────────────
         secret_dict = request.credentials.to_secret_dict()
         credential_enc = enc_service.encrypt(json.dumps(secret_dict)).to_db_string()
 
-        # ── 3. Encrypt inbound webhook secrets (nullable) ─────────────────
+        # ── 4. Encrypt inbound webhook secrets (nullable) ─────────────────
         webhook_secret_dict = request.build_webhook_secret_dict()
         webhook_secrets_enc: str | None = None
         if webhook_secret_dict:
@@ -141,12 +196,10 @@ class CredentialProvisioningService:
                 json.dumps(webhook_secret_dict)
             ).to_db_string()
 
-        # ── 4. Resolve plain column values ────────────────────────────────
-        base_url = str(request.base_url).rstrip("/")
+        # ── 5. Resolve plain column values ────────────────────────────────
         auth_type = request.credentials.auth_type
-        crm_type = request.crm_type.strip().lower()
 
-        # ── 5. Insert ─────────────────────────────────────────────────────
+        # ── 6. Insert ─────────────────────────────────────────────────────
         row = await self._create_row(
             integration_id=integration_id,
             tenant_id=tenant_id,
@@ -211,9 +264,6 @@ class CredentialProvisioningService:
 
         # ── Inbound webhook secrets (independent update) ───────────────────
         if request.has_webhook_updates():
-            # Re-use the version already on the row unless credentials were
-            # also updated in this same request (in which case enc_service / version
-            # are already set from the block above).
             ws_version = row.key_version
             ws_raw_key = await self._key_manager.get_encryption_key(ws_version)
             ws_enc = EncryptionService(raw_key=ws_raw_key, key_version=ws_version)
@@ -224,7 +274,6 @@ class CredentialProvisioningService:
                     json.dumps(ws_dict)
                 ).to_db_string()
             else:
-                # Caller sent the fields but both were empty/None — clear the column
                 row.webhook_secrets_enc = None
 
         # ── Plain columns ─────────────────────────────────────────────────
@@ -294,7 +343,7 @@ class CredentialProvisioningService:
             metadata={
                 "key_version": key_version,
                 "auth_type": auth_type,
-                "webhook_secrets": webhook_secrets,  # empty dict when not present
+                "webhook_secrets": webhook_secrets,
             },
         )
 
@@ -321,7 +370,6 @@ class CredentialProvisioningService:
 
         old_version = row.key_version
 
-        # Decrypt with OLD key
         old_raw_key = await self._key_manager.get_encryption_key(old_version)
         old_enc = EncryptionService(raw_key=old_raw_key, key_version=old_version)
 
@@ -331,7 +379,6 @@ class CredentialProvisioningService:
         if row.webhook_secrets_enc:
             decrypted_webhook = old_enc.decrypt_from_db(row.webhook_secrets_enc)
 
-        # Re-encrypt with NEW (current active) key
         new_version, new_raw_key = await self._key_manager.get_active_key_and_version()
         new_enc = EncryptionService(raw_key=new_raw_key, key_version=new_version)
 
@@ -385,6 +432,124 @@ class CredentialProvisioningService:
         )
 
     # ── Private helpers ────────────────────────────────────────────────────
+
+    async def _check_permissions(
+        self,
+        crm_type: str,
+        base_url: str,
+        request: ProvisionCredentialsRequest,
+    ) -> None:
+        """
+        Hit the CRM's permission-inspection endpoint using the caller's raw
+        credentials and validate the response.
+
+        This runs BEFORE any encryption or DB write.  If the token lacks the
+        required permissions a PermissionValidationError is raised — the caller
+        sees a clear list of exactly which checks failed and nothing is persisted.
+
+        Parameters
+        ----------
+        crm_type:
+            Lowercase CRM identifier (e.g. "espocrm", "zammad").
+        base_url:
+            CRM base URL already stripped of trailing slash.
+        request:
+            The original provision request carrying the raw credentials.
+
+        Raises
+        ------
+        PermissionValidationError
+            One or more required permissions are missing.
+        ValueError
+            crm_type is not in the known registry (no endpoint configured).
+        RuntimeError
+            The HTTP call to the CRM's permission endpoint failed (network
+            error, non-2xx response, or unparseable body).
+        """
+        endpoint_path = _PERMISSION_ENDPOINT.get(crm_type)
+        if endpoint_path is None:
+            # Unknown CRM type — skip the permission check rather than blocking
+            # the whole onboarding flow; the adapter's verify_connection() will
+            # catch auth problems downstream.
+            logger.warning(
+                "No permission-check endpoint registered for crm_type='%s'. "
+                "Skipping permission validation.",
+                crm_type,
+            )
+            return
+
+        ValidatorClass = _PERMISSION_VALIDATOR.get(crm_type)
+        if ValidatorClass is None:
+            logger.warning(
+                "No permission validator registered for crm_type='%s'. "
+                "Skipping permission validation.",
+                crm_type,
+            )
+            return
+
+        url = base_url + endpoint_path
+        auth_headers = _build_auth_headers(crm_type, request)
+
+        logger.info(
+            "Checking CRM permissions for crm_type='%s' at '%s'",
+            crm_type,
+            url,
+        )
+
+        # ── HTTP call ─────────────────────────────────────────────────────
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url, headers=auth_headers)
+        except httpx.RequestError as exc:
+            raise RuntimeError(
+                f"Could not reach the {crm_type} permission endpoint at '{url}': {exc}"
+            ) from exc
+
+        if response.status_code == 401:
+            raise PermissionValidationError(
+                [
+                    f"Authentication failed (HTTP 401). "
+                    f"The supplied API token was rejected by {crm_type} at '{url}'. "
+                    "Please verify your token or API key."
+                ]
+            )
+
+        if response.status_code == 403:
+            raise PermissionValidationError(
+                [
+                    f"Access denied (HTTP 403). "
+                    f"The API token does not have permission to call '{url}' on {crm_type}."
+                ]
+            )
+
+        if not (200 <= response.status_code < 300):
+            raise RuntimeError(
+                f"Permission endpoint '{url}' returned HTTP {response.status_code}. "
+                f"Body: {response.text[:300]}"
+            )
+
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Permission endpoint '{url}' returned a non-JSON body: {exc}"
+            ) from exc
+
+        # ── Validate parsed response ───────────────────────────────────────
+        validator = ValidatorClass(body)
+        result = validator.validate()
+
+        if not result.ok:
+            logger.warning(
+                "Permission check failed for crm_type='%s'. Failures: %s",
+                crm_type,
+                result.failures,
+            )
+            raise PermissionValidationError(result.failures)
+
+        logger.info(
+            "Permission check passed for crm_type='%s'.", crm_type
+        )
 
     async def _get_row(self, integration_id: UUID) -> Optional[CrmIntegration]:
         result = await self._db.execute(
@@ -448,15 +613,63 @@ class CredentialProvisioningService:
 
 
 # ---------------------------------------------------------------------------
-# Pure helper functions (no class coupling — easier to test in isolation)
+# Pure helper functions
 # ---------------------------------------------------------------------------
+
+
+def _build_auth_headers(
+    crm_type: str,
+    request: ProvisionCredentialsRequest,
+) -> Dict[str, str]:
+    """
+    Build the HTTP headers needed to authenticate the permission-check request
+    using the RAW (un-encrypted) credentials from the provision request.
+
+    Each CRM uses a different convention:
+      - EspoCRM  → "X-Api-Key: <token>"  (api_key auth)
+                   "Authorization: Basic <b64(user:pass)>"  (basic_auth)
+                   "Authorization: Bearer <token>"  (api_token / bearer)
+      - Zammad   → "Authorization: Token token=<token>"
+
+    Falls back to a Bearer header for unrecognised CRM types so the
+    permission endpoint can still be called rather than silently skipped.
+    """
+    import base64
+
+    secret_dict = request.credentials.to_secret_dict()
+    auth_type = request.credentials.auth_type
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+
+    if crm_type == "espocrm":
+        if auth_type in ("api_key", "api_token", "access_token"):
+            token = secret_dict.get("token", secret_dict.get("api_key", ""))
+            headers["X-Api-Key"] = token
+        elif auth_type == "basic_auth":
+            username = secret_dict.get("username", "")
+            password = secret_dict.get("password", "")
+            encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+            headers["Authorization"] = f"Basic {encoded}"
+        else:
+            token = secret_dict.get("token", "")
+            headers["Authorization"] = f"Bearer {token}"
+
+    elif crm_type == "zammad":
+        token = secret_dict.get("token", secret_dict.get("api_key", ""))
+        headers["Authorization"] = f"Token token={token}"
+
+    else:
+        # Generic fallback
+        token = secret_dict.get("token", secret_dict.get("api_key", ""))
+        headers["Authorization"] = f"Bearer {token}"
+
+    return headers
 
 
 def _to_status(row: CrmIntegration) -> CredentialStatusResponse:
     """Map a CrmIntegration ORM row → CredentialStatusResponse. No secrets exposed."""
     return CredentialStatusResponse(
         integration_id=row.id,
-        crm_type=row.source_system.system_name,   # via lazy="joined" relationship
+        crm_type=row.source_system.system_name,
         auth_type=row.auth_type,
         base_url=row.base_url or "",
         key_version=row.key_version,
@@ -498,14 +711,11 @@ def _secret_dict_to_envelope_creds(
         }
 
     if auth_type == "hmac":
-        # api_token drives outbound calls.
-        # Webhook secrets are in the envelope's metadata["webhook_secrets"].
         return {
             "strategy": "api_token",
             "token": secret_dict.get("api_token", ""),
         }
 
-    # Fallback — keeps adapters from crashing on unrecognised auth types
     logger.warning(
         "Unrecognised auth_type '%s', falling back to api_token strategy", auth_type
     )
