@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from app.adapters.base.adapter import AuthenticationError, BaseCrmAdapter
 from app.adapters.base.mapper import SchemaMapper
@@ -7,11 +7,17 @@ from app.domain.models import (
     PaginatedResult,
     UnifiedTicket,
     UnifiedAgent,
-    UnifiedOrganization
+    UnifiedCustomer,
+    UnifiedOrganization,
 )
 from app.adapters.espocrm.client import EspoCrmClient
 
 logger = logging.getLogger(__name__)
+
+# Role value as it appears in the User detail payload's rolesNames dict,
+# e.g. {"69b917db3281aa2e8": "Customer"}.
+# Must match exactly — EspoCRM role names are case-sensitive.
+_CUSTOMER_ROLE = "Customer"
 
 
 class EspoCrmAdapter(BaseCrmAdapter):
@@ -64,6 +70,83 @@ class EspoCrmAdapter(BaseCrmAdapter):
         mapped_items = self._mapper.map_agents(raw_list)
         return PaginatedResult(items=mapped_items, page=1, per_page=per_page, has_more=False)
 
+    async def fetch_customers(self, page: int = 1, per_page: int = 100) -> PaginatedResult:
+        """
+        Fetch all EspoCRM users whose role is "Customer".
+
+        WHY TWO STEPS
+        -------------
+        The User list endpoint (GET /api/v1/User) returns stub records that do
+        NOT include ``rolesNames``.  The role information is only present in the
+        full User detail payload fetched via GET /api/v1/User/{id}.
+
+        STRATEGY
+        --------
+        1. Paginate GET /api/v1/User to collect all user stubs (id, name, …).
+        2. For each stub, fetch the full detail record via /api/v1/User/{id}.
+        3. Filter to users where any value in ``rolesNames`` equals "Customer",
+           e.g. ``{"69b917db3281aa2e8": "Customer"}``.
+        4. Map the filtered detail records through the SchemaMapper.
+
+        NOTE: ``contactId`` in the User detail payload is the EspoCRM Contact
+        record linked to this user — it is NOT the same as the customer's User
+        id.  We key on User.id throughout.
+
+        Returns
+        -------
+        PaginatedResult
+            ``.items`` is ``List[UnifiedCustomer]``.
+        """
+        self._assert_authenticated()
+
+        # ── Step 1: collect all user stubs (rolesNames absent in list response) ──
+        list_path = self._get_endpoint("customers")
+        raw_stubs = await self._client.paginate_all(list_path)
+
+        logger.info(
+            "[%s] fetch_customers: %d user stubs retrieved, fetching full detail...",
+            self.crm_type,
+            len(raw_stubs),
+        )
+
+        # ── Step 2: fetch full detail per user (rolesNames only present here) ──
+        detail_path_tpl = self._get_endpoint("customer_by_id")
+        detailed: List[Dict[str, Any]] = []
+
+        for stub in raw_stubs:
+            user_id: Optional[str] = stub.get("id")
+            if not user_id:
+                continue
+            path = detail_path_tpl.replace("{customer_id}", user_id)
+            try:
+                detail = await self._client.request("GET", path)
+                detailed.append(detail)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] fetch_customers: could not fetch detail for user_id=%s — skipping. %s",
+                    self.crm_type,
+                    user_id,
+                    exc,
+                )
+
+        # ── Step 3: filter by role ──
+        customers_raw = [
+            u for u in detailed
+            if _CUSTOMER_ROLE in u.get("rolesNames", {}).values()
+        ]
+
+        logger.info(
+            "[%s] fetch_customers: %d/%d users have role '%s'",
+            self.crm_type,
+            len(customers_raw),
+            len(detailed),
+            _CUSTOMER_ROLE,
+        )
+
+        # ── Step 4: map to unified domain models ──
+        mapped_items = self._mapper.map_customers(customers_raw)
+        return PaginatedResult(items=mapped_items, page=1, per_page=per_page, has_more=False)
+
     async def fetch_organizations(self, page: int = 1, per_page: int = 100) -> PaginatedResult:
         self._assert_authenticated()
         path = self._get_endpoint("organizations")
@@ -74,9 +157,6 @@ class EspoCrmAdapter(BaseCrmAdapter):
     async def verify_connection(self) -> Dict[str, Any]:
         """
         Hit the token-validation endpoint declared in crm_adapters.yaml.
-
-        EspoCRM returns the current user's profile on success, giving us
-        both proof-of-auth and a useful log line (user id) for free.
 
         Returns
         -------
@@ -89,7 +169,7 @@ class EspoCrmAdapter(BaseCrmAdapter):
             If EspoCRM returns a non-2xx or the request fails entirely.
         """
         self._assert_authenticated()
-        path = self._get_endpoint("token-validation").rstrip("?")  # /api/v1/App/user
+        path = self._get_endpoint("token-validation").rstrip("?")
 
         try:
             result: Dict[str, Any] = await self._client.request("GET", path)

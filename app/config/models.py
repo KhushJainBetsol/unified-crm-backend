@@ -85,7 +85,7 @@ class FieldMappingConfig(BaseModel):
     ticket: Dict[str, str] = Field(default_factory=dict)
     agent: Dict[str, str] = Field(default_factory=dict)
     organization: Dict[str, str] = Field(default_factory=dict)
-
+    customer: Dict[str, str] = Field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
 # Top-level adapter config

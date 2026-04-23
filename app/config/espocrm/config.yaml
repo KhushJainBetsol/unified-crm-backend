@@ -30,11 +30,23 @@ endpoints:
     path: "/api/v1/User"
     method: "GET"
     default_params: {}
+  # Step 1 of fetch_customers: paginate all User stubs to collect IDs.
+  # rolesNames is NOT present in list responses — only in the detail payload.
+  customers:
+    path: "/api/v1/User"
+    method: "GET"
+    default_params: {}
+  # Step 2 of fetch_customers: fetch full User detail by ID.
+  # rolesNames (e.g. {"69b917db3281aa2e8": "Customer"}) is present here.
+  # Filtering to role == "Customer" happens in the adapter after this fetch.
+  customer_by_id:
+    path: "/api/v1/User/{customer_id}"
+    method: "GET"
+    default_params: {}
   organizations:
     path: "/api/v1/Account"
     method: "GET"
     default_params: {}
-
   token-validation:
     path: "/api/v1/App/user?"
     method: "GET"
@@ -53,6 +65,17 @@ field_mappings:
     organization_id: "accountId"
     description: "?description"
   agent:
+    id: "id"
+    email: "emailAddress"
+    first_name: "firstName"
+    last_name: "lastName"
+    active: "isActive"
+    created_at: "createdAt"
+    updated_at: "modifiedAt"
+  # Customers are regular Users with rolesNames containing "Customer".
+  # Role filtering is done in the adapter (not mappable from a dict value).
+  # phoneNumber and accountsIds are available in raw if needed downstream.
+  customer:
     id: "id"
     email: "emailAddress"
     first_name: "firstName"
