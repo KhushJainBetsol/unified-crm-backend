@@ -86,6 +86,7 @@ from sqlalchemy import select
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.crm_clients import fetch_crm_org_id  # ← NEW
 from app.credentials.async_manager import AsyncInfisicalCredentialManager
 from app.credentials.encryption import EncryptionService
 from app.credentials.exceptions import (
@@ -95,6 +96,8 @@ from app.credentials.exceptions import (
 from app.credentials.models import CrmCredentialEnvelope
 from app.models.crm_integration import CrmIntegration
 from app.models.tenant_source_systems import TenantSourceSystem
+from app.models.tenant import Tenant
+from app.models.source_system import SourceSystem
 from app.schemas.credentials import (
     CredentialStatusResponse,
     ProvisionCredentialsRequest,
@@ -157,23 +160,30 @@ class CredentialProvisioningService:
         """
         Validate permissions, then encrypt and store credentials for a NEW integration.
 
-        The permission check runs BEFORE any encryption or DB write.
-        If the API token/credentials lack the required permissions a
-        PermissionValidationError is raised immediately and nothing is stored.
-
         Steps
         -----
-        1. Check CRM permissions using the raw (un-encrypted) credentials.
-        2. Generate a fresh integration_id (uuid4).
-        3. Fetch the active AES key + version from Infisical.
-        4. Encrypt outbound secret dict → credential_enc.
-        5. Build webhook secret dict from request; encrypt if present, else NULL.
-        6. Insert a new CrmIntegration row with direct plain columns.
+        1. Fetch tenant name from DB using tenant_id.
+        2. Check CRM permissions using the raw (un-encrypted) credentials.
+        3. Generate a fresh integration_id (uuid4).
+        4. Fetch the active AES key + version from Infisical.
+        5. Encrypt outbound secret dict → credential_enc.
+        6. Build webhook secret dict from request; encrypt if present, else NULL.
+        7. Insert a new CrmIntegration row with direct plain columns.
+        8. Fetch CRM org ID + insert TenantSourceSystem row.
         """
         crm_type = request.crm_type.strip().lower()
         base_url = str(request.base_url).rstrip("/")
 
-        # ── 1. Permission gate — nothing is written if this raises ─────────
+        # ── 1. Fetch tenant name ───────────────────────────────────────────
+        tenant_result = await self._db.execute(
+            select(Tenant).where(Tenant.id == tenant_id)
+        )
+        tenant = tenant_result.scalars().first()
+        if tenant is None:
+            raise ValueError(f"Tenant with id={tenant_id} not found.")
+        tenant_name = tenant.name
+
+        # ── 2. Permission gate — nothing is written if this raises ─────────
         await self._check_permissions(
             crm_type=crm_type,
             base_url=base_url,
@@ -182,15 +192,15 @@ class CredentialProvisioningService:
 
         integration_id = uuid4()
 
-        # ── 2. Fetch AES key ──────────────────────────────────────────────
+        # ── 3. Fetch AES key ──────────────────────────────────────────────
         version, raw_key = await self._key_manager.get_active_key_and_version()
         enc_service = EncryptionService(raw_key=raw_key, key_version=version)
 
-        # ── 3. Encrypt outbound credentials ───────────────────────────────
+        # ── 4. Encrypt outbound credentials ───────────────────────────────
         secret_dict = request.credentials.to_secret_dict()
         credential_enc = enc_service.encrypt(json.dumps(secret_dict)).to_db_string()
 
-        # ── 4. Encrypt inbound webhook secrets (nullable) ─────────────────
+        # ── 5. Encrypt inbound webhook secrets (nullable) ─────────────────
         webhook_secret_dict = request.build_webhook_secret_dict()
         webhook_secrets_enc: str | None = None
         if webhook_secret_dict:
@@ -198,10 +208,10 @@ class CredentialProvisioningService:
                 json.dumps(webhook_secret_dict)
             ).to_db_string()
 
-        # ── 5. Resolve plain column values ────────────────────────────────
+        # ── 6. Resolve plain column values ────────────────────────────────
         auth_type = request.credentials.auth_type
 
-        # ── 6. Insert ─────────────────────────────────────────────────────
+        # ── 7. Insert CrmIntegration row ──────────────────────────────────
         row = await self._create_row(
             integration_id=integration_id,
             tenant_id=tenant_id,
@@ -213,12 +223,40 @@ class CredentialProvisioningService:
             webhook_secrets_enc=webhook_secrets_enc,
         )
 
-        
-        await self._db.execute(
-            update(TenantSourceSystem)
-            .where(TenantSourceSystem.tenant_id == tenant_id)
-            .values(integration_id=integration_id)
+        # ── 8. Fetch CRM org ID + insert TenantSourceSystem row ───────────
+        crm_org_id: str | None = await fetch_crm_org_id(
+            system_name=crm_type,
+            tenant_name=tenant_name,
         )
+
+        if crm_org_id is None:
+            logger.warning(
+                "Could not fetch CRM org id for tenant='%s' system='%s' — "
+                "crm_org_id will be NULL and must be back-filled manually.",
+                tenant_name,
+                crm_type,
+            )
+
+        ss_result = await self._db.execute(
+            select(SourceSystem).where(SourceSystem.system_name == crm_type)
+        )
+        source_system = ss_result.scalars().first()
+
+        if source_system is None:
+            logger.warning(
+                "No SourceSystem row found for crm_type='%s' — "
+                "skipping TenantSourceSystem insert.",
+                crm_type,
+            )
+        else:
+            tss_row = TenantSourceSystem(
+                tenant_id=tenant_id,
+                source_system_id=source_system.id,
+                integration_id=integration_id,
+                crm_org_id=crm_org_id,
+                is_active=True,
+            )
+            self._db.add(tss_row)
 
         await self._db.commit()
         await self._db.refresh(row)

@@ -46,29 +46,17 @@ async def svc_create_tenant(
     db: AsyncSession,
     name: str,
     contact_email: str,
-    source_system_ids: List[int],
 ) -> dict:
     """
-    Create a new tenant and assign the source systems they use.
+    Create a new tenant.
 
     Steps:
       1. Generate URL-friendly slug from tenant name
       2. Check slug uniqueness
       3. Insert tenant row
       4. Seed shared TenantRealm row (idempotent)
-      5. Validate all provided source_system_ids exist
-      6. For each selected source system:
-           a. Insert TenantSourceSystem row
-           b. Call the CRM API to fetch the org / account ID  ← NEW
-           c. Persist crm_org_id on the row (NULL on failure) ← NEW
-      7. Return the new tenant with assigned source systems
+      5. Return the new tenant
     """
-    if not source_system_ids:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "At least one source system must be selected",
-        )
-
     try:
         # Step 1 — slug
         slug = name.lower().replace(" ", "-").replace("_", "-")
@@ -85,7 +73,7 @@ async def svc_create_tenant(
         # Step 3 — insert tenant
         tenant = Tenant(name=name, slug=slug, contact_email=contact_email)
         db.add(tenant)
-        await db.flush()  # populate tenant.id
+        await db.flush()
 
         # Step 4 — seed shared realm (idempotent)
         existing_realm = await db.execute(
@@ -100,50 +88,6 @@ async def svc_create_tenant(
             )
             db.add(realm)
 
-        # Step 5 — validate all source_system_ids exist in DB
-        ss_result = await db.execute(
-            select(SourceSystem).where(SourceSystem.id.in_(source_system_ids))
-        )
-        found_systems = ss_result.scalars().all()
-        found_ids = {s.id for s in found_systems}
-        missing = set(source_system_ids) - found_ids
-        if missing:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"Source system ID(s) not found: {sorted(missing)}",
-            )
-
-        # Step 6 — insert TenantSourceSystem rows and fetch CRM org IDs
-        #
-        # The CRM lookup is intentionally done OUTSIDE the DB transaction
-        # block so that a slow / failing CRM does not hold a DB connection
-        # open or block the commit.  crm_org_id is set to NULL on any
-        # failure and can be back-filled later without re-creating the tenant.
-        tss_rows: list[TenantSourceSystem] = []
-        for ss in found_systems:
-            # Fetch org ID from the external CRM — soft-fails, never raises
-            crm_org_id: str | None = await fetch_crm_org_id(
-                system_name=ss.system_name,
-                tenant_name=name,
-            )
-
-            if crm_org_id is None:
-                logger.warning(
-                    "Could not fetch CRM org id for tenant='%s' system='%s' — "
-                    "crm_org_id will be NULL and must be back-filled manually.",
-                    name,
-                    ss.system_name,
-                )
-
-            row = TenantSourceSystem(
-                tenant_id=tenant.id,
-                source_system_id=ss.id,
-                is_active=True,
-                crm_org_id=crm_org_id,  # None if lookup failed
-            )
-            db.add(row)
-            tss_rows.append(row)
-
         await db.commit()
 
     except HTTPException:
@@ -157,35 +101,19 @@ async def svc_create_tenant(
             "Failed to create tenant due to an internal error.",
         ) from exc
 
-    logger.info(
-        "Created tenant '%s' (id=%s) with source systems %s",
-        slug,
-        tenant.id,
-        [s.system_name for s in found_systems],
-    )
+    logger.info("Created tenant '%s' (id=%s)", slug, tenant.id)
 
     return {
         "tenant": {
             "id": str(tenant.id),
             "name": tenant.name,
             "slug": tenant.slug,
-            "contact_email":tenant.contact_email,
+            "contact_email": tenant.contact_email,
             "is_active": tenant.is_active,
             "created_at": tenant.created_at,
         },
-        "source_systems": [
-            {
-                "id": ss.id,
-                "system_name": ss.system_name,
-                # Surface whether the CRM lookup succeeded so the caller
-                # can decide whether manual back-filling is needed.
-                "crm_org_id": row.crm_org_id,
-                "crm_org_id_fetched": row.crm_org_id is not None,
-            }
-            for ss, row in zip(found_systems, tss_rows)
-        ],
         "message": (
-            f"Tenant '{tenant.name}' created with {len(found_systems)} source system(s). "
+            f"Tenant '{tenant.name}' created. "
             "Use POST /super-admin/admins/invite to invite an admin."
         ),
     }
