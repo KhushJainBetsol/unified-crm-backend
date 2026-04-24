@@ -1,8 +1,5 @@
 """
 app/integrations/webhooks/service.py
-
-Receives RawWebhookPayload (plain dataclass, no ORM) + the open session
-from the router. No new session opened here.
 """
 
 from __future__ import annotations
@@ -10,52 +7,47 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.integrations.normalizer.espo_normalizer import normalize_espo_ticket
-from app.integrations.normalizer.zammad_normalizer import normalize_zammad_ticket
+from app.integrations.normalizer.normalizer import normalize_ticket, normalize_tickets
+from app.config.loader import ConfigLoader
+from app.config.models import AdapterConfig
 from app.integrations.webhooks.models import RawWebhookPayload
 from app.repositories.ticket_repository import TicketRepository
 from app.services.sync_service import SyncService
 
 logger = logging.getLogger(__name__)
 
+# Map source_system name → config path relative to ConfigLoader base_dir.
+# Add a new entry here whenever a new CRM integration is added.
+_CONFIG_PATH_BY_SOURCE: dict[str, str] = {
+    "espocrm": "espocrm/config.yaml",
+    "zammad": "zammad/config.yaml",
+}
+
+# Module-level loader; base_dir resolved relative to this file's package root.
+# Adjust the path if your config directory lives elsewhere.
+_config_loader = ConfigLoader(base_dir=Path(__file__).resolve().parent.parent / "config")
+
 
 # ── Custom Exceptions ──────────────────────────────────────────────────────────
 
 
 class WebhookProcessingError(Exception):
-    """
-    Raised when a webhook record fails processing in a way that is
-    meaningful enough to log at ERROR level with full context.
-    Wraps the original exception so the caller always has the root cause.
-    """
-
     def __init__(self, message: str, original: BaseException | None = None) -> None:
         super().__init__(message)
         self.original = original
 
 
 class NormalizationError(WebhookProcessingError):
-    """
-    Raised when a raw CRM payload cannot be mapped to a normalised ticket.
-    Use case: the CRM schema changed, a required field is missing, or a
-    field contains an unexpected type (e.g. status is null).
-    Separated from the generic error so callers can apply different retry
-    or alerting logic in the future.
-    """
+    pass
 
 
 class UnresolvableStatusError(WebhookProcessingError):
-    """
-    Raised when the status string from the CRM has no matching row in the
-    statuses lookup table.
-    Use case: a new status was added in the CRM but not yet mirrored in the
-    unified app's configuration. This is a data/config error, not a code bug,
-    so it deserves its own exception class to make alerting easier.
-    """
+    pass
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -65,20 +57,9 @@ async def handle_raw_webhook(
     payload: RawWebhookPayload,
     session: AsyncSession,
 ) -> None:
-    """
-    Entry point from router. Never raises — errors are logged so
-    the router always returns 200 and CRMs never retry a valid delivery.
-
-    Why swallow all exceptions here?
-    CRMs treat any non-2xx response as a failed delivery and will retry,
-    often with exponential back-off. Retrying a malformed payload or an
-    unknown source system will never succeed and wastes resources on both
-    sides. We log everything we need for debugging and always ACK.
-    """
     try:
         await _dispatch(payload, session)
     except WebhookProcessingError as exc:
-        # Already logged with context where raised; log the summary here.
         logger.error(
             "Webhook processing error | source=%s | event=%s | reason=%s | original=%s",
             payload.source_system,
@@ -87,7 +68,6 @@ async def handle_raw_webhook(
             exc.original,
         )
     except Exception as exc:
-        # Truly unexpected — log the full traceback.
         logger.exception(
             "Unhandled exception during webhook processing | source=%s | event=%s",
             payload.source_system,
@@ -100,18 +80,29 @@ async def _dispatch(payload: RawWebhookPayload, session: AsyncSession) -> None:
     """
     Routes the payload to the correct CRM handler.
 
-    Why a match statement instead of a dict of callables?
-    Each handler has a different signature and setup needs. A match keeps
-    the branching explicit and readable; new CRMs are added in one place.
+    Loads the AdapterConfig once here and passes it to each handler so
+    neither _handle_espo nor _handle_zammad need to touch the loader.
+    This also makes config-load failures surface early with a clear error
+    rather than mid-loop inside a per-record handler.
     """
+    config_path = _CONFIG_PATH_BY_SOURCE.get(payload.source_system)
+    if config_path is None:
+        logger.error(
+            "No handler registered for source_system=%s — "
+            "check the CrmIntegration configuration",
+            payload.source_system,
+        )
+        return
+
+    # Load (or return cached) AdapterConfig for this CRM.
+    config = _config_loader.load_adapter_config(config_path)
+
     match payload.source_system:
         case "espocrm":
-            await _handle_espo(payload, session)
+            await _handle_espo(payload, session, config)
         case "zammad":
-            await _handle_zammad(payload, session)
+            await _handle_zammad(payload, session, config)
         case _:
-            # Not a retryable error — the source_system value is baked into
-            # the integration record, so retrying will produce the same result.
             logger.error(
                 "No handler registered for source_system=%s — "
                 "check the CrmIntegration configuration",
@@ -123,17 +114,6 @@ async def _dispatch(payload: RawWebhookPayload, session: AsyncSession) -> None:
 
 
 def _extract_record_id(raw: dict[str, Any], source: str, id_key: str = "id") -> str | None:
-    """
-    Safely extracts and validates the CRM record ID from a raw payload dict.
-
-    Why a helper?
-    Both EspoCRM and Zammad records must have an ID to be processable. The
-    extraction + validation logic is identical; centralising it avoids
-    drift between the two handlers and makes testing straightforward.
-
-    Returns None (instead of raising) so the caller can log and skip
-    without interrupting the rest of the batch.
-    """
     crm_id = str(raw.get(id_key, "")).strip()
     if not crm_id:
         logger.error(
@@ -147,15 +127,6 @@ def _extract_record_id(raw: dict[str, Any], source: str, id_key: str = "id") -> 
 
 
 def _parse_iso_timestamp(value: Any, field_name: str, context: str) -> datetime | None:
-    """
-    Attempts to parse an ISO-8601 timestamp string, logging a warning on failure.
-
-    Why a helper?
-    Timestamp parsing appears in both the stale-update guard and in field
-    mapping. Using a shared helper ensures consistent warning messages and
-    avoids silent data loss — if parsing fails we return None rather than
-    crashing the whole record.
-    """
     if not value:
         return None
     try:
@@ -170,15 +141,11 @@ def _parse_iso_timestamp(value: Any, field_name: str, context: str) -> datetime 
 # ── EspoCRM ────────────────────────────────────────────────────────────────────
 
 
-async def _handle_espo(payload: RawWebhookPayload, session: AsyncSession) -> None:
-    """
-    Fans out per-record processing for EspoCRM events.
-
-    Why per-record try/except?
-    A batch webhook can contain multiple records. One malformed record must
-    not abort processing for the rest of the batch. Each failure is logged
-    independently so ops can replay or fix only the affected record.
-    """
+async def _handle_espo(
+    payload: RawWebhookPayload,
+    session: AsyncSession,
+    config: AdapterConfig,      # FIX: was missing; config was undefined in callee scope
+) -> None:
     sync = SyncService(session)
     repo = TicketRepository(session)
     source_system_id = payload.source_system_id
@@ -192,7 +159,7 @@ async def _handle_espo(payload: RawWebhookPayload, session: AsyncSession) -> Non
         try:
             match payload.event_type:
                 case "Case.create":
-                    await _espo_create(raw, source_system_id, tenant_id, sync, repo)
+                    await _espo_create(raw, source_system_id, tenant_id, sync, repo, config)
                 case "Case.delete":
                     await _espo_delete(crm_ticket_id, source_system_id, tenant_id, repo)
                 case _:
@@ -200,7 +167,6 @@ async def _handle_espo(payload: RawWebhookPayload, session: AsyncSession) -> Non
                         crm_ticket_id, raw, source_system_id, tenant_id, sync, repo
                     )
         except (NormalizationError, UnresolvableStatusError) as exc:
-            # Config/data errors: log clearly, no stack trace needed.
             logger.error(
                 "espo: skipping id=%s event=%s — %s",
                 crm_ticket_id,
@@ -208,7 +174,6 @@ async def _handle_espo(payload: RawWebhookPayload, session: AsyncSession) -> Non
                 exc,
             )
         except Exception as exc:
-            # Unexpected errors: full traceback for debugging.
             logger.exception(
                 "espo: unexpected error id=%s event=%s",
                 crm_ticket_id,
@@ -223,18 +188,13 @@ async def _espo_create(
     tenant_id: uuid.UUID | None,
     sync: SyncService,
     repo: TicketRepository,
+    config: AdapterConfig,      # FIX: added — was undefined at call site
 ) -> None:
-    """
-    Handles Case.create events from EspoCRM.
-
-    Why raise NormalizationError instead of returning early?
-    Returning early silently drops the record. Raising a typed exception
-    lets the caller (_handle_espo) decide how to handle it — currently it
-    logs at ERROR, but in the future it could dead-letter the record or
-    trigger an alert, without changing this function.
-    """
     try:
-        normalized = normalize_espo_ticket(raw)
+        # FIX: was normalize_tickets (batch function) called on a single dict.
+        # normalize_ticket returns one NormalizedTicket; normalize_tickets
+        # expects a list[dict] and returns list[NormalizedTicket].
+        normalized = normalize_ticket(raw, "espocrm", config)
     except (KeyError, ValueError) as exc:
         raise NormalizationError(
             f"espo: normalisation failed for id={raw.get('id')!r}", original=exc
@@ -290,19 +250,6 @@ async def _espo_partial_update(
     sync: SyncService,
     repo: TicketRepository,
 ) -> None:
-    """
-    Handles Case.update (and any unrecognised) events from EspoCRM.
-
-    Stale-update guard: if the incoming modifiedAt is not newer than
-    what we have stored, the update is silently skipped. This prevents
-    out-of-order webhook deliveries from overwriting newer data.
-
-    Why warn (not error) when the ticket is missing?
-    A missing ticket on update most likely means the create webhook was
-    dropped or processed out of order. It is a recoverable gap — the next
-    full sync will fill it in. ERROR would create alert noise for a
-    transient condition.
-    """
     existing = await repo.get_by_crm_id(crm_ticket_id, source_system_id, tenant_id=tenant_id)
     if not existing:
         logger.warning(
@@ -312,7 +259,6 @@ async def _espo_partial_update(
         )
         return
 
-    # Stale-update guard
     incoming_ts = _parse_iso_timestamp(
         raw.get("modifiedAt"), "modifiedAt", f"espo id={crm_ticket_id}"
     )
@@ -346,7 +292,6 @@ async def _espo_partial_update(
             elif existing.status_id != status_id:
                 updates["closed_at"] = None
         else:
-            # Warn, not error — the rest of the update is still valid.
             logger.warning(
                 "espo: cannot resolve status=%r for id=%s — status field skipped",
                 raw["status"],
@@ -394,14 +339,6 @@ async def _espo_delete(
     tenant_id: uuid.UUID | None,
     repo: TicketRepository,
 ) -> None:
-    """
-    Handles Case.delete events from EspoCRM.
-
-    Why treat 'already soft-deleted' as INFO, not a warning?
-    Duplicate delete webhooks are common — the CRM may retry or fire
-    the event multiple times. Idempotent handling (skip if already deleted)
-    is correct behaviour, not an anomaly worth surfacing in alerts.
-    """
     existing = await repo.get_by_crm_id(crm_ticket_id, source_system_id, tenant_id=tenant_id)
     if not existing:
         logger.warning(
@@ -419,7 +356,7 @@ async def _espo_delete(
     await repo.soft_delete(
         ticket=existing,
         deleted_by_id=None,
-        is_deleted_by_crm=True,  # fixed: was deleted_by_source=True
+        is_deleted_by_crm=True,
     )
     logger.info("espo: Case.delete id=%s — soft deleted", crm_ticket_id)
 
@@ -427,20 +364,11 @@ async def _espo_delete(
 # ── Zammad ─────────────────────────────────────────────────────────────────────
 
 
-async def _handle_zammad(payload: RawWebhookPayload, session: AsyncSession) -> None:
-    """
-    Fans out per-record processing for Zammad events.
-
-    Why extract ticket_raw = raw.get("ticket", raw)?
-    Zammad wraps the ticket object under a "ticket" key in some webhook
-    shapes but sends it flat in others. Falling back to raw itself handles
-    both shapes without requiring separate handlers.
-    Why raise NormalizationError / UnresolvableStatusError up to here?
-    These are config/data issues. Logging them at ERROR here (rather than
-    letting them propagate to handle_raw_webhook) gives us per-record
-    context (crm_ticket_id, event) in the log line, which is far more
-    useful when debugging a specific delivery failure.
-    """
+async def _handle_zammad(
+    payload: RawWebhookPayload,
+    session: AsyncSession,
+    config: AdapterConfig,      # FIX: was missing; config was undefined in callee scope
+) -> None:
     sync = SyncService(session)
     repo = TicketRepository(session)
     source_system_id = payload.source_system_id
@@ -452,13 +380,12 @@ async def _handle_zammad(payload: RawWebhookPayload, session: AsyncSession) -> N
         if crm_ticket_id is None:
             continue
 
-        # Both NormalizationError and UnresolvableStatusError must be raised
-        # and caught inside this single try/except so per-record context is
-        # preserved in the log line. Previously they were raised before the
-        # inner try, causing them to escape to handle_raw_webhook unhandled.
         try:
             try:
-                normalized = normalize_zammad_ticket(ticket_raw)
+                # FIX: was normalize_zammad_ticket(ticket_raw) — that function was
+                # deleted when the normalizers were consolidated. Use the unified
+                # normalize_ticket, passing the loaded AdapterConfig.
+                normalized = normalize_ticket(ticket_raw, "zammad", config)
             except (KeyError, ValueError) as exc:
                 raise NormalizationError(
                     f"zammad: normalisation failed for id={crm_ticket_id}", original=exc
@@ -487,7 +414,6 @@ async def _handle_zammad(payload: RawWebhookPayload, session: AsyncSession) -> N
                 tenant_id=tenant_id,
                 data={
                     "tenant_id": tenant_id,
-
                     "title": normalized.title,
                     "description": normalized.description,
                     "status_id": status_id,

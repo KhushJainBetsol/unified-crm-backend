@@ -18,12 +18,20 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from pathlib import Path
 
 from app.integrations.espo.client import EspoClient, EspoClientError
-from app.integrations.normalizer import NormalizedTicket, normalize_tickets
-from app.integrations.normalizer.espo_normalizer import normalize_espo_tickets
+from app.integrations.normalizer import NormalizedTicket
+from app.integrations.normalizer.normalizer import normalize_ticket, normalize_tickets
+from app.config.loader import ConfigLoader
 
 logger = logging.getLogger(__name__)
+
+_CONFIG_BASE_DIR = Path(__file__).parent.parent.parent / "config"
+
+
+def _get_espo_config():
+    return ConfigLoader(base_dir=_CONFIG_BASE_DIR).load_adapter_config("espocrm/config.yaml")
 
 
 class EspoService:
@@ -42,30 +50,22 @@ class EspoService:
         except EspoClientError as exc:
             logger.error("Failed to fetch cases from EspoCRM: %s", exc)
             raise
-        normalized = normalize_tickets(raw_tickets, source_system="espocrm")
+        config = _get_espo_config()
+        normalized = normalize_tickets(raw_tickets, "espocrm", config)
         logger.info(
             "EspoCRM full sync: %d raw → %d normalized tickets",
             len(raw_tickets), len(normalized),
         )
         return normalized
 
-    def normalize_raw_tickets(
-        self,
-        raw_tickets: list[dict],
-    ) -> list[NormalizedTicket]:
+    def normalize_raw_tickets(self, raw_tickets: list[dict]) -> list[NormalizedTicket]:
         """
         Normalize an already-fetched list of raw EspoCRM case dicts.
 
-        Used by the multitenant scheduler after fetching account-scoped cases
-        so the scheduler doesn't need to call the client again just to normalize.
-
-        Args:
-            raw_tickets: Raw case dicts returned by EspoClient.
-
-        Returns:
-            List of NormalizedTicket objects.
+        Used by the multitenant scheduler after fetching account-scoped cases.
         """
-        normalized = normalize_espo_tickets(raw_tickets)
+        config = _get_espo_config()
+        normalized = normalize_tickets(raw_tickets, "espocrm", config)
         logger.info(
             "EspoCRM normalize_raw_tickets: %d raw → %d normalized",
             len(raw_tickets), len(normalized),
@@ -79,8 +79,8 @@ class EspoService:
             logger.error("Failed to fetch EspoCRM case %s: %s", ticket_id, exc)
             return None
         try:
-            from app.integrations.normalizer.espo_normalizer import normalize_espo_ticket
-            return normalize_espo_ticket(raw)
+            config = _get_espo_config()
+            return normalize_ticket(raw, "espocrm", config)
         except (KeyError, ValueError) as exc:
             logger.error("Failed to normalize EspoCRM case %s: %s", ticket_id, exc)
             return None
@@ -93,7 +93,8 @@ class EspoService:
         except EspoClientError as exc:
             logger.error("Failed to fetch EspoCRM cases since %s: %s", since_str, exc)
             raise
-        normalized = normalize_tickets(raw_tickets, source_system="espocrm")
+        config = _get_espo_config()
+        normalized = normalize_tickets(raw_tickets, "espocrm", config)
         logger.info(
             "EspoCRM incremental sync: %d raw → %d normalized tickets",
             len(raw_tickets), len(normalized),
