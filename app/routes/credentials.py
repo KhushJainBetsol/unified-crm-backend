@@ -8,6 +8,7 @@ Endpoints
 POST   /api/v1/integrations/                               → provision
 PATCH  /api/v1/integrations/{integration_id}/credentials   → partial update
 GET    /api/v1/integrations/{integration_id}/credentials/status
+GET    /api/v1/integrations/{integration_id}/verify        → on-demand health check
 POST   /api/v1/integrations/{integration_id}/credentials/rotate
 DELETE /api/v1/integrations/{integration_id}/credentials   → revoke
 
@@ -321,6 +322,52 @@ async def get_credential_status(
         _handle_service_error(exc, integration_id)
 
 
+@router.get(
+    "/{integration_id}/verify",
+    summary="On-demand connection health check",
+    description=(
+        "Opens the CRM adapter (authenticate()) and calls verify_connection() "
+        "against the live CRM instance. Returns `{integration_id, status: 'verified'}` "
+        "on success or a **502** if the CRM rejects the connection."
+    ),
+)
+async def verify_integration(
+    integration_id: UUID,
+    current_user=Depends(get_current_user),
+    service: CredentialProvisioningService = Depends(get_provisioning_service),
+    factory: CrmAdapterFactory = Depends(get_adapter_factory),
+) -> dict:
+    """
+    Steps
+    -----
+    1. Confirm the integration row exists (raises 404 if not).
+    2. Open the adapter and call verify_connection() against the live CRM.
+       On failure → 502 with the rejection reason.
+    3. Return {integration_id, status: "verified"}.
+    """
+    # ── 1. Confirm the row exists ─────────────────────────────────────────
+    try:
+        await service.get_status(integration_id=integration_id)
+    except Exception as exc:
+        _handle_service_error(exc, integration_id)
+
+    # ── 2. Live adapter check ─────────────────────────────────────────────
+    try:
+        await _verify_adapter_connection(integration_id, factory)
+    except Exception as exc:
+        logger.warning(
+            "Verify check failed for integration_id='%s': %s",
+            integration_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Connection verification failed: {exc}",
+        )
+
+    return {"integration_id": str(integration_id), "status": "verified"}
+
+
 @router.post(
     "/{integration_id}/credentials/rotate",
     summary="Re-encrypt credentials with the current active key version",
@@ -351,16 +398,16 @@ async def rotate_credentials(
 #         "Pass ?wipe=true to also null out the encrypted credential blob."
 #     ),
 # )
-async def revoke_credentials(
-    integration_id: UUID,
-    wipe: bool = Query(
-        default=False,
-        description="If true, nulls out credential_enc (hard wipe).",
-    ),
-    current_user=Depends(get_current_user),
-    service: CredentialProvisioningService = Depends(get_provisioning_service),
-) -> None:
-    try:
-        await service.revoke(integration_id=integration_id, wipe=wipe)
-    except Exception as exc:
-        _handle_service_error(exc, integration_id)
+# async def revoke_credentials(
+#     integration_id: UUID,
+#     wipe: bool = Query(
+#         default=False,
+#         description="If true, nulls out credential_enc (hard wipe).",
+#     ),
+#     current_user=Depends(get_current_user),
+#     service: CredentialProvisioningService = Depends(get_provisioning_service),
+# ) -> None:
+#     try:
+#         await service.revoke(integration_id=integration_id, wipe=wipe)
+#     except Exception as exc:
+#         _handle_service_error(exc, integration_id)
