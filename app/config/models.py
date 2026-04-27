@@ -114,15 +114,32 @@ class AdapterConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Frontend Auth Type Metadata
+# ---------------------------------------------------------------------------
+
+class AuthTypeMetadata(BaseModel):
+    """Metadata for a single authentication strategy supported by a CRM."""
+    value: str = Field(..., description="Auth strategy identifier (e.g., 'api_token', 'oauth2')")
+    label: str = Field(..., description="Human-readable label for UI display")
+    icon: str = Field(..., description="Single character icon/badge for UI")
+
+
+# ---------------------------------------------------------------------------
 # Master registry entry (from crm_adapters.yaml)
 # ---------------------------------------------------------------------------
 
 class AdapterRegistryEntry(BaseModel):
     """One entry in crm_adapters.yaml under the 'adapters' key."""
-    display_name: str
-    config_path: str
-    adapter_class: str  # fully-qualified importable class, e.g. "crm.adapters.zammad.adapter.ZammadAdapter"
+    display_name: str = Field(..., description="Human-readable name for UI display")
+    config_path: str = Field(..., description="Path to adapter config YAML relative to config base dir")
+    adapter_class: str = Field(..., description="Fully-qualified importable class path")
+    description: Optional[str] = Field(default=None, description="Short description of the CRM")
+    default_base_url: Optional[str] = Field(default=None, description="Example base URL for this CRM")
     supported_capabilities: List[str] = Field(default_factory=list)
+    supported_auth_types: List[AuthTypeMetadata] = Field(default_factory=list, description="Available auth strategies")
+    webhook_model: Optional[str] = Field(default=None, description="Webhook model: 'shared' or 'per_event'")
+    webhook_instructions: List[str] = Field(default_factory=list, description="Step-by-step webhook setup instructions")
+    auth_instructions: Dict[str, List[str]] = Field(default_factory=dict, description="Auth-type-specific instructions")
 
 
 class AdapterRegistryManifest(BaseModel):

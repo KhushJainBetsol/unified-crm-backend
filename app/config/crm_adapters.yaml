@@ -2,24 +2,124 @@
 # Master registry of all supported CRM adapters.
 # Each entry declares the adapter type, its config file path, and the
 # importable Python class that implements BaseCrmAdapter.
+# Also includes frontend metadata: descriptions, auth types, instructions, webhooks.
 
 adapters:
   zammad:
     display_name: "Zammad"
+    description: "Open-source helpdesk & ticketing"
     config_path: "zammad/config.yaml"
     adapter_class: "app.adapters.zammad.adapter.ZammadAdapter"
+    default_base_url: "https://support.yourcompany.com"
     supported_capabilities:
       - fetch_tickets
       - fetch_agents
       - fetch_ticket_by_id
       - fetch_organizations
+    
+    # Frontend auth types
+    supported_auth_types:
+      - value: "api_token"
+        label: "API Token"
+        icon: "T"
+      - value: "basic_auth"
+        label: "Basic Auth"
+        icon: "U"
+    
+    # Webhook configuration
+    webhook_model: "shared"  # shared vs per_event
+    webhook_instructions:
+      - "Webhook setup"
+      - "Go to Admin → System → Webhooks."
+      - "Click 'Add Webhook'."
+      - "Enter a name for this webhook (e.g., 'Dashboard Ingest')."
+      - "Paste the provided Endpoint URL into the URL field."
+      - "Generate a random secret token, save it securely, and paste it into our dashboard in the Webhook Secret field."
+      - "Set SSL Verification to 'yes'."
+      - "Click Submit to create the webhook."
+      - "Trigger setup"
+      - "Next, set up a Trigger to connect the webhook to events:"
+      - "Go to Admin → System → Triggers."
+      - "Click 'Add Trigger'."
+      - "Set conditions for when the trigger fires (e.g., 'Action is updated' or 'Ticket created')."
+      - "Under 'Execute changes on objects', select 'Webhook' and choose the webhook you just created."
+      - "Click Submit to complete the trigger setup."
+    
+    # Auth type specific instructions
+    auth_instructions:
+      api_token:
+        - "Log in to your Zammad instance."
+        - "Click your avatar at the top-right → select Profile."
+        - "In the left sidebar, click Token Access."
+        - "Click the + Create button."
+        - "Enter a label."
+        - "Select the permissions you need (e.g. ticket.agent, admin)."
+        - "Optionally set an expiry date."
+        - "Click Create — copy the token immediately."
+      basic_auth:
+        - "No token creation needed."
+        - "Use your existing Zammad login credentials directly."
+        - "Format: username:password."
+        - "Note: Basic auth can be disabled by your admin — check Admin → Security → Authentication."
 
   espocrm:
     display_name: "EspoCRM"
+    description: "Self-hosted open-source CRM"
     config_path: "espocrm/config.yaml"
     adapter_class: "app.adapters.espocrm.adapter.EspoCrmAdapter"
+    default_base_url: "https://crm.yourcompany.com"
     supported_capabilities:
       - fetch_tickets
       - fetch_agents
       - fetch_ticket_by_id
       - fetch_contacts
+    
+    # Frontend auth types
+    supported_auth_types:
+      - value: "api_key"
+        label: "API Key (Recommended)"
+        icon: "K"
+      - value: "hmac"
+        label: "HMAC (API key + secret key)"
+        icon: "H"
+      - value: "basic_auth"
+        label: "Basic Auth"
+        icon: "U"
+    
+    # Webhook configuration
+    webhook_model: "per_event"  # shared vs per_event
+    webhook_instructions:
+      - "Go to Admin → Webhooks."
+      - "Click 'Create Webhook'."
+      - "Enter a name for this webhook."
+      - "Paste the provided Endpoint URL into the Webhook URL field."
+      - "Set the Payload Version to the latest available."
+      - "Configure event types: Select which entity events trigger this webhook (e.g., Lead.create, Lead.update)."
+      - "For each event, you may optionally set a per-event secret. Use the secrets provided in our dashboard."
+      - "Click Save to create the webhook."
+    
+    # Auth type specific instructions
+    auth_instructions:
+      api_key:
+        - "Log in to EspoCRM as Administrator."
+        - "Go to Admin (top-right menu) → API Users."
+        - "Click Create API User."
+        - "Enter a name."
+        - "Set the Role to define access."
+        - "Choose Authentication Method → API Key."
+        - "Click Save."
+        - "Copy the generated API Key."
+      hmac:
+        - "Log in to EspoCRM as Administrator."
+        - "Go to Admin (top-right menu) → API Users."
+        - "Click Create API User."
+        - "Enter a name and assign a Role."
+        - "Choose Authentication Method → HMAC."
+        - "Click Save."
+        - "Copy both the API Key and the Secret Key."
+        - "Paste the API Key into the 'API Key' field in our dashboard."
+        - "Note: The secret key is used internally for request signing and does not need to be stored here."
+      basic_auth:
+        - "No API user setup needed."
+        - "Use an existing EspoCRM user's login and password."
+        - "Note: The user must have API access enabled — go to Admin → Users → edit the user → check 'Allow API access'."

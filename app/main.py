@@ -30,6 +30,7 @@ from app.core.settings import get_settings
 # Routers
 from app.routes import sync, tickets, agents, customers, companies
 from app.routes.auth import router as auth_router
+from app.routes.config import router as config_router
 from app.routes.invitations import router as invitations_router
 from app.routes.tenants import router as tenants_router
 from app.routes.super_admin import router as super_admin_router
@@ -249,6 +250,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router,        prefix="/api/v1")
+app.include_router(config_router,      prefix="/api/v1")
 app.include_router(invitations_router, prefix="/api/v1")
 app.include_router(super_admin_router, prefix="/api/v1")
 app.include_router(tickets.router,     prefix="/api/v1")
