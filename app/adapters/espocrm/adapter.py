@@ -64,7 +64,7 @@ class EspoCrmAdapter(BaseCrmAdapter):
         raw_ticket = await self._client.request("GET", path)
         return self._mapper.to_ticket(raw_ticket)
 
-    async def fetch_agents(self, page: int = 1, per_page: int = 100) -> PaginatedResult:
+    async def fetch_agents(self, crm_org_id: str,page: int = 1, per_page: int = 100) -> PaginatedResult:
         """
         Fetch all EspoCRM users whose role is "Agent", scoped to the
         Account that matches this integration's crm_org_id.
@@ -152,7 +152,7 @@ class EspoCrmAdapter(BaseCrmAdapter):
 
         # ── Step 3: fetch all Contacts for this Account ───────────────────
         # crm_org_id is the EspoCRM Account UUID stored on the integration.
-        crm_org_id: Optional[str] = getattr(self, "_crm_org_id", None)
+        # crm_org_id: Optional[str] = self._crm_org_id
 
         if not crm_org_id:
             # No org scoping available — return all instance-wide agents.

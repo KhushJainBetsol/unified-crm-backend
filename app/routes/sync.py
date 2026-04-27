@@ -174,11 +174,12 @@ async def _sync_entities_via_adapter(
     and upsert them into the DB.  Returns a summary dict.
     """
     source_system_id = tss.source_system_id
+    crm_org_id = tss.crm_org_id
 
     try:
         adapter = await factory.create(str(tss.integration_id))
         async with adapter:
-            agents_result    = await adapter.fetch_agents()
+            agents_result    = await adapter.fetch_agents(crm_org_id)
             customers_result = await adapter.fetch_customers()
             orgs_result      = await adapter.fetch_organizations()
     except AdapterFactoryError as exc:
