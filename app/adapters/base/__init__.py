@@ -4,7 +4,7 @@ Base adapter layer public API.
 """
 
 from app.adapters.base.adapter import (
-    # AdapterError,
+    AdapterError,
     AuthenticationError,
     BaseCrmAdapter,
 )

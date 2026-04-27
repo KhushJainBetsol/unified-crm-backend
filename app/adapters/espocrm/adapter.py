@@ -193,7 +193,7 @@ class EspoCrmAdapter(BaseCrmAdapter):
             return PaginatedResult(items=[], page=1, per_page=per_page, has_more=False)
 
         # ── Step 4: cross-match agent emails against contact emails ───────
-        contact_emails: set[str] = {
+        contact_emails = {
             c["emailAddress"].lower()
             for c in contacts_raw
             if c.get("emailAddress")

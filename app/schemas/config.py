@@ -1,32 +1,13 @@
-"""
-app/schemas/config.py
-
-Pydantic schemas for CRM configuration endpoint.
-
-These schemas expose metadata about supported CRM adapters, including their
-authentication strategies and capabilities. This allows the frontend to
-dynamically display available CRMs and build credential input forms without
-having hardcoded values.
-
-Security
---------
-- Omits sensitive information (adapter class paths, HTTP configs, field mappings)
-- Only exposes public metadata intended for UI display
-"""
-
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class AuthTypeOptionSchema(BaseModel):
     """
     Metadata for a single authentication strategy option.
-    
-    The value field tells the frontend which auth type to request.
-    Frontend uses label and icon for UI display.
     """
     value: str = Field(
         ...,
@@ -44,21 +25,18 @@ class AuthTypeOptionSchema(BaseModel):
         examples=["T", "O", "U", "K", "H"]
     )
 
-    model_config = {"json_schema_extra": {
+    model_config = ConfigDict(json_schema_extra={
         "example": {
             "value": "api_token",
             "label": "API Token",
             "icon": "T"
         }
-    }}
+    })
 
 
 class CrmAuthStrategySchema(BaseModel):
     """
     Metadata about a CRM's authentication strategy.
-    
-    The strategy field tells the frontend which type of credentials to request.
-    Frontend is responsible for mapping strategies to required input fields.
     """
     strategy: str = Field(
         ...,
@@ -76,22 +54,18 @@ class CrmAuthStrategySchema(BaseModel):
         examples=["Token token=", "Bearer ", ""]
     )
 
-    model_config = {"json_schema_extra": {
+    model_config = ConfigDict(json_schema_extra={
         "example": {
             "strategy": "api_token",
             "token_header": "Authorization",
             "token_prefix": "Token token="
         }
-    }}
+    })
 
 
 class CrmInfoSchema(BaseModel):
     """
     Complete metadata for a single supported CRM adapter.
-    
-    Includes the CRM's display name, description, authentication options,
-    supported operations, and setup instructions. Frontend uses this to
-    populate CRM selection UI and determine available features.
     """
     crm_key: str = Field(
         ...,
@@ -128,19 +102,19 @@ class CrmInfoSchema(BaseModel):
     )
     webhook_model: Optional[str] = Field(
         ...,
-        description="Webhook configuration model: 'shared' (one secret for all events) or 'per_event' (secret per event type)",
+        description="Webhook configuration model: 'shared' or 'per_event'",
         examples=["shared", "per_event"]
     )
     webhook_instructions: List[str] = Field(
         ...,
-        description="Step-by-step instructions for configuring webhooks in the CRM"
+        description="Step-by-step instructions for configuring webhooks"
     )
     auth_instructions: Dict[str, List[str]] = Field(
         ...,
-        description="Auth-type-specific setup instructions (keyed by auth strategy value)"
+        description="Auth-type-specific setup instructions"
     )
 
-    model_config = {"json_schema_extra": {
+    model_config = ConfigDict(json_schema_extra={
         "example": {
             "crm_key": "zammad",
             "display_name": "Zammad",
@@ -152,58 +126,32 @@ class CrmInfoSchema(BaseModel):
                 "token_prefix": "Token token="
             },
             "supported_auth_options": [
-                {
-                    "value": "api_token",
-                    "label": "API Token",
-                    "icon": "T"
-                },
-                {
-                    "value": "basic_auth",
-                    "label": "Basic Auth",
-                    "icon": "U"
-                }
+                {"value": "api_token", "label": "API Token", "icon": "T"}
             ],
-            "supported_capabilities": [
-                "fetch_tickets",
-                "fetch_agents",
-                "fetch_ticket_by_id",
-                "fetch_organizations"
-            ],
+            "supported_capabilities": ["fetch_tickets"],
             "webhook_model": "shared",
-            "webhook_instructions": [
-                "Go to Admin → System → Webhooks.",
-                "Click 'Add Webhook'.",
-                "..."
-            ],
+            "webhook_instructions": ["Go to Admin...", "Click Add..."],
             "auth_instructions": {
-                "api_token": [
-                    "Log in to your Zammad instance.",
-                    "Click your avatar at the top-right → select Profile.",
-                    "..."
-                ]
+                "api_token": ["Log in...", "Generate key..."]
             }
         }
-    }}
+    })
 
 
 class SupportedCrmsResponse(BaseModel):
     """
     Response body for GET /api/v1/config/crms.
-    
-    Contains complete metadata for all supported CRM adapters currently
-    registered in the system. Frontend uses this during app initialization
-    to populate all UI elements related to CRM selection and configuration.
     """
     crms: List[CrmInfoSchema] = Field(
         ...,
-        description="List of all supported CRM adapters with complete metadata"
+        description="List of all supported CRM adapters"
     )
     total: int = Field(
         ...,
         description="Total number of supported CRMs"
     )
 
-    model_config = {"json_schema_extra": {
+    model_config = ConfigDict(json_schema_extra={
         "example": {
             "crms": [
                 {
@@ -217,23 +165,14 @@ class SupportedCrmsResponse(BaseModel):
                         "token_prefix": "Token token="
                     },
                     "supported_auth_options": [
-                        {
-                            "value": "api_token",
-                            "label": "API Token",
-                            "icon": "T"
-                        }
+                        {"value": "api_token", "label": "API Token", "icon": "T"}
                     ],
-                    "supported_capabilities": [
-                        "fetch_tickets",
-                        "fetch_agents",
-                        "fetch_ticket_by_id",
-                        "fetch_organizations"
-                    ],
+                    "supported_capabilities": ["fetch_tickets"],
                     "webhook_model": "shared",
-                    "webhook_instructions": [...],
-                    "auth_instructions": {...}
+                    "webhook_instructions": [], # Fixed: Changed from [...]
+                    "auth_instructions": {}      # Fixed: Changed from {...}
                 }
             ],
             "total": 1
         }
-    }}
+    })
