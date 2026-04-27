@@ -180,6 +180,64 @@ def _handle_service_error(exc: Exception, integration_id: UUID | None) -> None:
 # ---------------------------------------------------------------------------
 
 @router.post(
+    "/check-connection",
+    summary="Check CRM connection and validate credentials (without storing)",
+    description=(
+        "Tests if the provided credentials are valid and have required permissions. "
+        "Credentials are NOT stored in the database.\n\n"
+        "**Step 1 — Permission check:** The supplied credentials "
+        "are used to call the CRM's permission-inspection endpoint. If the token "
+        "lacks any required permission a **403** is returned with a "
+        "`failed_checks` list.\n\n"
+        "If the check passes, returns 200 with status 'connection_verified'. "
+        "Raw secrets are NEVER logged or returned."
+    ),
+)
+async def check_connection(
+    body: ProvisionCredentialsRequest,
+    current_user=Depends(get_current_user),
+    service: CredentialProvisioningService = Depends(get_provisioning_service),
+) -> dict:
+    """
+    Steps
+    -----
+    1. Permission gate  — validate CRM permissions.
+       PermissionValidationError → 403 with failed_checks list.
+    2. Return 200 with connection status if check passes.
+    
+    Note: Credentials are NOT stored. This is a read-only test endpoint.
+    This validates that the CRM credentials have the required permissions
+    before provisioning the integration.
+    """
+    # ── Step 1: Permission check (no DB write) ──────────────────────────────
+    try:
+        # Call the provision service's internal permission check
+        # This validates permissions without storing anything
+        crm_type = body.crm_type.strip().lower()
+        base_url = str(body.base_url).rstrip("/")
+        
+        await service._check_permissions(
+            crm_type=crm_type,
+            base_url=base_url,
+            request=body,
+        )
+    except Exception as exc:
+        _handle_service_error(exc, integration_id=None)
+
+    logger.info(
+        "Connection check passed for crm_type='%s' by user tenant_id='%s'.",
+        body.crm_type,
+        current_user.tenant_id,
+    )
+    return {
+        "status": "connection_verified",
+        "crm_type": body.crm_type,
+        "base_url": str(body.base_url),
+        "message": "Credentials validated. You can now provision this integration.",
+    }
+
+
+@router.post(
     "/",
     response_model=CredentialStatusResponse,
     status_code=status.HTTP_201_CREATED,
@@ -193,9 +251,8 @@ def _handle_service_error(exc: Exception, integration_id: UUID | None) -> None:
         "stored in the database.\n\n"
         "**Step 2 — Encrypt and store:** If permissions pass, credentials are "
         "encrypted and written to the database.\n\n"
-        "**Step 3 — Live verification:** The adapter opens a connection to the CRM "
-        "and calls `verify_connection()`. If the CRM rejects the credentials the "
-        "DB row is wiped and a **502** is returned.\n\n"
+        "Note: Connection verification is skipped here (run check-connection first "
+        "for safety).\n\n"
         "Raw secrets are NEVER logged or returned."
     ),
 )
@@ -203,7 +260,6 @@ async def provision_credentials(
     body: ProvisionCredentialsRequest,
     current_user=Depends(get_current_user),
     service: CredentialProvisioningService = Depends(get_provisioning_service),
-    factory: CrmAdapterFactory = Depends(get_adapter_factory),
 ) -> CredentialStatusResponse:
     """
     Steps
@@ -211,9 +267,8 @@ async def provision_credentials(
     1. Permission gate  — validate CRM permissions before any DB write.
        PermissionValidationError → 403 with failed_checks list.
     2. Encrypt + write credentials to DB.
-    3. Open the CRM adapter and call verify_connection() against the live CRM.
-       On rejection: wipe the DB row → 502.
-    4. Return 201 with integration metadata.
+    
+    Note: Does NOT verify connection. For safety, call check-connection first.
     """
     # ── Steps 1 + 2: Permission check then provision (encrypt → DB write) ─
     try:
@@ -226,36 +281,8 @@ async def provision_credentials(
 
     integration_id: UUID = result.integration_id
 
-    # ── Step 3: Verify credentials against the live CRM ──────────────────
-    try:
-        await _verify_adapter_connection(integration_id, factory)
-    except Exception as exc:
-        logger.warning(
-            "CRM rejected credentials for new integration_id='%s'; "
-            "wiping DB row. Reason: %s",
-            integration_id,
-            exc,
-        )
-        try:
-            await service.revoke(integration_id=integration_id, wipe=True)
-        except Exception as cleanup_exc:
-            logger.error(
-                "Failed to wipe integration row for integration_id='%s' "
-                "after CRM rejection: %s",
-                integration_id,
-                cleanup_exc,
-            )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=(
-                f"Credentials were stored but the CRM rejected them: {exc}. "
-                "No integration was created. Check your token and base_url."
-            ),
-        )
-
-    # ── Step 4: Return the status response ────────────────────────────────
     logger.info(
-        "Provisioned and verified integration_id='%s' crm_type='%s'.",
+        "Provisioned integration_id='%s' crm_type='%s'.",
         integration_id,
         result.crm_type,
     )
