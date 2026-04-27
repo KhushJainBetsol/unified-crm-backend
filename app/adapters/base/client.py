@@ -10,7 +10,7 @@ Responsibilities
 - Execute GET / POST / PATCH / DELETE with exponential back-off retry.
 - Abstract over all three pagination strategies declared in config:
     * page   — ?page=N&per_page=P
-    * offset — ?offset=N&limit=P
+    * offset — ?offset=N&maxSize=P   (param name from config.per_page_param)
     * cursor — ?cursor=<token>
 - Extract the items array from an arbitrary JSONPath inside the response.
 - Surface clean, typed exceptions so adapters don't leak httpx details.
@@ -280,8 +280,12 @@ class BaseCrmClient:
 
         Supports all three strategies declared in config.pagination.strategy:
           - page   → increments ``?page`` until an empty page is returned
-          - offset → increments ``?offset`` until fewer items than page_size
+          - offset → increments ``?offset`` using per_page_param from config
+                     (e.g. "maxSize" for EspoCRM, "limit" for others)
           - cursor → follows ``next_cursor`` until absent
+
+        extra_params are merged into every paginated request — this is how
+        the EspoCRM adapter passes where[] filters for account scoping.
 
         Usage
         -----
@@ -347,18 +351,44 @@ class BaseCrmClient:
         base_params: Dict[str, Any],
         pag: PaginationConfig,
     ) -> AsyncIterator[List[Any]]:
+        """
+        Offset-based pagination.
+
+        FIX: previously hardcoded "limit" as the page-size param name.
+        Now correctly uses ``pag.per_page_param`` (e.g. "maxSize" for EspoCRM)
+        so the page-size param matches what each CRM actually expects.
+
+        Also uses ``pag.total_count_path`` when available to stop early
+        instead of waiting for an empty page, which saves one extra request.
+        """
         offset = 0
-        limit = pag.default_page_size
+        page_size = pag.default_page_size
+
         while True:
-            params = {**base_params, "offset": offset, "limit": limit}
+            params = {
+                **base_params,
+                pag.page_param:     offset,      # e.g. "offset" → 0, 100, 200 …
+                pag.per_page_param: page_size,   # e.g. "maxSize" → 100  (was "limit" — BUG FIXED)
+            }
             raw = await self.request("GET", path, params=params)
             items = self._extract_items(raw, pag.items_path)
+
             if not items:
                 break
+
             yield items
-            if len(items) < limit:
-                break
-            offset += limit
+
+            # Early-exit using total count when the response provides it
+            # (e.g. EspoCRM returns {"list": [...], "total": 42})
+            if pag.total_count_path:
+                total = _resolve_path(raw, pag.total_count_path)
+                if total is not None and (offset + len(items)) >= int(total):
+                    break
+
+            if len(items) < page_size:
+                break  # partial page → last page
+
+            offset += page_size
 
     async def _paginate_by_cursor(
         self,

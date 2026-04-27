@@ -26,10 +26,23 @@ endpoints:
     path: "/api/v1/Case/{ticket_id}"
     method: "GET"
     default_params: {}
+
+  # ── Agent endpoints ────────────────────────────────────────────────
+  # Step 1 of fetch_agents: paginate all User stubs to collect IDs.
+  # rolesNames is NOT present in list responses — only in detail payload.
   agents:
     path: "/api/v1/User"
     method: "GET"
     default_params: {}
+  # Step 2 of fetch_agents: fetch full User detail by ID.
+  # rolesNames (e.g. {"69b917db3281aa2e8": "Agent"}) is present here.
+  # Filtering to role == "Agent" happens in the adapter after this fetch.
+  agent_by_id:
+    path: "/api/v1/User/{agent_id}"
+    method: "GET"
+    default_params: {}
+
+  # ── Customer endpoints ─────────────────────────────────────────────
   # Step 1 of fetch_customers: paginate all User stubs to collect IDs.
   # rolesNames is NOT present in list responses — only in the detail payload.
   customers:
@@ -43,6 +56,18 @@ endpoints:
     path: "/api/v1/User/{customer_id}"
     method: "GET"
     default_params: {}
+
+  # ── Contact endpoint ───────────────────────────────────────────────
+  # Used by fetch_agents to scope agents to a specific Account.
+  # EspoCRM User records have no accountId FK — the bridge is:
+  #   Contact.accountId == crm_org_id  AND
+  #   Contact.emailAddress == User.emailAddress
+  # Paginated with where[0][attribute]=accountId filter in the adapter.
+  contacts:
+    path: "/api/v1/Contact"
+    method: "GET"
+    default_params: {}
+
   organizations:
     path: "/api/v1/Account"
     method: "GET"

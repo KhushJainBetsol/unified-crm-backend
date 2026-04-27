@@ -4,15 +4,15 @@ CrmAdapterFactory
 =================
 Dynamically constructs fully configured CRM adapters.
 
-Design decisions
-----------------
-- IoC: The adapter does not fetch its own credentials nor build its own
-  HTTP client. The factory owns the full dependency graph.
-- Dynamic imports via importlib — no circular imports, no if/elif chains.
-- create() is async because AsyncDbBackedCredentialService.get_credentials()
-  is async (DB lookup + thread-pool Infisical key fetch).
-- Lifecycle separation: create() only constructs objects in memory.
-  The caller manages open/close via `async with adapter`.
+Change: create() now reads crm_org_id from the credentials envelope and
+  passes it as a keyword argument to the adapter constructor.  This lets
+  EspoCrmAdapter.fetch_agents() scope the Contact cross-match to the right
+  Account without any extra DB lookups at fetch time.
+
+  The crm_org_id field is expected on the credentials envelope
+  (AsyncDbBackedCredentialService returns it alongside base_url and
+  credentials).  If absent it defaults to None — adapters that don't need
+  account scoping (e.g. Zammad) are unaffected.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ class CrmAdapterFactory:
         registry: AdapterRegistry,
         credential_manager: AsyncDbBackedCredentialService,
     ) -> None:
-        self._registry = registry
+        self._registry     = registry
         self._cred_manager = credential_manager
 
     # ------------------------------------------------------------------
@@ -75,7 +75,7 @@ class CrmAdapterFactory:
         Parameters
         ----------
         integration_id:
-            The tenant's integration UUID.
+            The tenant's integration UUID (maps to crm_integrations.id).
         required_capabilities:
             Optional list of capability strings to validate against the
             registry before constructing the adapter.
@@ -83,7 +83,7 @@ class CrmAdapterFactory:
         Returns
         -------
         BaseCrmAdapter
-            Un-opened adapter instance.
+            Un-opened adapter instance with crm_org_id injected.
 
         Raises
         ------
@@ -101,11 +101,15 @@ class CrmAdapterFactory:
                 f"Failed to fetch credentials for integration '{integration_id}': {exc}"
             ) from exc
 
-        crm_type = envelope.crm_type
+        crm_type   = envelope.crm_type
+        # crm_org_id is stored on TenantSourceSystem and included in the
+        # envelope by AsyncDbBackedCredentialService.  It may be None for
+        # CRM types that don't need account scoping (e.g. Zammad).
+        crm_org_id: Optional[str] = getattr(envelope, "crm_org_id", None)
 
         # ── 2. Fetch registry entry + config ──────────────────────────────
         try:
-            entry = self._registry.get_entry(crm_type)
+            entry  = self._registry.get_entry(crm_type)
             config = self._registry.get_adapter_config(crm_type)
         except Exception as exc:
             raise AdapterFactoryError(
@@ -124,8 +128,6 @@ class CrmAdapterFactory:
         adapter_cls = self._import_class(entry.adapter_class)
 
         # ── 5. Resolve client class ───────────────────────────────────────
-        # Adapter declares its own client via client_class; falls back to
-        # BaseCrmClient if not declared.
         client_cls: Type[BaseCrmClient] = getattr(
             adapter_cls, "client_class", BaseCrmClient
         )
@@ -133,14 +135,15 @@ class CrmAdapterFactory:
         # ── 6. Build the dependency graph ─────────────────────────────────
         try:
             client = client_cls(
-                base_url=envelope.base_url,
-                config=config,
-                credentials=envelope.credentials,
+                base_url    = envelope.base_url,
+                config      = config,
+                credentials = envelope.credentials,
             )
             adapter = adapter_cls(
-                client=client,
-                config=config,
-                integration_id=integration_id,
+                client         = client,
+                config         = config,
+                integration_id = integration_id,
+                crm_org_id     = crm_org_id,   # ← NEW: scopes agent fetching
             )
         except Exception as exc:
             raise AdapterFactoryError(
@@ -149,20 +152,15 @@ class CrmAdapterFactory:
             ) from exc
 
         logger.info(
-            "Constructed %s for integration_id='%s'",
+            "Constructed %s for integration_id='%s' crm_org_id=%r",
             adapter_cls.__name__,
             integration_id,
+            crm_org_id,
         )
         return adapter
 
     def clear_class_cache(self) -> None:
-        """
-        No-op kept for interface compatibility with the integrations router.
-
-        importlib resolves classes on every create() call — there is no
-        module-level class cache to invalidate. If a subclass adds caching
-        it should override this method.
-        """
+        """No-op kept for interface compatibility."""
         logger.debug("clear_class_cache() called — nothing to clear.")
 
     # ------------------------------------------------------------------
@@ -170,11 +168,7 @@ class CrmAdapterFactory:
     # ------------------------------------------------------------------
 
     def _import_class(self, class_path: str) -> Type[BaseCrmAdapter]:
-        """
-        Dynamically import a Python class from a dot-notation string.
-
-        Example: "app.adapters.zammad.adapter.ZammadAdapter"
-        """
+        """Dynamically import a Python class from a dot-notation string."""
         try:
             module_path, class_name = class_path.rsplit(".", 1)
         except ValueError as exc:
@@ -185,7 +179,7 @@ class CrmAdapterFactory:
 
         try:
             module = importlib.import_module(module_path)
-            cls = getattr(module, class_name)
+            cls    = getattr(module, class_name)
         except ImportError as exc:
             raise AdapterFactoryError(
                 f"Failed to import module '{module_path}' "
@@ -200,5 +194,4 @@ class CrmAdapterFactory:
             raise AdapterFactoryError(
                 f"'{class_name}' must inherit from BaseCrmAdapter."
             )
-
         return cls

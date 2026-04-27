@@ -22,7 +22,6 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.crm_clients import fetch_crm_org_id  # ← NEW
 from app.core.keycloak_admin import create_keycloak_user
 from app.core.settings import get_settings
 from app.models.dashboard_user import DashboardUser
