@@ -218,7 +218,7 @@ class EspoCrmAdapter(BaseCrmAdapter):
         mapped_items = self._mapper.map_agents(scoped_agents_raw)
         return PaginatedResult(items=mapped_items, page=1, per_page=per_page, has_more=False)
 
-    async def fetch_customers(self, page: int = 1, per_page: int = 100) -> PaginatedResult:
+    async def fetch_customers(self, crm_org_id: str,page: int = 1, per_page: int = 100) -> PaginatedResult:
         """
         Fetch all EspoCRM users whose role is "Customer".
 

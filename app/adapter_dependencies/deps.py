@@ -22,6 +22,7 @@ from fastapi import Depends, HTTPException, Request, status
 from app.config.registry import AdapterRegistry
 from app.credentials.async_manager import AsyncInfisicalCredentialManager
 from app.factory.adapter_factory import AdapterFactoryError, CrmAdapterFactory
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 # ---------------------------------------------------------------------------
@@ -155,3 +156,4 @@ async def get_verified_adapter(
 
     async with adapter:
         yield adapter
+

@@ -180,7 +180,7 @@ async def _sync_entities_via_adapter(
         adapter = await factory.create(str(tss.integration_id))
         async with adapter:
             agents_result    = await adapter.fetch_agents(crm_org_id)
-            customers_result = await adapter.fetch_customers()
+            customers_result = await adapter.fetch_customers(crm_org_id)
             orgs_result      = await adapter.fetch_organizations()
     except AdapterFactoryError as exc:
         raise _adapter_error_to_http(exc)
