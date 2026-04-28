@@ -5,6 +5,7 @@ REST API for CRM credential lifecycle.
 
 Endpoints
 ---------
+POST   /api/v1/integrations/check-connection                → validate only (no store)
 POST   /api/v1/integrations/                               → provision
 PATCH  /api/v1/integrations/{integration_id}/credentials   → partial update
 GET    /api/v1/integrations/{integration_id}/credentials/status
@@ -23,9 +24,10 @@ Permission gate (provision + update)
 Before any encryption or DB write, provision() calls the CRM's permission
 endpoint with the supplied raw credentials and validates the response.
 
-  • Missing permissions  →  403 with a structured JSON body listing
-                            exactly which checks failed. Nothing is written.
-  • Sufficient perms     →  normal encrypt → DB write → adapter verify flow.
+  • Unknown crm_type      →  422 with a list of supported types.
+  • Missing permissions   →  403 with a structured JSON body listing
+                             exactly which checks failed. Nothing is written.
+  • Sufficient perms      →  normal encrypt → DB write → adapter verify flow.
 
 Verification gate (provision)
 -----------------------------
@@ -57,7 +59,11 @@ from app.schemas.credentials import (
     ProvisionCredentialsRequest,
     UpdateCredentialsRequest,
 )
-from app.services.credential_service import CredentialProvisioningService
+from app.services.credential_service import (
+    CredentialProvisioningService,
+    _PERMISSION_ENDPOINT,
+    _PERMISSION_VALIDATOR,
+)
 from app.adapters.base.permission_validator import PermissionValidationError
 
 logger = logging.getLogger(__name__)
@@ -94,8 +100,31 @@ async def get_provisioning_service(
 
 
 # ---------------------------------------------------------------------------
-# Internal helper
+# Internal helpers
 # ---------------------------------------------------------------------------
+
+def _assert_supported_crm_type(crm_type: str) -> None:
+    """
+    Raise HTTP 422 immediately if crm_type has no registered permission
+    endpoint or validator.
+
+    This is called at the top of check-connection (and optionally provision)
+    so the caller gets a clear, actionable error instead of a silent pass.
+    """
+    supported = sorted(set(_PERMISSION_ENDPOINT.keys()) & set(_PERMISSION_VALIDATOR.keys()))
+    if crm_type not in _PERMISSION_ENDPOINT or crm_type not in _PERMISSION_VALIDATOR:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "unsupported_crm_type",
+                "message": (
+                    f"crm_type '{crm_type}' is not recognised or has no "
+                    "permission validator configured."
+                ),
+                "supported_crm_types": supported,
+            },
+        )
+
 
 async def _verify_adapter_connection(
     integration_id: UUID,
@@ -185,11 +214,14 @@ def _handle_service_error(exc: Exception, integration_id: UUID | None) -> None:
     description=(
         "Tests if the provided credentials are valid and have required permissions. "
         "Credentials are NOT stored in the database.\n\n"
+        "**Step 0 — CRM type guard:** If `crm_type` is not in the supported registry "
+        "a **422** is returned immediately with a `supported_crm_types` list. "
+        "A placeholder value like `'string'` will be rejected here.\n\n"
         "**Step 1 — Permission check:** The supplied credentials "
         "are used to call the CRM's permission-inspection endpoint. If the token "
         "lacks any required permission a **403** is returned with a "
         "`failed_checks` list.\n\n"
-        "If the check passes, returns 200 with status 'connection_verified'. "
+        "If both checks pass, returns **200** with `status: connection_verified`. "
         "Raw secrets are NEVER logged or returned."
     ),
 )
@@ -201,21 +233,22 @@ async def check_connection(
     """
     Steps
     -----
-    1. Permission gate  — validate CRM permissions.
+    0. CRM type guard — reject unsupported / placeholder crm_type values
+       with a structured 422 before making any external call.
+    1. Permission gate — validate CRM permissions via the live CRM endpoint.
        PermissionValidationError → 403 with failed_checks list.
-    2. Return 200 with connection status if check passes.
-    
+    2. Return 200 with connection status if all checks pass.
+
     Note: Credentials are NOT stored. This is a read-only test endpoint.
-    This validates that the CRM credentials have the required permissions
-    before provisioning the integration.
     """
-    # ── Step 1: Permission check (no DB write) ──────────────────────────────
+    crm_type = body.crm_type.strip().lower()
+    base_url = str(body.base_url).rstrip("/")
+
+    # ── Step 0: Reject unknown / placeholder crm_type immediately ─────────
+    _assert_supported_crm_type(crm_type)
+
+    # ── Step 1: Permission check (no DB write) ─────────────────────────────
     try:
-        # Call the provision service's internal permission check
-        # This validates permissions without storing anything
-        crm_type = body.crm_type.strip().lower()
-        base_url = str(body.base_url).rstrip("/")
-        
         await service._check_permissions(
             crm_type=crm_type,
             base_url=base_url,
@@ -226,13 +259,13 @@ async def check_connection(
 
     logger.info(
         "Connection check passed for crm_type='%s' by user tenant_id='%s'.",
-        body.crm_type,
+        crm_type,
         current_user.tenant_id,
     )
     return {
         "status": "connection_verified",
-        "crm_type": body.crm_type,
-        "base_url": str(body.base_url),
+        "crm_type": crm_type,
+        "base_url": base_url,
         "message": "Credentials validated. You can now provision this integration.",
     }
 
@@ -267,10 +300,9 @@ async def provision_credentials(
     1. Permission gate  — validate CRM permissions before any DB write.
        PermissionValidationError → 403 with failed_checks list.
     2. Encrypt + write credentials to DB.
-    
+
     Note: Does NOT verify connection. For safety, call check-connection first.
     """
-    # ── Steps 1 + 2: Permission check then provision (encrypt → DB write) ─
     try:
         result = await service.provision(
             tenant_id=current_user.tenant_id,
@@ -372,13 +404,13 @@ async def verify_integration(
        On failure → 502 with the rejection reason.
     3. Return {integration_id, status: "verified"}.
     """
-    # ── 1. Confirm the row exists ─────────────────────────────────────────
+    # ── 1. Confirm the row exists ──────────────────────────────────────────
     try:
         await service.get_status(integration_id=integration_id)
     except Exception as exc:
         _handle_service_error(exc, integration_id)
 
-    # ── 2. Live adapter check ─────────────────────────────────────────────
+    # ── 2. Live adapter check ──────────────────────────────────────────────
     try:
         await _verify_adapter_connection(integration_id, factory)
     except Exception as exc:
@@ -415,26 +447,27 @@ async def rotate_credentials(
         _handle_service_error(exc, integration_id)
 
 
-# @router.delete(
-#     "/{integration_id}/credentials",
-#     status_code=status.HTTP_204_NO_CONTENT,
-#     response_class=Response,
-#     summary="Revoke integration credentials",
-#     description=(
-#         "Soft-disables the integration (is_active=False). "
-#         "Pass ?wipe=true to also null out the encrypted credential blob."
-#     ),
-# )
-# async def revoke_credentials(
-#     integration_id: UUID,
-#     wipe: bool = Query(
-#         default=False,
-#         description="If true, nulls out credential_enc (hard wipe).",
-#     ),
-#     current_user=Depends(get_current_user),
-#     service: CredentialProvisioningService = Depends(get_provisioning_service),
-# ) -> None:
-#     try:
-#         await service.revoke(integration_id=integration_id, wipe=wipe)
-#     except Exception as exc:
-#         _handle_service_error(exc, integration_id)
+@router.delete(
+    "/{integration_id}/credentials",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    response_model=None,
+    summary="Revoke integration credentials",
+    description=(
+        "Soft-disables the integration (is_active=False). "
+        "Pass ?wipe=true to also null out the encrypted credential blob."
+    ),
+)
+async def revoke_credentials(
+    integration_id: UUID,
+    wipe: bool = Query(
+        default=False,
+        description="If true, nulls out credential_enc (hard wipe).",
+    ),
+    current_user=Depends(get_current_user),
+    service: CredentialProvisioningService = Depends(get_provisioning_service),
+) -> None:
+    try:
+        await service.revoke(integration_id=integration_id, wipe=wipe)
+    except Exception as exc:
+        _handle_service_error(exc, integration_id)

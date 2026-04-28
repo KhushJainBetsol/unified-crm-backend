@@ -4,7 +4,7 @@ app/services/credential_service.py
 CredentialProvisioningService
 ==============================
 Orchestrates the full lifecycle of CRM credentials:
-  PROVISION  — verify permissions → generate integration_id → encrypt secrets → store in DB
+  PROVISION  — upsert: if tenant already has this CRM → update, else → create
   UPDATE     — partial update of credentials / metadata / webhook secrets
   RETRIEVE   — DB lookup → Infisical key fetch → AES decrypt → envelope
   ROTATE     — re-encrypt BOTH _enc columns with current active key
@@ -18,49 +18,63 @@ Two-column secret model
 Both columns are encrypted independently with the same key version so a
 single rotate() call re-encrypts both atomically.
 
-Permission gate (PROVISION)
-----------------------------
+Permission gate (PROVISION + CHECK-CONNECTION)
+----------------------------------------------
 Before any encryption or DB write, provision() calls _check_permissions()
 which hits the CRM's permission-inspection endpoint and validates the
 response using the appropriate CrmPermissionValidator subclass.
 
-  If permissions are INSUFFICIENT  →  PermissionValidationError is raised
-                                       immediately with a list of exactly which
-                                       checks failed.  Nothing is written to DB.
+  Unknown crm_type          →  ValueError raised immediately with a list of
+                               supported types. Nothing is written to DB.
 
-  If permissions are SUFFICIENT    →  normal encryption + DB write proceeds.
+  Permissions INSUFFICIENT  →  PermissionValidationError is raised immediately
+                               with a list of exactly which checks failed.
+                               Nothing is written to DB.
 
-Flow diagram (PROVISION)
-------------------------
+  Permissions SUFFICIENT    →  normal encryption + DB write proceeds.
+
+Upsert logic (PROVISION)
+--------------------------
+provision() now checks TenantSourceSystem before writing anything:
+
+  If a TenantSourceSystem row already exists for (tenant_id, source_system_id):
+      → permission check runs first (same as fresh provision)
+      → delegates to update() using the existing integration_id
+      → sets is_active=True on the row (re-activates if previously revoked)
+
+  If no row exists:
+      → normal create path (encrypt → insert CrmIntegration → insert TenantSourceSystem)
+
+This means the frontend can always call POST /integrations/ and the backend
+decides whether to create or update. The frontend never needs to know.
+
+Flow diagram (PROVISION — upsert)
+----------------------------------
 
   Frontend / API
        │
-       ▼  ProvisionCredentialsRequest + tenant_id (from JWT)
+       ▼  POST /integrations/  (always)
   CredentialProvisioningService.provision()
        │
-       ├─► _check_permissions(crm_type, base_url, credentials)
+       ├─► Fetch tenant name
+       │
+       ├─► Resolve SourceSystem from crm_type
+       │       └─► ValueError if unknown crm_type  ◄─ STOPS HERE
+       │
+       ├─► Lookup TenantSourceSystem (tenant_id + source_system_id)
        │       │
-       │       ├─► HTTP GET <crm_permission_url>  (using the caller's raw creds)
-       │       └─► EspoCrmPermissionValidator / ZammadPermissionValidator
-       │               └─► PermissionValidationError if any check fails  ◄─ STOPS HERE
+       │  ┌────┴────┐
+       │  │         │
+       │ EXISTS   NOT FOUND
+       │  │         │
+       │  ▼         ▼
+       │ _check_permissions()   _check_permissions()
+       │  │                      │
+       │  ▼                      ▼
+       │ update(existing_id)    encrypt → insert CrmIntegration
+       │  └─► is_active=True    insert TenantSourceSystem
        │
-       ├─► uuid4()  ← integration_id generated HERE, never from caller
-       │
-       ├─► AsyncInfisicalCredentialManager.get_active_key_and_version()
-       │         └─► Infisical: ACTIVE_KEY_VERSION + ENCRYPTION_KEY_V<n>
-       │
-       ├─► EncryptionService.encrypt(outbound_secret_json) → credential_enc
-       │
-       ├─► EncryptionService.encrypt(webhook_secret_json)  → webhook_secrets_enc
-       │         (skipped / NULL when no webhook secrets supplied)
-       │
-       └─► DB write:
-               crm_integrations.id                 = <new uuid>
-               crm_integrations.auth_type           = "api_token" | "hmac" | …
-               crm_integrations.key_version         = "v1"
-               crm_integrations.base_url            = "https://…"
-               crm_integrations.credential_enc      = <encrypted blob>
-               crm_integrations.webhook_secrets_enc = <encrypted blob> | NULL
+       └─► return CredentialStatusResponse
 
 Architecture notes
 ------------------
@@ -71,6 +85,8 @@ Architecture notes
 - Both _enc columns are re-keyed together in rotate() for atomicity.
 - Permission check uses the raw credentials from the request (before encryption)
   so no Infisical round-trip is needed at validation time.
+- update() always sets is_active=True when credentials are supplied so that
+  a previously revoked/wiped integration is re-activated on re-provision.
 """
 
 from __future__ import annotations
@@ -83,10 +99,9 @@ from uuid import UUID, uuid4
 
 import httpx
 from sqlalchemy import select
-from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.crm_clients import fetch_crm_org_id  # ← NEW
+from app.core.crm_clients import fetch_crm_org_id
 from app.credentials.async_manager import AsyncInfisicalCredentialManager
 from app.credentials.encryption import EncryptionService
 from app.credentials.exceptions import (
@@ -117,6 +132,10 @@ logger = logging.getLogger(__name__)
 # Maps crm_type (lowercase, as stored in source_systems.system_name) to the
 # path that returns the permission/ACL payload for the authenticated user.
 # The full URL is assembled as:  base_url + path
+#
+# IMPORTANT: Any crm_type NOT present here will be REJECTED by
+# _check_permissions() with a ValueError. Add new CRM types here (and a
+# matching entry in _PERMISSION_VALIDATOR) before provisioning them.
 # ---------------------------------------------------------------------------
 _PERMISSION_ENDPOINT: Dict[str, str] = {
     "espocrm": "/api/v1/App/user",
@@ -150,7 +169,7 @@ class CredentialProvisioningService:
         self._key_manager = key_manager
         self._db = db
 
-    # ── PROVISION ─────────────────────────────────────────────────────────
+    # ── PROVISION (upsert) ────────────────────────────────────────────────
 
     async def provision(
         self,
@@ -158,23 +177,33 @@ class CredentialProvisioningService:
         request: ProvisionCredentialsRequest,
     ) -> CredentialStatusResponse:
         """
-        Validate permissions, then encrypt and store credentials for a NEW integration.
+        Upsert credentials for a CRM integration.
 
-        Steps
-        -----
-        1. Fetch tenant name from DB using tenant_id.
-        2. Check CRM permissions using the raw (un-encrypted) credentials.
-        3. Generate a fresh integration_id (uuid4).
-        4. Fetch the active AES key + version from Infisical.
-        5. Encrypt outbound secret dict → credential_enc.
-        6. Build webhook secret dict from request; encrypt if present, else NULL.
-        7. Insert a new CrmIntegration row with direct plain columns.
-        8. Fetch CRM org ID + insert TenantSourceSystem row.
+        If the tenant already has an integration row for this CRM type
+        (determined by looking up TenantSourceSystem), the existing row is
+        updated (re-encrypted + is_active restored).  Otherwise a fresh
+        integration_id is generated and a new row is created.
+
+        In both cases the permission gate runs BEFORE any DB write.
+
+        Steps (create path)
+        -------------------
+        1. Fetch tenant name from DB.
+        2. Resolve SourceSystem — raises ValueError for unknown crm_type.
+        3. Check TenantSourceSystem for existing integration.
+           → If found: run permission check → delegate to update() → return.
+        4. Permission gate — raises on failure, nothing written.
+        5. Generate fresh integration_id (uuid4).
+        6. Fetch active AES key + version from Infisical.
+        7. Encrypt outbound secret dict → credential_enc.
+        8. Encrypt webhook secret dict → webhook_secrets_enc (or NULL).
+        9. Insert CrmIntegration row.
+        10. Fetch CRM org ID + insert TenantSourceSystem row.
         """
         crm_type = request.crm_type.strip().lower()
         base_url = str(request.base_url).rstrip("/")
 
-        # ── 1. Fetch tenant name ───────────────────────────────────────────
+        # ── 1. Fetch tenant ────────────────────────────────────────────────
         tenant_result = await self._db.execute(
             select(Tenant).where(Tenant.id == tenant_id)
         )
@@ -183,7 +212,63 @@ class CredentialProvisioningService:
             raise ValueError(f"Tenant with id={tenant_id} not found.")
         tenant_name = tenant.name
 
-        # ── 2. Permission gate — nothing is written if this raises ─────────
+        # ── 2. Resolve SourceSystem (validates crm_type early) ─────────────
+        ss_result = await self._db.execute(
+            select(SourceSystem).where(SourceSystem.system_name == crm_type)
+        )
+        source_system = ss_result.scalars().first()
+        if source_system is None:
+            raise ValueError(
+                f"Unknown crm_type '{crm_type}'. "
+                "Register it in the source_systems table before provisioning."
+            )
+
+        # ── 3. Upsert check — does this tenant already have this CRM? ──────
+        tss_result = await self._db.execute(
+            select(TenantSourceSystem).where(
+                TenantSourceSystem.tenant_id == tenant_id,
+                TenantSourceSystem.source_system_id == source_system.id,
+            )
+        )
+        existing_tss = tss_result.scalars().first()
+
+        if existing_tss is not None:
+            # ── Existing integration → run permission check then update ────
+            logger.info(
+                "Integration already exists for tenant_id='%s' crm_type='%s' "
+                "(integration_id='%s'). Running upsert → update path.",
+                tenant_id,
+                crm_type,
+                existing_tss.integration_id,
+            )
+
+            # Permission gate still runs — we don't skip it on updates.
+            await self._check_permissions(
+                crm_type=crm_type,
+                base_url=base_url,
+                request=request,
+            )
+
+            # Build an UpdateCredentialsRequest from the provision payload.
+            # base_url and webhook fields are forwarded so nothing is lost.
+            update_request = UpdateCredentialsRequest(
+                credentials=request.credentials,
+                base_url=request.base_url,
+            )
+
+            # Carry webhook fields through if the schema has them.
+            # (UpdateCredentialsRequest may expose webhook_* fields depending
+            #  on your schema version — assign them if present.)
+            for attr in ("webhook_secret", "webhook_signing_secret"):
+                if hasattr(request, attr) and hasattr(update_request, attr):
+                    setattr(update_request, attr, getattr(request, attr))
+
+            return await self.update(
+                integration_id=existing_tss.integration_id,
+                request=update_request,
+            )
+
+        # ── 4. Permission gate — nothing is written if this raises ─────────
         await self._check_permissions(
             crm_type=crm_type,
             base_url=base_url,
@@ -192,15 +277,15 @@ class CredentialProvisioningService:
 
         integration_id = uuid4()
 
-        # ── 3. Fetch AES key ──────────────────────────────────────────────
+        # ── 5. Fetch AES key ───────────────────────────────────────────────
         version, raw_key = await self._key_manager.get_active_key_and_version()
         enc_service = EncryptionService(raw_key=raw_key, key_version=version)
 
-        # ── 4. Encrypt outbound credentials ───────────────────────────────
+        # ── 6. Encrypt outbound credentials ───────────────────────────────
         secret_dict = request.credentials.to_secret_dict()
         credential_enc = enc_service.encrypt(json.dumps(secret_dict)).to_db_string()
 
-        # ── 5. Encrypt inbound webhook secrets (nullable) ─────────────────
+        # ── 7. Encrypt inbound webhook secrets (nullable) ──────────────────
         webhook_secret_dict = request.build_webhook_secret_dict()
         webhook_secrets_enc: str | None = None
         if webhook_secret_dict:
@@ -208,10 +293,10 @@ class CredentialProvisioningService:
                 json.dumps(webhook_secret_dict)
             ).to_db_string()
 
-        # ── 6. Resolve plain column values ────────────────────────────────
+        # ── 8. Resolve plain column values ─────────────────────────────────
         auth_type = request.credentials.auth_type
 
-        # ── 7. Insert CrmIntegration row ──────────────────────────────────
+        # ── 9. Insert CrmIntegration row ───────────────────────────────────
         row = await self._create_row(
             integration_id=integration_id,
             tenant_id=tenant_id,
@@ -221,9 +306,10 @@ class CredentialProvisioningService:
             base_url=base_url,
             credential_enc=credential_enc,
             webhook_secrets_enc=webhook_secrets_enc,
+            source_system=source_system,          # already resolved — no second query
         )
 
-        # ── 8. Fetch CRM org ID + insert TenantSourceSystem row ───────────
+        # ── 10. Fetch CRM org ID + insert TenantSourceSystem row ───────────
         crm_org_id: str | None = await fetch_crm_org_id(
             system_name=crm_type,
             tenant_name=tenant_name,
@@ -237,26 +323,14 @@ class CredentialProvisioningService:
                 crm_type,
             )
 
-        ss_result = await self._db.execute(
-            select(SourceSystem).where(SourceSystem.system_name == crm_type)
+        tss_row = TenantSourceSystem(
+            tenant_id=tenant_id,
+            source_system_id=source_system.id,
+            integration_id=integration_id,
+            crm_org_id=crm_org_id,
+            is_active=True,
         )
-        source_system = ss_result.scalars().first()
-
-        if source_system is None:
-            logger.warning(
-                "No SourceSystem row found for crm_type='%s' — "
-                "skipping TenantSourceSystem insert.",
-                crm_type,
-            )
-        else:
-            tss_row = TenantSourceSystem(
-                tenant_id=tenant_id,
-                source_system_id=source_system.id,
-                integration_id=integration_id,
-                crm_org_id=crm_org_id,
-                is_active=True,
-            )
-            self._db.add(tss_row)
+        self._db.add(tss_row)
 
         await self._db.commit()
         await self._db.refresh(row)
@@ -288,6 +362,10 @@ class CredentialProvisioningService:
         Updating credentials re-encrypts with the current active key so the
         row's key_version is also bumped. Webhook secrets can be updated
         independently of outbound credentials and vice-versa.
+
+        When credentials are supplied, is_active is set to True so that a
+        previously revoked / wiped integration is cleanly re-activated on
+        re-provision (the upsert path in provision() delegates here).
         """
         row = await self._get_row_or_raise(integration_id)
 
@@ -301,9 +379,17 @@ class CredentialProvisioningService:
             row.auth_type = request.credentials.auth_type
             row.key_version = version
 
-            # If HMAC credentials also carry webhook secrets, update that column too
-            cred_ws = request.credentials.to_webhook_secret_dict() \
-                if hasattr(request.credentials, "to_webhook_secret_dict") else None
+            # Re-activate in case this row was previously revoked or wiped.
+            # This is the key fix for the reset → re-provision flow:
+            # revoke(wipe=True) sets is_active=False; update() restores it.
+            row.is_active = True
+
+            # If HMAC credentials also carry webhook secrets, update that column too.
+            cred_ws = (
+                request.credentials.to_webhook_secret_dict()
+                if hasattr(request.credentials, "to_webhook_secret_dict")
+                else None
+            )
             if cred_ws:
                 row.webhook_secrets_enc = enc_service.encrypt(
                     json.dumps(cred_ws)
@@ -363,7 +449,7 @@ class CredentialProvisioningService:
         except Exception as exc:
             raise CredentialDecodeError(str(integration_id), str(exc)) from exc
 
-        # ── Decrypt webhook secrets (nullable) ─────────────────────────────
+        # ── Decrypt webhook secrets (nullable) ────────────────────────────
         webhook_secrets: Dict[str, Any] = {}
         if row.webhook_secrets_enc:
             try:
@@ -459,6 +545,19 @@ class CredentialProvisioningService:
         """
         Soft-disable an integration (is_active=False).
         Pass wipe=True to also null out BOTH _enc columns (hard delete of secrets).
+
+        Also hard-deletes the associated TenantSourceSystem row so that a
+        subsequent POST /integrations/ for the same tenant + crm_type will
+        go through the create path (fresh uuid4, fresh TenantSourceSystem row)
+        rather than the update path.
+
+        If you want to allow re-provisioning via the upsert path (update the
+        existing CrmIntegration row), keep the TenantSourceSystem row alive
+        and just wipe the credential columns — pass wipe=True and handle the
+        TenantSourceSystem deletion separately, or don't delete it here.
+
+        Current behaviour: TenantSourceSystem is always deleted on revoke so
+        the integration_id can be cleanly re-issued on next provision.
         """
         row = await self._get_row_or_raise(integration_id)
         row.is_active = False
@@ -469,6 +568,23 @@ class CredentialProvisioningService:
             logger.warning(
                 "Wiped credential_enc and webhook_secrets_enc",
                 extra={"integration_id": str(integration_id)},
+            )
+
+        # ── Hard-delete TenantSourceSystem row ────────────────────────────
+        tss_result = await self._db.execute(
+            select(TenantSourceSystem).where(
+                TenantSourceSystem.integration_id == integration_id
+            )
+        )
+        tss_row = tss_result.scalars().first()
+
+        if tss_row is not None:
+            await self._db.delete(tss_row)
+        else:
+            logger.warning(
+                "No TenantSourceSystem row found for integration_id='%s' — "
+                "nothing to delete.",
+                str(integration_id),
             )
 
         await self._db.commit()
@@ -494,6 +610,10 @@ class CredentialProvisioningService:
         required permissions a PermissionValidationError is raised — the caller
         sees a clear list of exactly which checks failed and nothing is persisted.
 
+        An UNKNOWN crm_type raises ValueError instead of silently passing.
+        This prevents placeholder or mistyped crm_type values from slipping
+        through as false positives.
+
         Parameters
         ----------
         crm_type:
@@ -505,34 +625,31 @@ class CredentialProvisioningService:
 
         Raises
         ------
+        ValueError
+            crm_type is not in the known registry.
         PermissionValidationError
             One or more required permissions are missing.
-        ValueError
-            crm_type is not in the known registry (no endpoint configured).
         RuntimeError
             The HTTP call to the CRM's permission endpoint failed (network
             error, non-2xx response, or unparseable body).
         """
+        supported = sorted(
+            set(_PERMISSION_ENDPOINT.keys()) & set(_PERMISSION_VALIDATOR.keys())
+        )
+
         endpoint_path = _PERMISSION_ENDPOINT.get(crm_type)
         if endpoint_path is None:
-            # Unknown CRM type — skip the permission check rather than blocking
-            # the whole onboarding flow; the adapter's verify_connection() will
-            # catch auth problems downstream.
-            logger.warning(
-                "No permission-check endpoint registered for crm_type='%s'. "
-                "Skipping permission validation.",
-                crm_type,
+            raise ValueError(
+                f"crm_type '{crm_type}' has no permission-check endpoint configured. "
+                f"Supported types: {supported}"
             )
-            return
 
         ValidatorClass = _PERMISSION_VALIDATOR.get(crm_type)
         if ValidatorClass is None:
-            logger.warning(
-                "No permission validator registered for crm_type='%s'. "
-                "Skipping permission validation.",
-                crm_type,
+            raise ValueError(
+                f"crm_type '{crm_type}' has no permission validator registered. "
+                f"Supported types: {supported}"
             )
-            return
 
         url = base_url + endpoint_path
         auth_headers = _build_auth_headers(crm_type, request)
@@ -620,28 +737,31 @@ class CredentialProvisioningService:
         base_url: str,
         credential_enc: str,
         webhook_secrets_enc: str | None,
+        source_system: SourceSystem | None = None,
     ) -> CrmIntegration:
         """
         Insert a new CrmIntegration row.
 
-        Resolves source_system_id from crm_type — raises ValueError if the
-        crm_type is not present in the source_systems table.
+        Accepts an already-resolved ``source_system`` object to avoid a
+        redundant DB query when provision() has already fetched it.  If not
+        supplied, it is fetched here (backward-compatible).
 
         All secret-bearing fields come pre-encrypted; this method never
         handles plaintext.
         """
-        from app.models.source_system import SourceSystem  # avoid circular dep
-
-        result = await self._db.execute(
-            select(SourceSystem).where(SourceSystem.system_name == crm_type)
-        )
-        source_system = result.scalar_one_or_none()
-
         if source_system is None:
-            raise ValueError(
-                f"Unknown crm_type '{crm_type}'. "
-                "Register it in the source_systems table before provisioning."
+            # Fallback — resolves source_system when called outside provision()
+            from app.models.source_system import SourceSystem as _SS  # avoid circular dep
+            result = await self._db.execute(
+                select(_SS).where(_SS.system_name == crm_type)
             )
+            source_system = result.scalar_one_or_none()
+
+            if source_system is None:
+                raise ValueError(
+                    f"Unknown crm_type '{crm_type}'. "
+                    "Register it in the source_systems table before provisioning."
+                )
 
         row = CrmIntegration(
             id=integration_id,
