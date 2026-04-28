@@ -35,6 +35,7 @@ from app.routes.invitations import router as invitations_router
 from app.routes.tenants import router as tenants_router
 from app.routes.super_admin import router as super_admin_router
 from app.routes.credentials import router as credential_router
+from app.routes.tenant_source_systems import router as tenant_ss_router
 from app.services.scheduler import run_all_tenants_full_sync, start_scheduler, stop_scheduler
 from app.utils.exceptions import register_exception_handlers
 from app.integrations.webhooks.router import router as webhook_router
@@ -261,6 +262,7 @@ app.include_router(sync.router,        prefix="/api/v1")
 app.include_router(tenants_router,     prefix="/api/v1")
 app.include_router(credential_router,  prefix="/api/v1")
 app.include_router(webhook_router)
+app.include_router(tenant_ss_router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["Health"])
