@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator
+from dataclasses import dataclass, field
 
 
 # ---------------------------------------------------------------------------
@@ -221,3 +222,21 @@ class PaginatedResult(BaseModel):
     next_cursor: Optional[str] = None
 
     model_config = {"arbitrary_types_allowed": True}
+
+@dataclass
+class UnifiedComment:
+    """
+    CRM-agnostic comment produced by an adapter's fetch_comments().
+    Maps 1-to-1 to NormalizedComment before DB upsert.
+    """
+    id: str                          # CRM-native comment ID
+    body: Optional[str]
+    comment_type: Optional[str]      # "note", "email", "Post", etc.
+    author_name: Optional[str]
+    author_email: Optional[str]
+    is_internal: bool
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+    # first_article signals the Zammad "description" article that
+    # should update the ticket body, not be stored as a comment
+    is_first_article: bool = field(default=False)

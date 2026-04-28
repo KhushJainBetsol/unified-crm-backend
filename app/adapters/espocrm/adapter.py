@@ -8,9 +8,11 @@ from app.domain.models import (
     UnifiedTicket,
     UnifiedAgent,
     UnifiedCustomer,
+    UnifiedComment,
     UnifiedOrganization,
 )
 from app.adapters.espocrm.client import EspoCrmClient
+from app.integrations.normalizer.comment_normalizer import _parse_dt  # reuse helper
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +47,41 @@ class EspoCrmAdapter(BaseCrmAdapter):
             raise AuthenticationError(f"EspoCRM auth failed: {exc}") from exc
 
     async def fetch_tickets(
-        self, page: int = 1, per_page: int = 100, filters: Optional[Dict[str, Any]] = None
+        self,
+        crm_org_id: str,
+        page: int = 1,
+        per_page: int = 100,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> PaginatedResult:
         self._assert_authenticated()
         path = self._get_endpoint("tickets")
-        raw_list = await self._client.paginate_all(path, extra_params=filters)
+
+        extra_params: Dict[str, Any] = dict(filters or {})
+
+        if crm_org_id:
+            # Filter Cases where accountId == crm_org_id using EspoCRM's
+            # where-clause syntax (same pattern used in fetch_agents for contacts).
+            extra_params.update(
+                {
+                    "where[0][type]":      "equals",
+                    "where[0][attribute]": "accountId",
+                    "where[0][value]":     crm_org_id,
+                }
+            )
+            logger.info(
+                "[%s] fetch_tickets: scoping to account_id=%s",
+                self.crm_type,
+                crm_org_id,
+            )
+        else:
+            logger.warning(
+                "[%s] fetch_tickets: crm_org_id not provided for integration_id=%s — "
+                "returning all tickets without account scoping",
+                self.crm_type,
+                self._integration_id,
+            )
+
+        raw_list = await self._client.paginate_all(path, extra_params=extra_params)
         mapped_items = self._mapper.map_tickets(raw_list)
         return PaginatedResult(
             items=mapped_items,
@@ -362,3 +394,61 @@ class EspoCrmAdapter(BaseCrmAdapter):
         path = self._get_endpoint("ticket_by_id").replace("{ticket_id}", str(crm_ticket_id))
         await self._client.request("PUT", path, json_body=crm_data)
         logger.info("[%s] Case %s updated: %s", self.crm_type, crm_ticket_id, crm_data)
+
+    async def fetch_comments(self, crm_ticket_id: str) -> PaginatedResult:
+        """
+        Fetch all stream Post entries for an EspoCRM Case.
+
+        Uses paginated GET /api/v1/Case/{id}/stream filtered to type=Post.
+        All entries are treated as regular comments (no is_first_article logic
+        for EspoCRM — the ticket description is a dedicated Case field).
+        """
+        self._assert_authenticated()
+
+        all_posts: list[dict] = []
+        offset = 0
+
+        while True:
+            path = self._get_endpoint("comments").replace("{crm_ticket_id}", crm_ticket_id)
+            response = await self._client.request(
+                "GET",
+                path,
+                params={
+                    "offset":               offset,
+                    "maxSize":              100,
+                    "where[0][type]":       "equals",
+                    "where[0][attribute]":  "type",
+                    "where[0][value]":      "Post",
+                },
+            )
+            batch: list[dict] = response.get("list", [])
+            total: int        = response.get("total", 0)
+            if not batch:
+                break
+            all_posts.extend(batch)
+            offset += 100
+            if len(all_posts) >= total:
+                break
+
+        items: list[UnifiedComment] = []
+        for raw in all_posts:
+            crm_id = raw.get("id")
+            if crm_id is None:
+                continue
+
+            data_block = raw.get("data") or {}
+            body = data_block.get("post") or raw.get("post")
+
+            items.append(UnifiedComment(
+                id               = str(crm_id),
+                body             = body,
+                comment_type     = raw.get("type", "Post"),
+                author_name      = raw.get("createdByName"),
+                author_email     = raw.get("createdByEmail"),
+                is_internal      = bool(raw.get("isInternal", False)),
+                created_at       = _parse_dt(raw.get("createdAt")),
+                updated_at       = _parse_dt(raw.get("modifiedAt")),
+                is_first_article = False,  # EspoCRM has no description-article concept
+            ))
+
+        return PaginatedResult(items=items, page=1, per_page=len(items), has_more=False)

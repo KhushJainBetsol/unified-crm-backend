@@ -57,6 +57,13 @@ endpoints:
     method: "GET"
     default_params: {}
 
+  comments:
+    # Fetches all stream Post entries for a specific Case.
+    # {crm_ticket_id} is replaced at runtime in the adapter.
+    path: "/api/v1/Case/{crm_ticket_id}/stream"
+    method: "GET"
+    default_params: {}
+    
   # ── Contact endpoint ───────────────────────────────────────────────
   # Used by fetch_agents to scope agents to a specific Account.
   # EspoCRM User records have no accountId FK — the bridge is:

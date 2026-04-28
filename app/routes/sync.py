@@ -221,8 +221,9 @@ async def _sync_tickets_via_adapter(
     """
     try:
         adapter = await factory.create(str(tss.integration_id))
+        crm_org_id=tss.crm_org_id
         async with adapter:
-            tickets_result = await adapter.fetch_tickets()
+            tickets_result = await adapter.fetch_tickets(crm_org_id)
     except AdapterFactoryError as exc:
         raise _adapter_error_to_http(exc)
     except Exception as exc:
@@ -537,8 +538,9 @@ async def sync_espocrm_full(db: AsyncSession = Depends(get_db)):
 async def sync_ticket_comments(
     ticket_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    factory: CrmAdapterFactory = Depends(get_adapter_factory),
 ):
-    count = await CommentService(db).sync_comments_for_ticket(ticket_id)
+    count = await CommentService(db).sync_comments_for_ticket(ticket_id, factory=factory)
     return success(
         f"Synced {count} comment(s) for ticket {ticket_id}",
         {"ticket_id": str(ticket_id), "synced_count": count},

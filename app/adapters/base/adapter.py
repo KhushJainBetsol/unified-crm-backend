@@ -22,6 +22,7 @@ from app.config.models import AdapterConfig
 from app.domain.models import (
     PaginatedResult,
     UnifiedAgent,
+    UnifiedComment,
     UnifiedOrganization,
     UnifiedTicket,
 )
@@ -177,6 +178,22 @@ class BaseCrmAdapter(ABC):
     @abstractmethod
     async def verify_connection(self) -> Dict[str, Any]:
         """Lightweight credential check. Raises AuthenticationError on failure."""
+
+    @abstractmethod
+    async def fetch_comments(
+        self,
+        crm_ticket_id: str,
+    ) -> "PaginatedResult":
+        """
+        Fetch all comments/articles for a single ticket.
+        items → List[UnifiedComment].
+
+        Adapters are responsible for:
+        - Fetching raw comment data from the CRM
+        - Converting to UnifiedComment
+        - For Zammad: marking the oldest article as is_first_article=True
+            so CommentService can use it to update the ticket description
+        """
 
     # ------------------------------------------------------------------
     # Concrete helpers available to all subclasses

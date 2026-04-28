@@ -65,6 +65,12 @@ endpoints:
     method: "GET"
     default_params: {}
 
+  comments:
+    # Fetches all articles (comments) for a specific ticket.
+    path: "/api/v1/ticket_articles/by_ticket/{crm_ticket_id}"
+    method: "GET"
+    default_params: {}
+
 
 # ---------------------------------------------------------------------------
 # Schema field mappings

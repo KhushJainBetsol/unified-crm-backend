@@ -573,8 +573,9 @@ async def _sync_tickets_via_adapter(
     NormalizedTicket, and upsert into the DB.
     """
     adapter = await factory.create(str(tss.integration_id))
+    crm_org_id=tss.crm_org_id
     async with adapter:
-        tickets_result = await adapter.fetch_tickets()
+        tickets_result = await adapter.fetch_tickets(crm_org_id)
 
     normalized = [
         _unified_to_normalized(t, source_system_name)
