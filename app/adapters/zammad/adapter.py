@@ -147,7 +147,17 @@ class ZammadAdapter(BaseCrmAdapter):
         """
         self._assert_authenticated()
 
-        all_users = await self._fetch_users_for_org(crm_org_id)
+        if crm_org_id:
+            all_users = await self._fetch_users_for_org(crm_org_id)
+        else:
+            logger.warning(
+                "[%s] fetch_agents: crm_org_id not provided for integration_id=%s — "
+                "fetching all users without org scoping",
+                self.crm_type,
+                self._integration_id,
+            )
+            path = "/api/v1/users"
+            all_users = await self._client.paginate_all(path)
 
         raw_agents = [
             u for u in all_users
@@ -181,7 +191,17 @@ class ZammadAdapter(BaseCrmAdapter):
         """
         self._assert_authenticated()
 
-        all_users = await self._fetch_users_for_org(crm_org_id)
+        if crm_org_id:
+            all_users = await self._fetch_users_for_org(crm_org_id)
+        else:
+            logger.warning(
+                "[%s] fetch_customers: crm_org_id not provided for integration_id=%s — "
+                "fetching all users without org scoping",
+                self.crm_type,
+                self._integration_id,
+            )
+            path = "/api/v1/users"
+            all_users = await self._client.paginate_all(path)
 
         raw_customers = [
             u for u in all_users

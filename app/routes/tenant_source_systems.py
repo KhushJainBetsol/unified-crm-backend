@@ -17,8 +17,9 @@ from app.dependencies import get_db  # your existing async session dependency
 from app.schemas.tenant_source_systems import (
     TenantSourceSystemCheckRequest,
     TenantSourceSystemCheckResponse,
+    TenantActiveIntegrationsResponse
 )
-from app.services.tenant_source_systems import check_tenant_source_system
+from app.services.tenant_source_systems import check_tenant_source_system,get_active_integrations
 
 router = APIRouter(
     prefix="/tenant-source-systems",
@@ -53,3 +54,26 @@ async def check_mapping_get(
         source_system_id=source_system_id,
     )
     return await check_tenant_source_system(request, db)
+
+# --------------------------------------------------------------------------- #
+# GET /tenant-source-systems/active  (NEW)                                      #
+# --------------------------------------------------------------------------- #
+
+@router.get(
+    "/active",
+    response_model=TenantActiveIntegrationsResponse,
+    summary="List all active source-system integrations for a tenant",
+    response_description=(
+        "Returns the tenant_id plus a list of source_system_ids "
+        "that are currently active for that tenant."
+    ),
+)
+async def get_active_integrations_for_tenant(
+    tenant_id: uuid.UUID = Query(..., description="UUID of the tenant."),
+    db: AsyncSession = Depends(get_db),
+) -> TenantActiveIntegrationsResponse:
+    # request = TenantActiveIntegrationsResponse(
+    #     tenant_id=tenant_id,
+    # )
+    return await get_active_integrations(tenant_id, db)
+    

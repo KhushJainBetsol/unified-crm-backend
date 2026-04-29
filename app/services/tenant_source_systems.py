@@ -1,7 +1,5 @@
 """
-Service layer — tenant_source_systems existence check.
-
-Keeps all DB logic out of the router so it stays testable in isolation.
+Service layer — tenant_source_systems existence check + active integrations list.
 """
 
 from __future__ import annotations
@@ -15,6 +13,7 @@ from app.models.tenant_source_systems import TenantSourceSystem
 from app.schemas.tenant_source_systems import (
     TenantSourceSystemCheckRequest,
     TenantSourceSystemCheckResponse,
+    TenantActiveIntegrationsResponse,
 )
 
 
@@ -25,13 +24,6 @@ async def check_tenant_source_system(
     """
     Check whether a (tenant_id, source_system_id) pair exists in
     tenant_source_systems and return a structured response.
-
-    Args:
-        request: Validated request containing tenant_id and source_system_id.
-        db:      Async SQLAlchemy session (injected via FastAPI dependency).
-
-    Returns:
-        TenantSourceSystemCheckResponse with exists flag, is_active, and message.
     """
     stmt = select(TenantSourceSystem).where(
         TenantSourceSystem.tenant_id == request.tenant_id,
@@ -62,4 +54,33 @@ async def check_tenant_source_system(
         ),
         tenant_id=request.tenant_id,
         source_system_id=request.source_system_id,
+    )
+
+
+async def get_active_integrations(
+    tenant_id: uuid.UUID,
+    db: AsyncSession,
+) -> TenantActiveIntegrationsResponse:
+    """
+    Return all source_system_ids where is_active=True for the given tenant.
+
+    Args:
+        tenant_id: UUID of the tenant.
+        db:        Async SQLAlchemy session (injected via FastAPI dependency).
+
+    Returns:
+        TenantActiveIntegrationsResponse containing the list of active
+        source_system_ids and their count.
+    """
+    stmt = select(TenantSourceSystem.source_system_id).where(
+        TenantSourceSystem.tenant_id == tenant_id,
+        TenantSourceSystem.is_active.is_(True),
+    )
+    result = await db.execute(stmt)
+    active_ids: list[int] = list(result.scalars().all())
+
+    return TenantActiveIntegrationsResponse(
+        tenant_id=tenant_id,
+        active_source_system_ids=active_ids,
+        count=len(active_ids),
     )

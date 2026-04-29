@@ -26,7 +26,7 @@ class TenantSourceSystemCheckRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Response                                                                      #
+# Response — single check                                                       #
 # --------------------------------------------------------------------------- #
 
 class TenantSourceSystemCheckResponse(BaseModel):
@@ -44,3 +44,32 @@ class TenantSourceSystemCheckResponse(BaseModel):
     )
     tenant_id: uuid.UUID = Field(..., description="Echo of the requested tenant_id.")
     source_system_id: int = Field(..., description="Echo of the requested source_system_id.")
+
+
+# --------------------------------------------------------------------------- #
+# Response — active integrations list (new)                                     #
+# --------------------------------------------------------------------------- #
+
+class ActiveIntegrationItem(BaseModel):
+    """A single active source-system integration belonging to the tenant."""
+    source_system_id: int = Field(
+        ...,
+        description="Integer ID of the source system.",
+    )
+
+class TenantActiveIntegrationsResponse(BaseModel):
+    tenant_id: uuid.UUID = Field(
+        ...,
+        description="The tenant whose integrations are listed.",
+    )
+    active_source_system_ids: list[int] = Field(
+        default_factory=list,
+        description=(
+            "List of source_system_id values where the tenant has an "
+            "active (is_active=True) mapping."
+        ),
+    )
+    count: int = Field(
+        ...,
+        description="Number of active integrations found.",
+    )
