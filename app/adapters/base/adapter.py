@@ -23,7 +23,6 @@ from app.domain.models import (
     PaginatedResult,
     UnifiedAgent,
     UnifiedComment,
-    UnifiedOrganization,
     UnifiedTicket,
 )
 
@@ -158,14 +157,6 @@ class BaseCrmAdapter(ABC):
     ) -> PaginatedResult:
         """Fetch customers. items → List[UnifiedCustomer]."""
 
-    @abstractmethod
-    async def fetch_organizations(
-        self,
-        *,
-        page: int = 1,
-        per_page: int = 100,
-    ) -> PaginatedResult:
-        """Fetch organizations. items → List[UnifiedOrganization]."""
 
     @abstractmethod
     async def push_ticket_update(
@@ -193,6 +184,31 @@ class BaseCrmAdapter(ABC):
         - Converting to UnifiedComment
         - For Zammad: marking the oldest article as is_first_article=True
             so CommentService can use it to update the ticket description
+        """
+
+    @abstractmethod
+    async def push_comment(
+        self,
+        crm_ticket_id: str,
+        body: str,
+        author_name: str,
+    ) -> dict:
+        """
+        Post a new comment to a ticket in the CRM.
+
+        Args:
+            crm_ticket_id: The external ticket ID in the CRM
+            body: The comment text to post
+            author_name: The name of the agent posting the comment
+
+        Returns:
+            A dict with at least an 'id' key containing the comment's
+            external ID, or a synthesized local ID if the CRM doesn't return one.
+
+        Raises:
+            AuthenticationError: If the adapter is not authenticated
+            HTTPStatusError: If the CRM rejects the request
+            TimeoutError: If the CRM doesn't respond in time
         """
 
     # ------------------------------------------------------------------

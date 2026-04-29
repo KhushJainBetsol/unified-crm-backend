@@ -7,30 +7,18 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.normalizer.normalizer import normalize_ticket, normalize_tickets
-from app.config.loader import ConfigLoader
+from app.config.registry import AdapterRegistry
 from app.config.models import AdapterConfig
 from app.integrations.webhooks.models import RawWebhookPayload
 from app.repositories.ticket_repository import TicketRepository
 from app.services.sync_service import SyncService
 
 logger = logging.getLogger(__name__)
-
-# Map source_system name → config path relative to ConfigLoader base_dir.
-# Add a new entry here whenever a new CRM integration is added.
-_CONFIG_PATH_BY_SOURCE: dict[str, str] = {
-    "espocrm": "espocrm/config.yaml",
-    "zammad": "zammad/config.yaml",
-}
-
-# Module-level loader; base_dir resolved relative to this file's package root.
-# Adjust the path if your config directory lives elsewhere.
-_config_loader = ConfigLoader(base_dir=Path(__file__).resolve().parent.parent / "config")
 
 
 # ── Custom Exceptions ──────────────────────────────────────────────────────────
@@ -80,34 +68,42 @@ async def _dispatch(payload: RawWebhookPayload, session: AsyncSession) -> None:
     """
     Routes the payload to the correct CRM handler.
 
-    Loads the AdapterConfig once here and passes it to each handler so
-    neither _handle_espo nor _handle_zammad need to touch the loader.
-    This also makes config-load failures surface early with a clear error
-    rather than mid-loop inside a per-record handler.
+    Loads the AdapterConfig from the central AdapterRegistry.
+    If the source_system is not registered, early-exit with a log message.
+
+    This ensures webhook processing uses the same config as the adapter layer,
+    avoiding duplicate config mappings.
     """
-    config_path = _CONFIG_PATH_BY_SOURCE.get(payload.source_system)
-    if config_path is None:
+    from app.adapter_dependencies.deps import get_adapter_factory_instance
+
+    try:
+        factory = get_adapter_factory_instance()
+        registry = factory._adapter_registry
+    except RuntimeError as exc:
+        logger.error("Adapter registry not initialized: %s", exc)
+        return
+
+    # Validate that the source system is registered
+    try:
+        config = registry.get_adapter_config(payload.source_system)
+    except Exception as exc:
         logger.error(
-            "No handler registered for source_system=%s — "
-            "check the CrmIntegration configuration",
+            "Source system not registered | source=%s | error=%s",
             payload.source_system,
+            exc,
         )
         return
 
-    # Load (or return cached) AdapterConfig for this CRM.
-    config = _config_loader.load_adapter_config(config_path)
-
-    match payload.source_system:
-        case "espocrm":
-            await _handle_espo(payload, session, config)
-        case "zammad":
-            await _handle_zammad(payload, session, config)
-        case _:
-            logger.error(
-                "No handler registered for source_system=%s — "
-                "check the CrmIntegration configuration",
-                payload.source_system,
-            )
+    # Route to the appropriate handler
+    if payload.source_system == "espocrm":
+        await _handle_espo(payload, session, config)
+    elif payload.source_system == "zammad":
+        await _handle_zammad(payload, session, config)
+    else:
+        logger.error(
+            "No handler registered for source_system=%s",
+            payload.source_system,
+        )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -157,15 +153,14 @@ async def _handle_espo(
             continue
 
         try:
-            match payload.event_type:
-                case "Case.create":
-                    await _espo_create(raw, source_system_id, tenant_id, sync, repo, config)
-                case "Case.delete":
-                    await _espo_delete(crm_ticket_id, source_system_id, tenant_id, repo)
-                case _:
-                    await _espo_partial_update(
-                        crm_ticket_id, raw, source_system_id, tenant_id, sync, repo
-                    )
+            if payload.event_type == "Case.create":
+                await _espo_create(raw, source_system_id, tenant_id, sync, repo, config)
+            elif payload.event_type == "Case.delete":
+                await _espo_delete(crm_ticket_id, source_system_id, tenant_id, repo)
+            else:
+                await _espo_partial_update(
+                    crm_ticket_id, raw, source_system_id, tenant_id, sync, repo
+                )
         except (NormalizationError, UnresolvableStatusError) as exc:
             logger.error(
                 "espo: skipping id=%s event=%s — %s",

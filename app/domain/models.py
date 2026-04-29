@@ -170,27 +170,6 @@ class UnifiedCustomer(BaseModel):
         return " ".join(parts) or self.email or self.id
 
 
-class UnifiedOrganization(BaseModel):
-    """A normalised CRM organization / account."""
-
-    id:             str
-    crm_type:       str
-    integration_id: str
-
-    name:   Optional[str] = None
-    active: bool          = True
-
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-    raw: Dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("created_at", "updated_at", mode="before")
-    @classmethod
-    def normalise_tz(cls, v: Any) -> Optional[datetime]:
-        return _parse_dt(v)
-
-
 # ---------------------------------------------------------------------------
 # Pagination envelope
 # ---------------------------------------------------------------------------

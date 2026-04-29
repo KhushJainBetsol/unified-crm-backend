@@ -9,7 +9,6 @@ from app.domain.models import (
     UnifiedAgent,
     UnifiedCustomer,
     UnifiedComment,
-    UnifiedOrganization,
 )
 from app.adapters.espocrm.client import EspoCrmClient
 from app.integrations.normalizer.comment_normalizer import _parse_dt  # reuse helper
@@ -48,7 +47,6 @@ class EspoCrmAdapter(BaseCrmAdapter):
 
     async def fetch_tickets(
         self,
-        crm_org_id: str,
         page: int = 1,
         per_page: int = 100,
         filters: Optional[Dict[str, Any]] = None,
@@ -57,29 +55,6 @@ class EspoCrmAdapter(BaseCrmAdapter):
         path = self._get_endpoint("tickets")
 
         extra_params: Dict[str, Any] = dict(filters or {})
-
-        if crm_org_id:
-            # Filter Cases where accountId == crm_org_id using EspoCRM's
-            # where-clause syntax (same pattern used in fetch_agents for contacts).
-            extra_params.update(
-                {
-                    "where[0][type]":      "equals",
-                    "where[0][attribute]": "accountId",
-                    "where[0][value]":     crm_org_id,
-                }
-            )
-            logger.info(
-                "[%s] fetch_tickets: scoping to account_id=%s",
-                self.crm_type,
-                crm_org_id,
-            )
-        else:
-            logger.warning(
-                "[%s] fetch_tickets: crm_org_id not provided for integration_id=%s — "
-                "returning all tickets without account scoping",
-                self.crm_type,
-                self._integration_id,
-            )
 
         raw_list = await self._client.paginate_all(path, extra_params=extra_params)
         mapped_items = self._mapper.map_tickets(raw_list)
@@ -96,7 +71,7 @@ class EspoCrmAdapter(BaseCrmAdapter):
         raw_ticket = await self._client.request("GET", path)
         return self._mapper.to_ticket(raw_ticket)
 
-    async def fetch_agents(self, crm_org_id: str,page: int = 1, per_page: int = 100) -> PaginatedResult:
+    async def fetch_agents(self,page: int = 1, per_page: int = 100) -> PaginatedResult:
         """
         Fetch all EspoCRM users whose role is "Agent", scoped to the
         Account that matches this integration's crm_org_id.
@@ -186,71 +161,11 @@ class EspoCrmAdapter(BaseCrmAdapter):
         # crm_org_id is the EspoCRM Account UUID stored on the integration.
         # crm_org_id: Optional[str] = self._crm_org_id
 
-        if not crm_org_id:
-            # No org scoping available — return all instance-wide agents.
-            # This happens when the integration has no crm_org_id configured.
-            logger.warning(
-                "[%s] fetch_agents: crm_org_id not set on integration_id=%s — "
-                "returning all %d instance-wide agents without account scoping",
-                self.crm_type,
-                self._integration_id,
-                len(all_agents_raw),
-            )
-            mapped_items = self._mapper.map_agents(all_agents_raw)
-            return PaginatedResult(items=mapped_items, page=1, per_page=per_page, has_more=False)
-
-        contacts_path = self._get_endpoint("contacts")
-        contacts_raw = await self._client.paginate_all(
-            contacts_path,
-            extra_params={
-                "where[0][type]":      "equals",
-                "where[0][attribute]": "accountId",
-                "where[0][value]":     crm_org_id,
-            },
-        )
-
-        logger.info(
-            "[%s] fetch_agents: %d contact(s) found for account_id=%s",
-            self.crm_type,
-            len(contacts_raw),
-            crm_org_id,
-        )
-
-        if not contacts_raw:
-            logger.info(
-                "[%s] fetch_agents: no contacts for account_id=%s — no agents to return",
-                self.crm_type,
-                crm_org_id,
-            )
-            return PaginatedResult(items=[], page=1, per_page=per_page, has_more=False)
-
-        # ── Step 4: cross-match agent emails against contact emails ───────
-        contact_emails = {
-            c["emailAddress"].lower()
-            for c in contacts_raw
-            if c.get("emailAddress")
-        }
-
-        scoped_agents_raw = [
-            agent for agent in all_agents_raw
-            if (agent.get("emailAddress") or "").lower() in contact_emails
-        ]
-
-        logger.info(
-            "[%s] fetch_agents: %d/%d agent(s) scoped to account_id=%s "
-            "(matched against %d contact email(s))",
-            self.crm_type,
-            len(scoped_agents_raw),
-            len(all_agents_raw),
-            crm_org_id,
-            len(contact_emails),
-        )
-
-        # ── Map to unified domain models ──────────────────────────────────
-        mapped_items = self._mapper.map_agents(scoped_agents_raw)
+    
+        mapped_items = self._mapper.map_agents(all_agents_raw)
         return PaginatedResult(items=mapped_items, page=1, per_page=per_page, has_more=False)
 
-    async def fetch_customers(self, crm_org_id: str,page: int = 1, per_page: int = 100) -> PaginatedResult:
+    async def fetch_customers(self,page: int = 1, per_page: int = 100) -> PaginatedResult:
         """
         Fetch all EspoCRM users whose role is "Customer".
 
@@ -324,13 +239,6 @@ class EspoCrmAdapter(BaseCrmAdapter):
 
         # ── Map to unified domain models ──────────────────────────────────
         mapped_items = self._mapper.map_customers(customers_raw)
-        return PaginatedResult(items=mapped_items, page=1, per_page=per_page, has_more=False)
-
-    async def fetch_organizations(self, page: int = 1, per_page: int = 100) -> PaginatedResult:
-        self._assert_authenticated()
-        path = self._get_endpoint("organizations")
-        raw_list = await self._client.paginate_all(path)
-        mapped_items = self._mapper.map_organizations(raw_list)
         return PaginatedResult(items=mapped_items, page=1, per_page=per_page, has_more=False)
 
     async def verify_connection(self) -> Dict[str, Any]:
@@ -452,3 +360,23 @@ class EspoCrmAdapter(BaseCrmAdapter):
             ))
 
         return PaginatedResult(items=items, page=1, per_page=len(items), has_more=False)
+
+    async def push_comment(
+        self,
+        crm_ticket_id: str,
+        body: str,
+        author_name: str,
+    ) -> dict:
+        """
+        Post a new comment (stream Post) to a Case in EspoCRM.
+
+        Returns a dict with at least an 'id' key, or a synthesized local ID
+        if the CRM doesn't return one.
+        """
+        self._assert_authenticated()
+
+        return await self._client.post_comment(
+            crm_ticket_id=crm_ticket_id,
+            body=body,
+            author_name=author_name,
+        )

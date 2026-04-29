@@ -174,14 +174,12 @@ async def _sync_entities_via_adapter(
     and upsert them into the DB.  Returns a summary dict.
     """
     source_system_id = tss.source_system_id
-    crm_org_id = tss.crm_org_id
 
     try:
         adapter = await factory.create(str(tss.integration_id))
         async with adapter:
-            agents_result    = await adapter.fetch_agents(crm_org_id)
-            customers_result = await adapter.fetch_customers(crm_org_id)
-            orgs_result      = await adapter.fetch_organizations()
+            agents_result    = await adapter.fetch_agents()
+            customers_result = await adapter.fetch_customers()
     except AdapterFactoryError as exc:
         raise _adapter_error_to_http(exc)
     except Exception as exc:
@@ -190,17 +188,14 @@ async def _sync_entities_via_adapter(
     # Unwrap PaginatedResult — items are UnifiedAgent/UnifiedCustomer/UnifiedOrganization
     raw_agents    = agents_result.items
     raw_customers = customers_result.items
-    raw_orgs      = orgs_result.items
 
     svc = EntitySyncService(db, source_system_id, tenant_id)
     agents_c,    agents_u    = await svc.sync_agents(raw_agents,    crm_type)
     customers_c, customers_u = await svc.sync_customers(raw_customers, crm_type)
-    companies_c, companies_u = await svc.sync_companies(raw_orgs,    crm_type)
 
     return {
         "agents":    {"created": agents_c,    "updated": agents_u},
         "customers": {"created": customers_c, "updated": customers_u},
-        "companies": {"created": companies_c, "updated": companies_u},
     }
 
 
@@ -221,9 +216,8 @@ async def _sync_tickets_via_adapter(
     """
     try:
         adapter = await factory.create(str(tss.integration_id))
-        crm_org_id=tss.crm_org_id
         async with adapter:
-            tickets_result = await adapter.fetch_tickets(crm_org_id)
+            tickets_result = await adapter.fetch_tickets()
     except AdapterFactoryError as exc:
         raise _adapter_error_to_http(exc)
     except Exception as exc:
@@ -387,6 +381,11 @@ async def sync_zammad_entities_for_tenant(
     factory: CrmAdapterFactory = Depends(get_adapter_factory),
     registry: AdapterRegistry = Depends(get_adapter_registry),
 ):
+    logger.warning(
+        "DEPRECATED: /sync/tenant/{tenant_id}/zammad/sync-entities is deprecated. "
+        "Use /sync/tenant/{tenant_id}/zammad/sync-entities instead.",
+        extra={"tenant_id": str(tenant_id)},
+    )
     await _get_tenant_or_404(tenant_id, db)
     tss = await _get_tss_or_404(tenant_id, "zammad", db)
     entity_result = await _sync_entities_via_adapter(

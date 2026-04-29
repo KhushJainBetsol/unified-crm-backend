@@ -26,7 +26,48 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 
 # ---------------------------------------------------------------------------
-# Core singleton accessors
+# Non-request accessors (for services outside FastAPI context)
+# ---------------------------------------------------------------------------
+
+def get_adapter_factory_instance() -> CrmAdapterFactory:
+    """
+    Return the CrmAdapterFactory from app.state for use in non-route contexts.
+
+    This is for services instantiated outside FastAPI request handling,
+    such as background schedulers, cron jobs, or direct service instantiation
+    in tests.
+
+    Usage
+    -----
+    # In a background scheduler or service initialization:
+    factory = get_adapter_factory_instance()
+    adapter = await factory.create(integration_id)
+
+    Raises
+    ------
+    RuntimeError: If the app is not running or factory is not initialised.
+
+    Note
+    ----
+    This function imports `app` at call time to avoid circular imports.
+    It is safe to call after lifespan has completed app initialisation.
+    """
+    # Import at function call time to avoid circular dependencies
+    from app.main import app
+
+    factory: CrmAdapterFactory | None = getattr(
+        app.state, "adapter_factory", None
+    )
+    if factory is None:
+        raise RuntimeError(
+            "CRM adapter factory is not initialised. "
+            "Ensure the app has completed its lifespan startup."
+        )
+    return factory
+
+
+# ---------------------------------------------------------------------------
+# Core singleton accessors (for FastAPI Request context)
 # ---------------------------------------------------------------------------
 
 def get_adapter_registry(request: Request) -> AdapterRegistry:

@@ -23,7 +23,6 @@ from app.domain.models import (
     TicketStatus,
     UnifiedAgent,
     UnifiedCustomer,
-    UnifiedOrganization,
     UnifiedTicket,
 )
 logger = logging.getLogger(__name__)
@@ -144,19 +143,6 @@ class SchemaMapper:
             updated_at=_resolve(raw, m.get("updated_at", "?updated_at")),
             raw=raw,
         )
-    def to_organization(self, raw: Dict[str, Any]) -> UnifiedOrganization:
-        """Map a raw CRM organization payload to a UnifiedOrganization."""
-        m = self._mappings.organization
-        return UnifiedOrganization(
-            id=str(_resolve(raw, m.get("id", "id")) or ""),
-            crm_type=self._crm_type,
-            integration_id=self._integration_id,
-            name=_resolve(raw, m.get("name", "?name")),
-            active=bool(_resolve(raw, m.get("active", "?active")) or True),
-            created_at=_resolve(raw, m.get("created_at", "?created_at")),
-            updated_at=_resolve(raw, m.get("updated_at", "?updated_at")),
-            raw=raw,
-        )
     def map_tickets(self, raw_list: List[Dict[str, Any]]) -> List[UnifiedTicket]:
         """Bulk-map a list of raw ticket dicts."""
         tickets = []
@@ -193,20 +179,6 @@ class SchemaMapper:
                     raw.get("id"),
                 )
         return customers
-    def map_organizations(
-        self, raw_list: List[Dict[str, Any]]
-    ) -> List[UnifiedOrganization]:
-        """Bulk-map a list of raw organization dicts."""
-        orgs = []
-        for raw in raw_list:
-            try:
-                orgs.append(self.to_organization(raw))
-            except Exception:
-                logger.exception(
-                    "SchemaMapper failed to map organization payload (id=%s). Skipping.",
-                    raw.get("id"),
-                )
-        return orgs
     # ------------------------------------------------------------------
     # Private normalisation helpers
     # ------------------------------------------------------------------

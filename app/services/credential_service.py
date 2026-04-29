@@ -101,7 +101,6 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.crm_clients import fetch_crm_org_id
 from app.credentials.async_manager import AsyncInfisicalCredentialManager
 from app.credentials.encryption import EncryptionService
 from app.credentials.exceptions import (
@@ -309,25 +308,10 @@ class CredentialProvisioningService:
             source_system=source_system,          # already resolved — no second query
         )
 
-        # ── 10. Fetch CRM org ID + insert TenantSourceSystem row ───────────
-        crm_org_id: str | None = await fetch_crm_org_id(
-            system_name=crm_type,
-            tenant_name=tenant_name,
-        )
-
-        if crm_org_id is None:
-            logger.warning(
-                "Could not fetch CRM org id for tenant='%s' system='%s' — "
-                "crm_org_id will be NULL and must be back-filled manually.",
-                tenant_name,
-                crm_type,
-            )
-
         tss_row = TenantSourceSystem(
             tenant_id=tenant_id,
             source_system_id=source_system.id,
             integration_id=integration_id,
-            crm_org_id=crm_org_id,
             is_active=True,
         )
         self._db.add(tss_row)

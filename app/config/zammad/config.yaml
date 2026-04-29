@@ -55,11 +55,6 @@ endpoints:
     default_params:
       role: "Customer"
 
-  organizations:
-    path: "/api/v1/organizations"
-    method: "GET"
-    default_params: {}
-
   token-validation:
     path: "/api/v1/user_access_token"
     method: "GET"

@@ -8,7 +8,6 @@ from app.domain.models import (
     UnifiedTicket,
     UnifiedAgent,
     UnifiedComment,
-    UnifiedOrganization
 )
 from app.adapters.zammad.client import ZammadClient
 from app.integrations.normalizer.comment_normalizer import _extract_name, _extract_email, _parse_dt
@@ -45,42 +44,20 @@ class ZammadAdapter(BaseCrmAdapter):
 
     async def fetch_tickets(
         self,
-        crm_org_id: Optional[str] = None,
         page: int = 1,
         per_page: int = 100,
         filters: Optional[Dict[str, Any]] = None,
     ) -> PaginatedResult:
         self._assert_authenticated()
 
-        if crm_org_id:
-            # Zammad uses a Lucene-style query string on the search endpoint.
-            # e.g. GET /api/v1/tickets/search?query=organization_id:5&page=1&per_page=100
-            path   = self._get_endpoint("tickets")
-            params: Dict[str, Any] = {
-                "query":    f"organization_id:{crm_org_id}",
-                "page":     page,
-                "per_page": per_page,
-            }
-            if filters:
-                params.update(filters)
-            logger.info(
-                "[%s] fetch_tickets: scoping to organization_id=%s via search endpoint",
-                self.crm_type,
-                crm_org_id,
-            )
-        else:
-            logger.warning(
-                "[%s] fetch_tickets: crm_org_id not provided for integration_id=%s — "
-                "returning all tickets without organization scoping",
-                self.crm_type,
-                self._integration_id,
-            )
-            path   = self._get_endpoint("tickets")
-            params = self._get_endpoint_params("tickets")
-            params["page"]     = page
-            params["per_page"] = per_page
-            if filters:
-                params.update(filters)
+
+       
+        path   = self._get_endpoint("tickets")
+        params = self._get_endpoint_params("tickets")
+        params["page"]     = page
+        params["per_page"] = per_page
+        if filters:
+            params.update(filters)
 
         raw_response = await self._client.request("GET", path, params=params)
         raw_list     = raw_response if isinstance(raw_response, list) else []
@@ -99,45 +76,8 @@ class ZammadAdapter(BaseCrmAdapter):
         raw_ticket = await self._client.request("GET", path)
         return self._mapper.to_ticket(raw_ticket)
 
-    async def _fetch_users_for_org(self, crm_org_id: str) -> list[dict]:
-        """
-        Fetch users scoped to a specific org via search endpoint.
-        Mirrors client.py's get_users_by_org() logic.
-        """
-        all_users: list[dict] = []
-        page = 1
-
-        while True:
-            logger.info(
-                "[%s] Fetching users for org_id=%s page=%d",
-                self.crm_type, crm_org_id, page,
-            )
-            response = await self._client.request(
-                "GET",
-                "/api/v1/users/search",
-                params={
-                    "query":    f"organization_id:{crm_org_id}",
-                    "per_page": 100,
-                    "page":     page,
-                },
-            )
-            batch: list[dict] = response if isinstance(response, list) else []
-            if not batch:
-                break
-            all_users.extend(batch)
-            if len(batch) < 100:
-                break
-            page += 1
-
-        logger.info(
-            "[%s] _fetch_users_for_org: %d users fetched for org_id=%s",
-            self.crm_type, len(all_users), crm_org_id,
-        )
-        return all_users
-
     async def fetch_agents(
         self,
-        crm_org_id: str,
         page: int = 1,
         per_page: int = 100,
     ) -> PaginatedResult:
@@ -147,17 +87,9 @@ class ZammadAdapter(BaseCrmAdapter):
         """
         self._assert_authenticated()
 
-        if crm_org_id:
-            all_users = await self._fetch_users_for_org(crm_org_id)
-        else:
-            logger.warning(
-                "[%s] fetch_agents: crm_org_id not provided for integration_id=%s — "
-                "fetching all users without org scoping",
-                self.crm_type,
-                self._integration_id,
-            )
-            path = "/api/v1/users"
-            all_users = await self._client.paginate_all(path)
+        
+        path =  self._get_endpoint("agents")
+        all_users = await self._client.paginate_all(path)
 
         raw_agents = [
             u for u in all_users
@@ -166,8 +98,8 @@ class ZammadAdapter(BaseCrmAdapter):
         ]
 
         logger.info(
-            "[%s] fetch_agents: %d agents filtered from %d users (org_id=%s)",
-            self.crm_type, len(raw_agents), len(all_users), crm_org_id,
+            "[%s] fetch_agents: %d agents filtered from %d users",
+            self.crm_type, len(raw_agents), len(all_users),
         )
 
         mapped_items = self._mapper.map_agents(raw_agents)
@@ -181,7 +113,6 @@ class ZammadAdapter(BaseCrmAdapter):
 
     async def fetch_customers(
         self,
-        crm_org_id: str,
         page: int = 1,
         per_page: int = 100,
     ) -> PaginatedResult:
@@ -191,17 +122,8 @@ class ZammadAdapter(BaseCrmAdapter):
         """
         self._assert_authenticated()
 
-        if crm_org_id:
-            all_users = await self._fetch_users_for_org(crm_org_id)
-        else:
-            logger.warning(
-                "[%s] fetch_customers: crm_org_id not provided for integration_id=%s — "
-                "fetching all users without org scoping",
-                self.crm_type,
-                self._integration_id,
-            )
-            path = "/api/v1/users"
-            all_users = await self._client.paginate_all(path)
+        path =  self._get_endpoint("customers")
+        all_users = await self._client.paginate_all(path)
 
         raw_customers = [
             u for u in all_users
@@ -210,8 +132,8 @@ class ZammadAdapter(BaseCrmAdapter):
         ]
 
         logger.info(
-            "[%s] fetch_customers: %d customers filtered from %d users (org_id=%s)",
-            self.crm_type, len(raw_customers), len(all_users), crm_org_id,
+            "[%s] fetch_customers: %d customers filtered from %d users",
+            self.crm_type, len(raw_customers), len(all_users),
         )
 
         mapped_items = self._mapper.map_customers(raw_customers)
@@ -222,13 +144,6 @@ class ZammadAdapter(BaseCrmAdapter):
             per_page=per_page,
             has_more=False,
         )
-
-    async def fetch_organizations(self, page: int = 1, per_page: int = 100) -> PaginatedResult:
-        self._assert_authenticated()
-        path     = self._get_endpoint("organizations")
-        raw_list = await self._client.paginate_all(path)
-        mapped_items = self._mapper.map_organizations(raw_list)
-        return PaginatedResult(items=mapped_items, page=1, per_page=per_page, has_more=False)
 
     async def verify_connection(self) -> Dict[str, Any]:
         self._assert_authenticated()
@@ -330,3 +245,23 @@ class ZammadAdapter(BaseCrmAdapter):
             ))
 
         return PaginatedResult(items=items, page=1, per_page=len(items), has_more=False)
+
+    async def push_comment(
+        self,
+        crm_ticket_id: str,
+        body: str,
+        author_name: str,
+    ) -> dict:
+        """
+        Post a new comment (article) to a ticket in Zammad.
+
+        Returns a dict with at least an 'id' key, or a synthesized local ID
+        if the CRM doesn't return one.
+        """
+        self._assert_authenticated()
+
+        return await self._client.post_comment(
+            crm_ticket_id=crm_ticket_id,
+            body=body,
+            author_name=author_name,
+        )

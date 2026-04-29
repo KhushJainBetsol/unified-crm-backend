@@ -51,7 +51,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.registry import AdapterNotFoundError, AdapterRegistry
-from app.domain.models import UnifiedAgent, UnifiedCustomer, UnifiedOrganization
+from app.domain.models import UnifiedAgent, UnifiedCustomer
 from app.models.agent import Agent
 from app.models.company import Company
 from app.models.customer import Customer
@@ -148,35 +148,6 @@ def _extract_customer_fields(
     return crm_customer_id, name, email, phone
 
 
-def _extract_org_fields(
-    raw: dict, mappings: dict[str, str]
-) -> tuple[str, str, str | None, str | None]:
-    """
-    Extract (crm_company_id, company_name, email, phone) from a raw org dict.
-    """
-    id_path = mappings.get("id", "id")
-    crm_company_id = str(_get(raw, id_path))
-
-    name_path    = mappings.get("name", "name")
-    company_name = str(_get(raw, name_path) or f"Organization {crm_company_id}")
-
-    email_path = mappings.get("email", "?email")
-    email = _get(raw, email_path) or None
-    if email is not None:
-        email = str(email)
-
-    phone_path = mappings.get("phone", "?phone")
-    phone = _get(raw, phone_path) or None
-    if phone is not None:
-        phone = str(phone)
-    else:
-        phone = raw.get("phoneNumber") or raw.get("phone") or None
-        if phone is not None:
-            phone = str(phone)
-
-    return crm_company_id, company_name, email, phone
-
-
 # ---------------------------------------------------------------------------
 # Service class
 # ---------------------------------------------------------------------------
@@ -265,41 +236,7 @@ class EntitySyncService:
             await self.db.flush()
             return True
 
-    async def _upsert_company(
-        self,
-        crm_company_id: str,
-        company_name: str,
-        email: str | None = None,
-        phone: str | None = None,
-    ) -> bool:
-        """Returns True if created, False if updated."""
-        result = await self.db.execute(
-            select(Company).where(
-                Company.tenant_id        == self.tenant_id,
-                Company.crm_company_id   == crm_company_id,
-                Company.source_system_id == self.source_system_id,
-            )
-        )
-        company = result.scalars().first()
-
-        if company:
-            company.company_name = company_name
-            company.email        = email
-            company.phone        = phone
-            await self.db.flush()
-            return False
-        else:
-            self.db.add(Company(
-                tenant_id        = self.tenant_id,
-                crm_company_id   = crm_company_id,
-                source_system_id = self.source_system_id,
-                company_name     = company_name,
-                email            = email,
-                phone            = phone,
-            ))
-            await self.db.flush()
-            return True
-
+    
     # ------------------------------------------------------------------
     # Config-driven sync methods
     # ------------------------------------------------------------------
@@ -392,54 +329,6 @@ class EntitySyncService:
                 item_id = item.id if isinstance(item, UnifiedCustomer) else item.get("id")
                 logger.error(
                     "Failed to sync %s customer id=%r tenant=%s: %s",
-                    crm_type, item_id, self.tenant_id, exc,
-                )
-
-        return created, updated
-
-    async def sync_companies(
-        self,
-        raw_list: list,
-        crm_type: str,
-        registry: AdapterRegistry | None = None,
-    ) -> tuple[int, int]:
-        """
-        Sync a list of organizations into the companies table.
-
-        Accepts either:
-          - List[UnifiedOrganization]  from the adapter pattern (new)
-          - List[dict]                 raw CRM JSON (legacy / backward-compat)
-
-        Returns:
-            (created, updated) counts.
-        """
-        created = updated = 0
-
-        for item in raw_list:
-            try:
-                if isinstance(item, UnifiedOrganization):
-                    # ── Unified model path (adapter pattern) ──────────────
-                    crm_company_id = item.id
-                    company_name   = item.name or f"Organization {item.id}"
-                    email          = None   # UnifiedOrganization has no email field
-                    phone          = None   # UnifiedOrganization has no phone field
-                else:
-                    # ── Dict path (legacy) ────────────────────────────────
-                    mappings = _get_org_mappings(crm_type, registry)
-                    crm_company_id, company_name, email, phone = _extract_org_fields(item, mappings)
-
-                was_created = await self._upsert_company(
-                    crm_company_id, company_name, email, phone
-                )
-                if was_created:
-                    created += 1
-                else:
-                    updated += 1
-
-            except Exception as exc:
-                item_id = item.id if isinstance(item, UnifiedOrganization) else item.get("id")
-                logger.error(
-                    "Failed to sync %s org id=%r tenant=%s: %s",
                     crm_type, item_id, self.tenant_id, exc,
                 )
 

@@ -484,7 +484,6 @@ async def _get_tenant_source_systems(
             select(TenantSourceSystem).where(
                 TenantSourceSystem.tenant_id  == tenant_id,
                 TenantSourceSystem.is_active  == True,   # noqa: E712
-                TenantSourceSystem.crm_org_id != None,   # noqa: E711
             )
         )
         return list(result.scalars().all())
@@ -541,22 +540,19 @@ async def _sync_entities_via_adapter(
 
     Returns (agents_c, agents_u, customers_c, customers_u, companies_c, companies_u).
     """
-    crm_org_id = tss.crm_org_id
 
     adapter = await factory.create(str(tss.integration_id))
     async with adapter:
-        agents_result    = await adapter.fetch_agents(crm_org_id)
-        customers_result = await adapter.fetch_customers(crm_org_id)
-        orgs_result      = await adapter.fetch_organizations()
+        agents_result    = await adapter.fetch_agents()
+        customers_result = await adapter.fetch_customers()
 
     async with async_session_maker() as db:
         try:
             svc = EntitySyncService(db, tss.source_system_id, tenant_id)
             agents_c,    agents_u    = await svc.sync_agents(agents_result.items,    source_system_name)
             customers_c, customers_u = await svc.sync_customers(customers_result.items, source_system_name)
-            companies_c, companies_u = await svc.sync_companies(orgs_result.items,   source_system_name)
             await db.commit()
-            return agents_c, agents_u, customers_c, customers_u, companies_c, companies_u
+            return agents_c, agents_u, customers_c, customers_u
         except Exception:
             await db.rollback()
             raise
@@ -573,9 +569,8 @@ async def _sync_tickets_via_adapter(
     NormalizedTicket, and upsert into the DB.
     """
     adapter = await factory.create(str(tss.integration_id))
-    crm_org_id=tss.crm_org_id
     async with adapter:
-        tickets_result = await adapter.fetch_tickets(crm_org_id)
+        tickets_result = await adapter.fetch_tickets()
 
     normalized = [
         _unified_to_normalized(t, source_system_name)
@@ -608,11 +603,10 @@ async def _sync_one_tenant_source_system(
     if not source_system_name:
         return {"error": f"Unknown source_system_id={tss.source_system_id}"}
 
-    crm_org_id = tss.crm_org_id
 
     logger.info(
-        "Starting sync — tenant=%s source=%s crm_org_id=%s",
-        tenant_id, source_system_name, crm_org_id,
+        "Starting sync — tenant=%s source=%s",
+        tenant_id, source_system_name
     )
 
     try:
@@ -621,7 +615,6 @@ async def _sync_one_tenant_source_system(
         (
             agents_c, agents_u,
             customers_c, customers_u,
-            companies_c, companies_u,
         ) = await _sync_entities_via_adapter(
             tenant_id, source_system_name, tss, factory
         )
@@ -631,36 +624,36 @@ async def _sync_one_tenant_source_system(
         )
 
         logger.info(
-            "Sync done — tenant=%s source=%s crm_org=%s | "
-            "agents(%d/%d) customers(%d/%d) companies(%d/%d) "
+            "Sync done — tenant=%s source=%s| "
+            "agents(%d/%d) customers(%d/%d)"
             "tickets: fetched=%d created=%d updated=%d failed=%d",
-            tenant_id, source_system_name, crm_org_id,
-            agents_c, agents_u, customers_c, customers_u, companies_c, companies_u,
+            tenant_id, source_system_name,
+            agents_c, agents_u, customers_c, customers_u,
             ticket_result.total_fetched, ticket_result.created,
             ticket_result.updated, ticket_result.failed,
         )
 
         return _build_result(
             agents_c, agents_u, customers_c, customers_u,
-            companies_c, companies_u, ticket_result,
+            ticket_result,
         )
 
     except AdapterFactoryError as exc:
         logger.error(
-            "Adapter factory error for tenant=%s source=%s crm_org=%s: %s",
-            tenant_id, source_system_name, crm_org_id, exc,
+            "Adapter factory error for tenant=%s source=%s",
+            tenant_id, source_system_name, exc,
         )
         return {"error": str(exc)}
     except CrmClientError as exc:
         logger.error(
-            "CRM client error for tenant=%s source=%s crm_org=%s: %s",
-            tenant_id, source_system_name, crm_org_id, exc,
+            "CRM client error for tenant=%s source=%s",
+            tenant_id, source_system_name, exc,
         )
         return {"error": str(exc)}
     except Exception as exc:
         logger.exception(
-            "Unexpected error for tenant=%s source=%s crm_org=%s: %s",
-            tenant_id, source_system_name, crm_org_id, exc,
+            "Unexpected error for tenant=%s source=%s",
+            tenant_id, source_system_name, exc,
         )
         return {"error": str(exc)}
 
@@ -676,7 +669,7 @@ async def run_all_tenants_full_sync() -> None:
         tss_rows = await _get_tenant_source_systems(tenant.id)
         if not tss_rows:
             logger.debug(
-                "Tenant %s has no active source systems with crm_org_id — skipping",
+                "Tenant %s has no active source systems — skipping",
                 tenant.id,
             )
             continue
@@ -691,12 +684,12 @@ async def run_tenant_full_sync(
 ) -> dict:
     tss_rows = await _get_tenant_source_systems(tenant_id)
     if not tss_rows:
-        logger.warning("Tenant %s has no active source systems with crm_org_id", tenant_id)
+        logger.warning("Tenant %s has no active source systems", tenant_id)
         return {}
     all_results: dict[str, dict] = {}
     for tss in tss_rows:
         source_system_name = await _get_source_system_name(tss.source_system_id)
-        key = f"{source_system_name}:{tss.crm_org_id}"
+        key = f"{source_system_name}"
         all_results[key] = await _sync_one_tenant_source_system(tenant_id, tss)
     return all_results
 
@@ -710,7 +703,7 @@ async def run_zammad_full_sync(db: AsyncSession | None = None) -> dict:
             name = await _get_source_system_name(tss.source_system_id)
             if name != "zammad":
                 continue
-            key = f"tenant:{tenant.id}:zammad:{tss.crm_org_id}"
+            key = f"tenant:{tenant.id}:zammad"
             all_results[key] = await _sync_one_tenant_source_system(tenant.id, tss)
     return all_results
 
@@ -724,7 +717,7 @@ async def run_espocrm_full_sync(db: AsyncSession | None = None) -> dict:
             name = await _get_source_system_name(tss.source_system_id)
             if name != "espocrm":
                 continue
-            key = f"tenant:{tenant.id}:espocrm:{tss.crm_org_id}"
+            key = f"tenant:{tenant.id}:espocrm"
             all_results[key] = await _sync_one_tenant_source_system(tenant.id, tss)
     return all_results
 
@@ -736,14 +729,12 @@ async def run_espocrm_full_sync(db: AsyncSession | None = None) -> dict:
 def _build_result(
     agents_c, agents_u,
     customers_c, customers_u,
-    companies_c, companies_u,
     ticket_result,
 ) -> dict:
     return {
         "entities": {
             "agents":    {"created": agents_c,    "updated": agents_u},
             "customers": {"created": customers_c, "updated": customers_u},
-            "companies": {"created": companies_c, "updated": companies_u},
         },
         "tickets": {
             "total_fetched": ticket_result.total_fetched,

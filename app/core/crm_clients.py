@@ -239,40 +239,6 @@ _HTTP_TIMEOUT = 10.0
 # Public interface
 # ---------------------------------------------------------------------------
 
-async def fetch_crm_org_id(
-    system_name: str,
-    tenant_name: str,
-    factory: Optional[CrmAdapterFactory] = None,
-    integration_id: Optional[str] = None,
-) -> str | None:
-    """
-    Resolve the CRM-native organisation/account ID for *tenant_name*.
-
-    Tries the adapter path first (preferred), falls back to the legacy
-    hard-coded-credentials path if factory/integration_id are unavailable.
-
-    Args:
-        system_name:     Value from source_systems.system_name ("zammad" | "espocrm").
-        tenant_name:     The tenant's display name used as the search term.
-        factory:         CrmAdapterFactory from app.state (preferred).
-        integration_id:  UUID string of the CrmIntegration row (preferred).
-
-    Returns:
-        The CRM's own ID string, or None if not found / on any error.
-        Never raises — all failures are swallowed and logged.
-    """
-    if factory is not None and integration_id is not None:
-        return await _fetch_via_adapter(system_name, tenant_name, factory, integration_id)
-
-    # Fallback: legacy path using global settings credentials
-    logger.warning(
-        "fetch_crm_org_id: factory/integration_id not provided for system='%s' — "
-        "using legacy credential fallback for tenant '%s'",
-        system_name, tenant_name,
-    )
-    return await _fetch_org_id_fallback(system_name, tenant_name)
-
-
 # ---------------------------------------------------------------------------
 # Adapter-pattern path (preferred)
 # ---------------------------------------------------------------------------
@@ -335,79 +301,5 @@ async def _fetch_via_adapter(
 # TODO: Remove once all tenants have integration records in the DB.
 # ---------------------------------------------------------------------------
 
-async def _fetch_org_id_fallback(system_name: str, tenant_name: str) -> str | None:
-    """
-    Legacy fallback: direct httpx calls using credentials from Settings.
-    Only used when no integration_id is available yet.
-    """
-    import httpx
-
-    normalised = system_name.strip().lower()
-
-    if normalised == "zammad":
-        return await _fetch_zammad_org_id_legacy(tenant_name)
-    if normalised == "espocrm":
-        return await _fetch_espo_account_id_legacy(tenant_name)
-
-    logger.debug(
-        "fetch_crm_org_id fallback: no client configured for system '%s'", system_name
-    )
-    return None
 
 
-async def _fetch_zammad_org_id_legacy(tenant_name: str) -> str | None:
-    import httpx
-
-    url = f"{settings.ZAMMAD_BASE_URL.rstrip('/')}/api/v1/organizations/search"
-    params = {"query": f"name:{tenant_name}"}
-    headers = {
-        "Authorization": f"Token token={settings.ZAMMAD_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            resp = await client.get(url, headers=headers, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list) and data:
-                org_id = data[0].get("id")
-                if org_id is not None:
-                    return str(org_id)
-        logger.warning("Zammad fallback: no organisation found for tenant '%s'", tenant_name)
-        return None
-    except Exception as exc:
-        logger.warning("Zammad fallback org lookup failed for tenant '%s': %s", tenant_name, exc)
-        return None
-
-
-async def _fetch_espo_account_id_legacy(tenant_name: str) -> str | None:
-    import httpx
-
-    url = f"{settings.ESPO_BASE_URL.rstrip('/')}/api/v1/Account"
-    params = {
-        "where[0][type]": "equals",
-        "where[0][attribute]": "name",
-        "where[0][value]": tenant_name,
-        "maxSize": 1,
-    }
-    headers = {
-        "X-Api-Key": settings.ESPO_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            resp = await client.get(url, headers=headers, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            records = data.get("list", [])
-            if records:
-                account_id = records[0].get("id")
-                if account_id:
-                    return str(account_id)
-        logger.warning("EspoCRM fallback: no Account found for tenant '%s'", tenant_name)
-        return None
-    except Exception as exc:
-        logger.warning("EspoCRM fallback account lookup failed for tenant '%s': %s", tenant_name, exc)
-        return None

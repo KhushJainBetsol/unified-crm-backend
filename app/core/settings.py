@@ -48,10 +48,14 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
 
     # EspoCRM
+    # NOTE: Legacy env vars, kept for backwards compatibility only.
+    # All new code uses the adapter pattern with credentials from CRM integrations table.
     ESPO_BASE_URL: str = ""
     ESPO_API_KEY: str = ""
 
     # Zammad
+    # NOTE: Legacy env vars, kept for backwards compatibility only.
+    # All new code uses the adapter pattern with credentials from CRM integrations table.
     ZAMMAD_BASE_URL: str = ""
     ZAMMAD_API_TOKEN: str = ""
 
@@ -74,9 +78,9 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "http://localhost:5173"
     SUPER_ADMIN_EMAIL: str = ""
 
-    # Adapter pattern
+    # Adapter pattern (using adapter engine for all new operations)
     CRM_CONFIG_DIR: str = "app/config"
-    CRM_ADAPTER_ENGINE: str = "legacy"
+    CRM_ADAPTER_ENGINE: str = "new"  # Default to new adapter pattern
 
     # ── Infisical ─────────────────────────────────────────────────────────────
     # No empty-string defaults — if these are missing pydantic raises a clear

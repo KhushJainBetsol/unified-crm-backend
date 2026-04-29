@@ -74,11 +74,7 @@ endpoints:
     path: "/api/v1/Contact"
     method: "GET"
     default_params: {}
-
-  organizations:
-    path: "/api/v1/Account"
-    method: "GET"
-    default_params: {}
+    
   token-validation:
     path: "/api/v1/App/user?"
     method: "GET"

@@ -49,11 +49,6 @@ class TenantSourceSystem(Base):
         default=True,
     )
 
-    crm_org_id: Mapped[str | None] = mapped_column(
-        String,
-        nullable=True,
-    )
-
     # Relationships
     tenant: Mapped["Tenant"] = relationship(
         "Tenant",
