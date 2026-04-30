@@ -469,7 +469,7 @@ class CredentialProvisioningService:
     async def get_status(self, integration_id: UUID) -> CredentialStatusResponse:
         """Return metadata/status without decrypting anything."""
         row = await self._get_row_or_raise(integration_id)
-        return _to_status(row)
+        return self._to_status(row)
 
     # ── ROTATE ────────────────────────────────────────────────────────────
 
