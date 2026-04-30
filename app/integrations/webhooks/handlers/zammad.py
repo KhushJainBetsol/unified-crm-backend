@@ -1,5 +1,15 @@
 """
 app/integrations/webhooks/handlers/zammad.py
+
+Bug fixed
+---------
+_extract_event previously returned the raw Zammad event string
+(e.g. "ticket_create", "ticket_update") or fell back to the ticket
+state name (e.g. "new", "open"). Neither matched the internal keys
+("create", "update", "delete") used by _handle_zammad() in service.py,
+so every Zammad webhook hit the `else` branch and was silently discarded.
+
+Fix: normalise the raw event string to the internal key before returning.
 """
 
 from __future__ import annotations
@@ -24,6 +34,11 @@ class ZammadWebhookHandler(BaseWebhookHandler):
         body: bytes,
         integration: CrmIntegration,
     ) -> None:
+        """
+        Zammad sends its shared secret in the X-Zammad-Token header.
+        Verification is skipped (with a warning) when no secret is configured
+        so that integrations without HMAC still receive webhooks.
+        """
         expected = integration.webhook_secret or ""
 
         if not expected:
@@ -52,7 +67,6 @@ class ZammadWebhookHandler(BaseWebhookHandler):
                 status_code=400, detail="Expected a JSON object from Zammad"
             )
 
-        # Copy plain scalar values out of the ORM object here
         return RawWebhookPayload(
             integration_id=integration.id,
             source_system_id=integration.source_system_id,
@@ -65,17 +79,54 @@ class ZammadWebhookHandler(BaseWebhookHandler):
 
     @staticmethod
     def _extract_event(payload: dict) -> str:
+        """
+        Normalise the Zammad event to our internal keys: "create" | "update" | "delete".
+
+        Zammad sends an "event" field like:
+          "ticket_create"  →  "create"
+          "ticket_update"  →  "update"
+          "ticket_delete"  →  "delete"  (if ever added)
+
+        Falls back to inspecting the ticket state name if the event field is
+        absent, which should not happen in practice but guards against
+        unexpected payload shapes.
+        """
         try:
-            event = payload.get("event")
+            event = payload.get("event", "")
             if isinstance(event, str) and event:
-                return event
+                event_lower = event.lower()
+                if "create" in event_lower:
+                    return "create"
+                if "update" in event_lower:
+                    return "update"
+                if "delete" in event_lower:
+                    return "delete"
+
+            # Fallback — inspect ticket state (does NOT determine create vs update,
+            # but at least avoids "unknown" for payloads missing the event field)
             ticket = payload.get("ticket")
             if isinstance(ticket, dict):
                 state = ticket.get("state")
                 if isinstance(state, dict):
-                    name = state.get("name")
-                    if isinstance(name, str) and name:
-                        return name
-        except Exception:
-            pass
+                    state_name = state.get("name", "")
+                elif isinstance(state, str):
+                    state_name = state
+                else:
+                    state_name = ""
+
+                if state_name:
+                    logger.warning(
+                        "zammad: 'event' field missing — inferred from ticket state '%s'. "
+                        "Treating as 'update'.",
+                        state_name,
+                    )
+                    return "update"
+
+        except Exception as exc:
+            logger.warning("zammad: _extract_event failed: %s", exc)
+
+        logger.warning(
+            "zammad: could not determine event type from payload keys=%s",
+            list(payload.keys()),
+        )
         return "unknown"

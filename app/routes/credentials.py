@@ -58,6 +58,7 @@ from app.schemas.credentials import (
     CredentialStatusResponse,
     ProvisionCredentialsRequest,
     UpdateCredentialsRequest,
+    WebhookUrlResponse,
 )
 from app.services.credential_service import (
     CredentialProvisioningService,
@@ -425,6 +426,68 @@ async def verify_integration(
         )
 
     return {"integration_id": str(integration_id), "status": "verified"}
+
+
+@router.get(
+    "/{integration_id}/webhook-url",
+    response_model=WebhookUrlResponse,
+    summary="Get webhook URL for an integration",
+    description=(
+        "Returns the webhook URL and CRM-specific setup instructions for this integration. "
+        "Use this endpoint to retrieve the webhook URL that should be registered with the CRM."
+    ),
+)
+async def get_webhook_url(
+    integration_id: UUID,
+    current_user=Depends(get_current_user),
+    service: CredentialProvisioningService = Depends(get_provisioning_service),
+) -> WebhookUrlResponse:
+    """
+    Get the webhook URL for an integration.
+    
+    Steps
+    -----
+    1. Fetch the integration record to get webhook_uuid and crm_type.
+    2. Construct the webhook URL from webhook_uuid.
+    3. Return webhook URL with CRM-specific setup instructions.
+    """
+    try:
+        status_response = await service.get_status(integration_id=integration_id)
+    except Exception as exc:
+        _handle_service_error(exc, integration_id)
+    
+    # Build CRM-specific instructions
+    crm_type = status_response.crm_type.lower()
+    if crm_type == "espocrm":
+        instructions = (
+            f"In EspoCRM admin panel:\n"
+            f"1. Go to Admin → Integrations → Webhooks\n"
+            f"2. Create a new webhook with URL: {status_response.webhook_url}\n"
+            f"3. Set Events: Case.create, Case.update, Case.delete, Note.create\n"
+            f"4. Save webhook (webhook_uuid will be verified on first inbound request)"
+        )
+    elif crm_type == "zammad":
+        instructions = (
+            f"In Zammad admin panel:\n"
+            f"1. Go to Admin → Webhooks\n"
+            f"2. Create a new webhook with URL: {status_response.webhook_url}\n"
+            f"3. Set Events: ticket.create, ticket.update\n"
+            f"4. Save webhook (webhook_uuid will be verified on first inbound request)"
+        )
+    else:
+        instructions = (
+            f"Register the following URL with your CRM webhook system:\n"
+            f"URL: {status_response.webhook_url}\n"
+            f"The webhook_uuid will be verified on first inbound request."
+        )
+    
+    return WebhookUrlResponse(
+        integration_id=integration_id,
+        webhook_uuid=status_response.webhook_uuid,
+        webhook_url=status_response.webhook_url,
+        crm_type=status_response.crm_type,
+        instructions=instructions,
+    )
 
 
 @router.post(

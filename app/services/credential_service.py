@@ -255,10 +255,11 @@ class CredentialProvisioningService:
                 base_url=request.base_url,
             )
 
-            # Carry webhook fields through if the schema has them.
-            # (UpdateCredentialsRequest may expose webhook_* fields depending
-            #  on your schema version — assign them if present.)
-            for attr in ("webhook_secret", "webhook_signing_secret"):
+            # FIX: carry ALL webhook secret fields through to the update request.
+            # Previously only "webhook_secret" and "webhook_signing_secret" were
+            # forwarded — "per_event_secrets" was silently dropped, causing
+            # webhook_secrets_enc to never be written on the upsert path.
+            for attr in ("webhook_secret", "webhook_signing_secret", "per_event_secrets"):
                 if hasattr(request, attr) and hasattr(update_request, attr):
                     setattr(update_request, attr, getattr(request, attr))
 
@@ -827,6 +828,7 @@ def _to_status(row: CrmIntegration) -> CredentialStatusResponse:
         is_active=row.is_active,
         has_credentials=row.has_credentials(),
         has_webhook_secrets=row.has_webhook_secrets(),
+        webhook_uuid=row.webhook_uuid,
         token_expires_at=row.token_expires_at,
         created_at=row.created_at,
         updated_at=row.updated_at,

@@ -331,11 +331,23 @@ class CredentialStatusResponse(BaseModel):
     is_active: bool
     has_credentials: bool
     has_webhook_secrets: bool          # True when webhook_secrets_enc is populated
+    webhook_uuid: UUID                  # Unique identifier for webhook routing
     token_expires_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @property
+    def webhook_url(self) -> str:
+        """
+        Compute the full webhook URL for this integration.
+        Constructed as: {WEBHOOK_BASE_URL}/webhooks/ingest/{webhook_uuid}
+        """
+        from app.core.settings import get_settings
+        settings = get_settings()
+        base_url = getattr(settings, 'WEBHOOK_BASE_URL', 'http://localhost:8000')
+        return f"{base_url.rstrip('/')}/webhooks/ingest/{self.webhook_uuid}"
 
 
 class CredentialRotationResponse(BaseModel):
@@ -345,3 +357,19 @@ class CredentialRotationResponse(BaseModel):
     new_key_version: str
     rotated_at: datetime
     message: str = "Credentials rotated successfully."
+
+
+class WebhookUrlResponse(BaseModel):
+    """
+    Response for GET /api/v1/integrations/{integration_id}/webhook-url
+    Provides the complete webhook URL and related metadata for integration setup.
+    """
+    integration_id: UUID
+    webhook_uuid: UUID
+    webhook_url: str
+    crm_type: str
+    instructions: str = Field(
+        description="Human-readable CRM-specific instructions for webhook registration."
+    )
+
+    model_config = {"from_attributes": True}

@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     KEYCLOAK_ADMIN_CLIENT_ID: str = "crm-admin-api"
     KEYCLOAK_ADMIN_CLIENT_SECRET: str = ""
     FRONTEND_URL: str = "http://localhost:5173"
+    WEBHOOK_BASE_URL: str = "http://192.168.80.239:8000"  # Backend webhook endpoint base URL
     SUPER_ADMIN_EMAIL: str = ""
 
     # Adapter pattern (using adapter engine for all new operations)

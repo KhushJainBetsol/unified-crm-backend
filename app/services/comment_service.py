@@ -14,7 +14,7 @@ Sync flow (adapter pattern):
   sync_comments_for_ticket(ticket_id, factory)
     → load ticket + source system
     → _get_integration_id_for_ticket  (tenant_id + source_system_id → integration_id)
-    → factory.create(integration_id)  → correct adapter
+    → factory.create(integration_id)  → correct adapter  
     → adapter.fetch_comments(crm_ticket_id)  → List[UnifiedComment]
     → Zammad only: is_first_article=True → update ticket.description
     → remaining items → repo.upsert

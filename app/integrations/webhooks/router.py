@@ -11,9 +11,11 @@ handler so the service has zero SQLAlchemy dependency.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -22,9 +24,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.core.database import async_session_maker
+from app.credentials.encryption import EncryptedPayload, EncryptionService
+from app.credentials.manager import InfisicalCredentialManager
+from app.credentials.models import InfisicalSettings
+from app.integrations.webhooks.errors import WebhookVerificationError
 from app.integrations.webhooks.handlers import get_handler
 from app.integrations.webhooks.models import RawWebhookPayload
 from app.integrations.webhooks.service import handle_raw_webhook
+from app.integrations.webhooks.verifier import WebhookVerifier
 from app.models.crm_integration import CrmIntegration
 
 logger = logging.getLogger(__name__)
@@ -73,9 +80,9 @@ async def ingest(webhook_uuid: str, request: Request) -> JSONResponse:
     Design decisions:
     - Body is read before any await on `request` to avoid stream exhaustion.
     - UUID is validated before touching the DB to avoid unnecessary queries.
+    - Credentials are decrypted once and passed to service.
     - All HTTPExceptions use generic messages to avoid leaking integration
-      details to an unauthenticated caller (e.g. distinguishing "not found"
-      from "inactive" would reveal that a UUID is valid).
+      details to an unauthenticated caller.
     - handle_raw_webhook never raises; errors are logged inside the service.
       This guarantees a 200 ACK so the CRM does not retry a valid delivery.
     """
@@ -99,7 +106,7 @@ async def ingest(webhook_uuid: str, request: Request) -> JSONResponse:
             # attacker which UUIDs are valid.
             if integration is None or not integration.is_active:
                 logger.warning(
-                    "Webhook rejected | uuid=%s | reason=%s | from=%s",
+                    "Webhook rejected | webhook_uuid=%s | reason=%s | from=%s",
                     webhook_uuid,
                     "not_found" if integration is None else "inactive",
                     _client_ip(request),
@@ -118,16 +125,20 @@ async def ingest(webhook_uuid: str, request: Request) -> JSONResponse:
                 )
                 raise HTTPException(status_code=500, detail="Handler not found")
 
-            # Signature / secret verification.
-            # A failed verify should return 400, not 401/403, to avoid
-            # confirming that the endpoint exists and accepts that CRM's format.
+            # ── Decrypt secrets for verification and processing ──────────────────────
+            webhook_secrets = await _decrypt_webhook_secrets(integration)
+            outbound_credentials = await _decrypt_outbound_credentials(integration)
+
+            # ── Signature / secret verification using centralized verifier ─────────
             try:
-                await handler.verify(request, body, integration)
-            except WebhookAuthError as exc:
+                verifier = WebhookVerifier(webhook_secrets)
+                await verifier.verify(request, body, integration)
+            except WebhookVerificationError as exc:
                 logger.warning(
                     "Webhook signature verification failed | system=%s | "
-                    "integration_id=%s | from=%s | reason=%s",
+                    "webhook_uuid=%s | integration_id=%s | from=%s | reason=%s",
                     system_name,
+                    webhook_uuid,
                     integration.id,
                     _client_ip(request),
                     exc,
@@ -141,7 +152,9 @@ async def ingest(webhook_uuid: str, request: Request) -> JSONResponse:
                 payload: RawWebhookPayload = await handler.parse(
                     request, body, integration
                 )
-            except WebhookParseError as exc:
+                # Inject webhook_uuid into payload for tracing
+                payload.webhook_uuid = integration.webhook_uuid
+            except Exception as exc:
                 logger.error(
                     "Webhook parse failed | system=%s | integration_id=%s | "
                     "from=%s | reason=%s",
@@ -153,10 +166,17 @@ async def ingest(webhook_uuid: str, request: Request) -> JSONResponse:
                 raise HTTPException(status_code=400, detail="Malformed webhook payload")
 
             # Business logic — never raises; all errors are logged inside.
-            await handle_raw_webhook(payload, session)
+            # Pass both webhook secrets and outbound credentials for full processing
+            await handle_raw_webhook(
+                payload,
+                session,
+                webhook_secrets=webhook_secrets,
+                outbound_credentials=outbound_credentials,
+            )
 
     logger.info(
-        "Webhook accepted | source=%s | event=%s | records=%d | from=%s | at=%s",
+        "Webhook accepted | webhook_uuid=%s | source=%s | event=%s | records=%d | from=%s | at=%s",
+        integration.webhook_uuid,
         payload.source_system,
         payload.event_type,
         len(payload.records),
@@ -239,3 +259,78 @@ def _client_ip(request: Request) -> str:
     if request.client:
         return request.client.host
     return "unknown"
+
+
+# ── Credential decryption helpers ──────────────────────────────────────────────
+
+
+async def _decrypt_webhook_secrets(integration: CrmIntegration) -> Dict[str, Any]:
+    """
+    Decrypt webhook_secrets_enc from CrmIntegration.
+
+    Returns an empty dict if no secrets are configured or if decryption fails.
+    Logs warnings but never raises — webhook can still proceed with limited
+    verification capability.
+    """
+    if not integration.webhook_secrets_enc:
+        logger.debug(
+            "No webhook_secrets_enc configured for integration_id=%s",
+            integration.id,
+        )
+        return {}
+
+    try:
+        infisical_settings = InfisicalSettings.from_env()
+        key_manager = InfisicalCredentialManager(infisical_settings)
+        version, raw_key = key_manager.get_active_key_and_version()
+
+        enc_service = EncryptionService(raw_key=raw_key, key_version=version)
+        secrets = enc_service.decrypt_dict_from_db(integration.webhook_secrets_enc)
+        logger.debug(
+            "Successfully decrypted webhook_secrets for integration_id=%s",
+            integration.id,
+        )
+        return secrets
+    except Exception as exc:
+        logger.warning(
+            "Failed to decrypt webhook_secrets_enc for integration_id=%s: %s",
+            integration.id,
+            exc,
+        )
+        return {}
+
+
+async def _decrypt_outbound_credentials(integration: CrmIntegration) -> Dict[str, Any]:
+    """
+    Decrypt credential_enc from CrmIntegration.
+
+    Returns an empty dict if no credentials are configured or if decryption fails.
+    Logs warnings but never raises — webhook processing continues but adapter
+    authentication may fail at that point.
+    """
+    if not integration.credential_enc:
+        logger.debug(
+            "No credential_enc configured for integration_id=%s",
+            integration.id,
+        )
+        return {}
+
+    try:
+        infisical_settings = InfisicalSettings.from_env()
+        key_manager = InfisicalCredentialManager(infisical_settings)
+        version, raw_key = key_manager.get_active_key_and_version()
+
+        enc_service = EncryptionService(raw_key=raw_key, key_version=version)
+        credentials = enc_service.decrypt_dict_from_db(integration.credential_enc)
+        logger.debug(
+            "Successfully decrypted credential_enc for integration_id=%s",
+            integration.id,
+        )
+        return credentials
+    except Exception as exc:
+        logger.warning(
+            "Failed to decrypt credential_enc for integration_id=%s: %s",
+            integration.id,
+            exc,
+        )
+        return {}
