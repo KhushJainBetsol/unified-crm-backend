@@ -89,7 +89,7 @@ field_mappings:
     created_at: "createdAt"
     updated_at: "modifiedAt"
     assignee_id: "assignedUserId"
-    customer_id: "contactId"
+    customer_id: "?contactId"
     organization_id: "accountId"
     description: "?description"
   agent:
