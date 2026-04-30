@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,6 +30,10 @@ from app.services.super_admin_service import (
     svc_list_source_systems,
     svc_list_tenants,
 )
+from app.credentials.async_manager import AsyncInfisicalCredentialManager
+
+async def get_key_manager(request: Request) -> AsyncInfisicalCredentialManager:
+    return request.app.state.key_manager
 
 settings = get_settings()
 
@@ -80,14 +84,17 @@ async def list_source_systems(
 @router.post("/tenants", status_code=status.HTTP_201_CREATED)
 async def create_tenant(
     body: CreateTenantRequest,
+    request: Request,                                          # ← add
     db: AsyncSession = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
 ):
     _require_super_admin(user)
+    key_manager: AsyncInfisicalCredentialManager = request.app.state.key_manager   # ← add
     return await svc_create_tenant(
         db=db,
         name=body.name,
         contact_email=body.contact_email,
+        key_manager=key_manager,                               # ← add
     )
 
 

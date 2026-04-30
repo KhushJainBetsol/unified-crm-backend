@@ -63,6 +63,12 @@ def _creds_secret_name(integration_id: str) -> str:
     """
     return f"CREDS_{integration_id}"
 
+def _tenant_key_secret_name(tenant_id: str) -> str:
+    """
+    TENANT_KEY_<tenant_id>
+    e.g. TENANT_KEY_550e8400-e29b-41d4-a716-446655440000
+    """
+    return f"TENANT_KEY_{tenant_id}"
 
 # ---------------------------------------------------------------------------
 # InfisicalCredentialManager
@@ -176,6 +182,66 @@ class InfisicalCredentialManager:
         version = self.get_active_key_version()
         raw_key = self.get_encryption_key(version)
         return version, raw_key
+
+    # ==================================================================
+    # SECTION 1b — PER-TENANT KEY MANAGEMENT (new)
+    # ==================================================================
+
+    def generate_and_store_tenant_key(self, tenant_id: str) -> str:
+        """
+        Generate a cryptographically random AES key for a new tenant and
+        store it in Infisical under the name TENANT_KEY_<tenant_id>.
+
+        Called once at tenant-creation time by svc_create_tenant().
+        Idempotent: if the secret already exists it is overwritten
+        (upsert semantics via _upsert_secret).
+
+        Parameters
+        ----------
+        tenant_id:
+            The tenant's UUID string (no braces, lowercase).
+
+        Returns
+        -------
+        str
+            The generated raw key (hex string).  Callers don't need this
+            value directly — it's returned only for logging/testing.
+        """
+        import secrets as _secrets
+        raw_key = _secrets.token_hex(32)          # 256-bit random key
+        secret_name = _tenant_key_secret_name(tenant_id)
+        self._upsert_secret(secret_name, raw_key)
+        logger.info(
+            "Generated and stored tenant key for tenant_id='%s' "
+            "(secret_name=%s).",
+            tenant_id,
+            secret_name,
+        )
+        return raw_key
+
+    def get_tenant_key(self, tenant_id: str) -> Optional[str]:
+        """
+        Fetch the per-tenant AES key from Infisical.
+
+        Returns None if no tenant-specific key exists yet (old tenants
+        created before per-tenant key rollout).  Callers should fall back
+        to the global active key in that case.
+
+        Parameters
+        ----------
+        tenant_id:
+            The tenant's UUID string.
+        """
+        secret_name = _tenant_key_secret_name(tenant_id)
+        try:
+            return self._fetch_secret(secret_name, context=f"tenant_key:{tenant_id}")
+        except CredentialNotFoundError:
+            logger.debug(
+                "No per-tenant key found for tenant_id='%s' — "
+                "caller should fall back to global key.",
+                tenant_id,
+            )
+            return None
 
     # ==================================================================
     # SECTION 2 — CRM CREDENTIAL STORAGE (new adapter pattern)
