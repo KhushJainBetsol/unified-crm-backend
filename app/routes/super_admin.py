@@ -50,8 +50,6 @@ class CreateTenantRequest(BaseModel):
     """Tenant info + list of source system IDs the tenant will use."""
     name: str
     contact_email: EmailStr
-    source_system_ids: List[int]  # e.g. [1, 2] — must exist in source_systems table
-
 
 class InviteAdminRequest(BaseModel):
     """Invite an admin to an already-existing tenant."""
@@ -85,13 +83,11 @@ async def create_tenant(
     db: AsyncSession = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
 ):
-    """Create a new tenant and assign the source systems they use."""
     _require_super_admin(user)
     return await svc_create_tenant(
         db=db,
         name=body.name,
         contact_email=body.contact_email,
-        source_system_ids=body.source_system_ids,
     )
 
 

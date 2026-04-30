@@ -1,0 +1,132 @@
+auth:
+  strategy: "api_token"
+  token_header: "X-Api-Key"
+  token_prefix: ""
+
+http:
+  timeout_seconds: 30
+  max_retries: 3
+  backoff_base: 2
+  retry_on_status: [429, 500, 502, 503, 504]
+
+pagination:
+  strategy: "offset"
+  page_param: "offset"
+  per_page_param: "maxSize"
+  default_page_size: 100
+  items_path: "list"
+  total_count_path: "total"
+
+endpoints:
+  tickets:
+    path: "/api/v1/Case"
+    method: "GET"
+    default_params: {}
+  ticket_by_id:
+    path: "/api/v1/Case/{ticket_id}"
+    method: "GET"
+    default_params: {}
+
+  # ── Agent endpoints ────────────────────────────────────────────────
+  # Step 1 of fetch_agents: paginate all User stubs to collect IDs.
+  # rolesNames is NOT present in list responses — only in detail payload.
+  agents:
+    path: "/api/v1/User"
+    method: "GET"
+    default_params: {}
+  # Step 2 of fetch_agents: fetch full User detail by ID.
+  # rolesNames (e.g. {"69b917db3281aa2e8": "Agent"}) is present here.
+  # Filtering to role == "Agent" happens in the adapter after this fetch.
+  agent_by_id:
+    path: "/api/v1/User/{agent_id}"
+    method: "GET"
+    default_params: {}
+
+  # ── Customer endpoints ─────────────────────────────────────────────
+  # Step 1 of fetch_customers: paginate all User stubs to collect IDs.
+  # rolesNames is NOT present in list responses — only in the detail payload.
+  customers:
+    path: "/api/v1/User"
+    method: "GET"
+    default_params: {}
+  # Step 2 of fetch_customers: fetch full User detail by ID.
+  # rolesNames (e.g. {"69b917db3281aa2e8": "Customer"}) is present here.
+  # Filtering to role == "Customer" happens in the adapter after this fetch.
+  customer_by_id:
+    path: "/api/v1/User/{customer_id}"
+    method: "GET"
+    default_params: {}
+
+  comments:
+    # Fetches all stream Post entries for a specific Case.
+    # {crm_ticket_id} is replaced at runtime in the adapter.
+    path: "/api/v1/Case/{crm_ticket_id}/stream"
+    method: "GET"
+    default_params: {}
+    
+  # ── Contact endpoint ───────────────────────────────────────────────
+  # Used by fetch_agents to scope agents to a specific Account.
+  # EspoCRM User records have no accountId FK — the bridge is:
+  #   Contact.accountId == crm_org_id  AND
+  #   Contact.emailAddress == User.emailAddress
+  # Paginated with where[0][attribute]=accountId filter in the adapter.
+  contacts:
+    path: "/api/v1/Contact"
+    method: "GET"
+    default_params: {}
+    
+  token-validation:
+    path: "/api/v1/App/user?"
+    method: "GET"
+    default_params: {}
+
+field_mappings:
+  ticket:
+    id: "id"
+    title: "name"
+    status: "status"
+    priority: "priority"
+    created_at: "createdAt"
+    updated_at: "modifiedAt"
+    assignee_id: "assignedUserId"
+    customer_id: "contactId"
+    organization_id: "accountId"
+    description: "?description"
+  agent:
+    id: "id"
+    email: "emailAddress"
+    first_name: "firstName"
+    last_name: "lastName"
+    active: "isActive"
+    created_at: "createdAt"
+    updated_at: "modifiedAt"
+  # Customers are regular Users with rolesNames containing "Customer".
+  # Role filtering is done in the adapter (not mappable from a dict value).
+  # phoneNumber and accountsIds are available in raw if needed downstream.
+  customer:
+    id: "id"
+    email: "emailAddress"
+    first_name: "firstName"
+    last_name: "lastName"
+    active: "isActive"
+    created_at: "createdAt"
+    updated_at: "modifiedAt"
+  organization:
+    id: "id"
+    name: "name"
+    active: "?isActive"
+    created_at: "createdAt"
+    updated_at: "modifiedAt"
+
+status_map:
+  "new": "open"
+  "assigned": "open"
+  "pending": "pending"
+  "closed": "closed"
+  "rejected": "closed"
+
+priority_map:
+  "low": "low"
+  "normal": "normal"
+  "high": "high"
+  "urgent": "urgent"

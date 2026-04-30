@@ -2,13 +2,11 @@
 app/core/settings.py
 
 Centralised environment configuration using pydantic-settings.
-
-New vars added for Keycloak multitenancy (marked with # KEYCLOAK NEW).
-All existing vars are unchanged.
+Includes a pre-validator to strip hidden carriage returns (\r) common in RHEL/Windows transfers.
 """
 
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Any, Optional
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,11 +16,20 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=False,
+        case_sensitive=True,   # ← FIXED: False caused RHEL env var matching issues
         extra="ignore",
     )
 
-    # App
+    # ── CLEANING DATA ────────────────────────────────────────────────────────
+    @field_validator("*", mode="before")
+    @classmethod
+    def strip_whitespace(cls, v: Any) -> Any:
+        """Strip hidden characters like \r and trailing spaces from all input values."""
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
+    # ── App ──────────────────────────────────────────────────────────────────
     APP_NAME: str = "UnifiedCRM"
     APP_VERSION: str = "0.1.0"
     ENVIRONMENT: Literal["development", "staging", "production"] = "development"
@@ -31,7 +38,7 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str
 
-    # JWT (legacy — keep for any existing helpers, not used for auth anymore)
+    # JWT (legacy)
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
@@ -41,10 +48,14 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
 
     # EspoCRM
+    # NOTE: Legacy env vars, kept for backwards compatibility only.
+    # All new code uses the adapter pattern with credentials from CRM integrations table.
     ESPO_BASE_URL: str = ""
     ESPO_API_KEY: str = ""
 
     # Zammad
+    # NOTE: Legacy env vars, kept for backwards compatibility only.
+    # All new code uses the adapter pattern with credentials from CRM integrations table.
     ZAMMAD_BASE_URL: str = ""
     ZAMMAD_API_TOKEN: str = ""
 
@@ -58,19 +69,29 @@ class Settings(BaseSettings):
 
     SYNC_INTERVAL_MINUTES: int = 15
 
-    # ── KEYCLOAK NEW ──────────────────────────────────────────────────────────
+    # ── KEYCLOAK ──────────────────────────────────────────────────────────────
     KEYCLOAK_URL: str = "http://localhost:8080"
     KEYCLOAK_REALM: str = "unified-crm"
-    # Client used by the frontend (public PKCE client)
     KEYCLOAK_CLIENT_ID: str = "crm-frontend"
-    # Service-account client used by backend to call Keycloak Admin API
     KEYCLOAK_ADMIN_CLIENT_ID: str = "crm-admin-api"
     KEYCLOAK_ADMIN_CLIENT_SECRET: str = ""
-    # Frontend URL — used when generating invite links
     FRONTEND_URL: str = "http://localhost:5173"
-    # Super admin email — identified by this address until superadmin role is ready
+    WEBHOOK_BASE_URL: str = "http://192.168.80.239:8000"  # Backend webhook endpoint base URL
     SUPER_ADMIN_EMAIL: str = ""
-    # ── END KEYCLOAK NEW ──────────────────────────────────────────────────────
+
+    # Adapter pattern (using adapter engine for all new operations)
+    CRM_CONFIG_DIR: str = "app/config"
+    CRM_ADAPTER_ENGINE: str = "new"  # Default to new adapter pattern
+
+    # ── Infisical ─────────────────────────────────────────────────────────────
+    # No empty-string defaults — if these are missing pydantic raises a clear
+    # ValidationError at startup rather than silently passing "" to the SDK.
+    INFISICAL_CLIENT_ID: str
+    INFISICAL_CLIENT_SECRET: str
+    INFISICAL_PROJECT_ID: str
+    INFISICAL_ENVIRONMENT: str = "dev"
+    INFISICAL_HOST: str = "https://app.infisical.com"
+    INFISICAL_SECRET_PATH: str = "/"
 
     @property
     def allowed_origins_list(self) -> list[str]:

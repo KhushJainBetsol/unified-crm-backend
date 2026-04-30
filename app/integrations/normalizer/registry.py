@@ -1,82 +1,96 @@
 """
 app/integrations/normalizer/registry.py
 
-Single entry point for ticket normalisation.
+Config-driven normalizer registry.
 
-Instead of importing individual normalizers throughout the codebase,
-the sync service calls normalize_ticket() or normalize_tickets() and
-passes the source system name. The registry dispatches to the correct
-normalizer automatically.
+Single entry point for ticket normalisation.  Instead of a hard-coded
+dispatch table that maps source-system names to CRM-specific functions,
+this registry delegates to the single config-driven normalizer and
+fetches the AdapterConfig from the AdapterRegistry.
 
-Usage:
+This means: to add a new CRM you only add its YAML config file and
+register it in crm_adapters.yaml.  No Python changes needed here.
+
+Usage (unchanged public API):
     from app.integrations.normalizer.registry import normalize_ticket, normalize_tickets
 
-    # single ticket
-    ticket = normalize_ticket(raw_payload, source_system="zammad")
-
-    # batch
+    ticket  = normalize_ticket(raw, source_system="zammad")
     tickets = normalize_tickets(raw_list, source_system="espocrm")
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from pathlib import Path
 
-from app.integrations.normalizer.espo_normalizer import normalize_espo_ticket, normalize_espo_tickets
+from app.config.registry import AdapterNotFoundError, AdapterRegistry
+from app.integrations.normalizer.normalizer import (
+    normalize_ticket as _normalize_one,
+    normalize_tickets as _normalize_many,
+)
 from app.integrations.normalizer.schema import NormalizedTicket
-from app.integrations.normalizer.zammad_normalizer import normalize_zammad_ticket, normalize_zammad_tickets
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Registry maps source system name → normalizer functions
-# To add a new CRM: create its normalizer file and add an entry here.
+# Module-level AdapterRegistry (lazy-initialised once)
 # ---------------------------------------------------------------------------
-_SINGLE_NORMALIZERS: dict[str, Callable[[dict], NormalizedTicket]] = {
-    "zammad": normalize_zammad_ticket,
-    "espocrm": normalize_espo_ticket,
-}
+# We keep a module-level instance so the registry is initialised once per
+# process.  Routes and services that already have an AdapterRegistry on
+# app.state can call normalize_ticket_with_config() directly if they prefer.
+# ---------------------------------------------------------------------------
 
-_BATCH_NORMALIZERS: dict[str, Callable[[list[dict]], list[NormalizedTicket]]] = {
-    "zammad": normalize_zammad_tickets,
-    "espocrm": normalize_espo_tickets,
-}
+_registry: AdapterRegistry | None = None
 
+
+def _get_registry() -> AdapterRegistry:
+    global _registry
+    if _registry is None:
+        from app.core.settings import get_settings
+        settings = get_settings()
+        config_dir = Path(settings.CONFIG_DIR)  # e.g. Path("config")
+        _registry = AdapterRegistry(config_base_dir=config_dir)
+        _registry.initialise()
+    return _registry
+
+
+# ---------------------------------------------------------------------------
+# Public API  (same signatures as before)
+# ---------------------------------------------------------------------------
 
 def normalize_ticket(raw: dict, source_system: str) -> NormalizedTicket:
     """
     Normalize a single raw CRM ticket dict into a NormalizedTicket.
 
+    Reads field mappings and value maps from the CRM's YAML config.
+
     Args:
         raw:           Raw ticket dict from the CRM API.
-        source_system: Source system name — must match a key in source_systems table
-                       e.g. "zammad" or "espocrm".
+        source_system: CRM key — must match a registered adapter key
+                       (e.g. "zammad" or "espocrm").
 
     Returns:
         NormalizedTicket
 
     Raises:
-        ValueError: if source_system is not registered.
-        KeyError / ValueError: if required fields are missing in raw.
+        ValueError:    if source_system is not registered.
+        KeyError:      if required fields are missing in raw.
     """
-    normalizer = _SINGLE_NORMALIZERS.get(source_system.lower())
-    if normalizer is None:
-        raise ValueError(
-            f"No normalizer registered for source system {source_system!r}. "
-            f"Available: {list(_SINGLE_NORMALIZERS.keys())}"
-        )
-    return normalizer(raw)
+    config = _get_adapter_config(source_system)
+    return _normalize_one(raw, source_system=source_system, config=config)
 
 
-def normalize_tickets(raw_list: list[dict], source_system: str) -> list[NormalizedTicket]:
+def normalize_tickets(
+    raw_list: list[dict], source_system: str
+) -> list[NormalizedTicket]:
     """
     Normalize a batch of raw CRM ticket dicts.
+
     Skips failed tickets and logs errors — never raises on partial failure.
 
     Args:
         raw_list:      List of raw ticket dicts from the CRM API.
-        source_system: Source system name e.g. "zammad" or "espocrm".
+        source_system: CRM key e.g. "zammad" or "espocrm".
 
     Returns:
         List of successfully normalised NormalizedTicket objects.
@@ -84,22 +98,76 @@ def normalize_tickets(raw_list: list[dict], source_system: str) -> list[Normaliz
     Raises:
         ValueError: if source_system is not registered.
     """
-    normalizer = _BATCH_NORMALIZERS.get(source_system.lower())
-    if normalizer is None:
-        raise ValueError(
-            f"No batch normalizer registered for source system {source_system!r}. "
-            f"Available: {list(_BATCH_NORMALIZERS.keys())}"
-        )
-    results = normalizer(raw_list)
+    config = _get_adapter_config(source_system)
+    results = _normalize_many(raw_list, source_system=source_system, config=config)
     logger.info(
         "Normalised %d/%d tickets from %s",
-        len(results),
-        len(raw_list),
-        source_system,
+        len(results), len(raw_list), source_system,
     )
     return results
 
 
 def get_supported_sources() -> list[str]:
-    """Return all registered source system names."""
-    return list(_SINGLE_NORMALIZERS.keys())
+    """Return all registered adapter keys (source system names)."""
+    return _get_registry().list_adapter_keys()
+
+
+# ---------------------------------------------------------------------------
+# Extended public API — for callers that already hold an AdapterRegistry
+# ---------------------------------------------------------------------------
+
+def normalize_ticket_with_registry(
+    raw: dict,
+    source_system: str,
+    registry: AdapterRegistry,
+) -> NormalizedTicket:
+    """
+    Normalize a ticket using a caller-supplied registry (e.g. from app.state).
+    Avoids the module-level lazy-init path.
+    """
+    try:
+        config = registry.get_adapter_config(source_system)
+    except AdapterNotFoundError:
+        raise ValueError(
+            f"No adapter registered for source system {source_system!r}. "
+            f"Available: {registry.list_adapter_keys()}"
+        )
+    return _normalize_one(raw, source_system=source_system, config=config)
+
+
+def normalize_tickets_with_registry(
+    raw_list: list[dict],
+    source_system: str,
+    registry: AdapterRegistry,
+) -> list[NormalizedTicket]:
+    """
+    Normalize a batch using a caller-supplied registry.
+    """
+    try:
+        config = registry.get_adapter_config(source_system)
+    except AdapterNotFoundError:
+        raise ValueError(
+            f"No adapter registered for source system {source_system!r}. "
+            f"Available: {registry.list_adapter_keys()}"
+        )
+    results = _normalize_many(raw_list, source_system=source_system, config=config)
+    logger.info(
+        "Normalised %d/%d tickets from %s",
+        len(results), len(raw_list), source_system,
+    )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Internal helper
+# ---------------------------------------------------------------------------
+
+def _get_adapter_config(source_system: str):
+    registry = _get_registry()
+    try:
+        return registry.get_adapter_config(source_system.lower())
+    except AdapterNotFoundError:
+        raise ValueError(
+            f"No normalizer config for source system {source_system!r}. "
+            f"Available: {registry.list_adapter_keys()}"
+        )

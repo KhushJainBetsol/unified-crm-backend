@@ -4,12 +4,20 @@ app/services/comment_service.py
 Business logic for ticket comments.
 
 Responsibilities:
-  - Fetch raw comments from CRM clients (Zammad + EspoCRM)
-  - Normalize them via comment_normalizer
-  - Resolve ticket CRM id → internal UUID
-  - Resolve source system name → DB id
-  - Upsert normalized comments into the DB via CommentRepository
+  - Sync comments from CRM via the adapter pattern (fetch_comments)
+  - Normalize UnifiedComment → repo.upsert
+  - Resolve ticket → integration_id via TenantSourceSystem
   - Paginated reads for the API layer
+  - Post new comments to CRM + DB
+
+Sync flow (adapter pattern):
+  sync_comments_for_ticket(ticket_id, factory)
+    → load ticket + source system
+    → _get_integration_id_for_ticket  (tenant_id + source_system_id → integration_id)
+    → factory.create(integration_id)  → correct adapter  
+    → adapter.fetch_comments(crm_ticket_id)  → List[UnifiedComment]
+    → Zammad only: is_first_article=True → update ticket.description
+    → remaining items → repo.upsert
 
 Routes call get_comments_for_ticket().
 Sync endpoints call sync_comments_for_ticket().
@@ -21,6 +29,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import httpx
 from fastapi import HTTPException
@@ -28,11 +37,10 @@ from fastapi import status as http_status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.integrations.normalizer.comment_normalizer import (
-    normalize_espo_comments,
-    normalize_zammad_comments,
-)
+from app.domain.models import UnifiedComment
+from app.factory.adapter_factory import AdapterFactoryError, CrmAdapterFactory
 from app.models.source_system import SourceSystem
+from app.models.tenant_source_systems import TenantSourceSystem
 from app.models.ticket import Ticket
 from app.models.ticket_comment import TicketComment
 from app.repositories.comment_repository import CommentRepository
@@ -43,7 +51,7 @@ logger = logging.getLogger(__name__)
 class CommentService:
 
     def __init__(self, db: AsyncSession) -> None:
-        self.db = db
+        self.db   = db
         self.repo = CommentRepository(db)
 
     # ------------------------------------------------------------------
@@ -84,98 +92,140 @@ class CommentService:
             )
         return source
 
+    async def _get_integration_id_for_ticket(self, ticket: Ticket) -> str:
+        """
+        Resolve the integration_id for a ticket via TenantSourceSystem.
+
+        Uses ticket.tenant_id + ticket.source_system_id to look up the
+        active TenantSourceSystem row, then returns its integration_id
+        as a string so the adapter factory can create the right adapter.
+
+        Raises:
+            HTTP 500 — ticket has no tenant_id (cannot route to an adapter)
+            HTTP 404 — no active integration found for this tenant + source system
+        """
+        if ticket.tenant_id is None:
+            raise HTTPException(
+                status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    f"Ticket {ticket.id} has no tenant_id — "
+                    "cannot resolve CRM integration for comment sync."
+                ),
+            )
+
+        result = await self.db.execute(
+            select(TenantSourceSystem).where(
+                TenantSourceSystem.tenant_id        == ticket.tenant_id,
+                TenantSourceSystem.source_system_id == ticket.source_system_id,
+                TenantSourceSystem.is_active        == True,  # noqa: E712
+            )
+        )
+        tss = result.scalars().first()
+        if not tss:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"No active CRM integration found for "
+                    f"tenant={ticket.tenant_id} "
+                    f"source_system_id={ticket.source_system_id}. "
+                    "Make sure the integration is registered and active."
+                ),
+            )
+        return str(tss.integration_id)
+
     async def _post_to_crm(
         self,
-        system_name: str,
+        integration_id: str,
         crm_ticket_id: str,
         text: str,
         author_name: str,
     ) -> str:
         """
-        Dispatch comment to the correct CRM client.
+        Post a new comment to a ticket in the CRM via the adapter pattern.
 
-        Wraps ALL exceptions into clean HTTPExceptions so FastAPI's
-        error handler always fires — which means CORS middleware always
-        gets to add its headers.
+        Uses the adapter factory to dynamically load the correct CRM adapter
+        and call its push_comment method.
+
+        Args:
+            integration_id: The external integration ID (UUID as string)
+            crm_ticket_id: The external ticket ID in the CRM
+            text: The comment text to post
+            author_name: The name of the agent posting the comment
+
+        Returns:
+            The external comment ID (or a synthesized local UUID if CRM didn't return one)
+
+        Raises:
+            HTTPException (502): On any CRM error (timeout, auth failure, etc.)
+            HTTPException (404): If the integration cannot be resolved
         """
+        factory = None
         try:
-            if system_name == "zammad":
-                return await self._post_zammad(crm_ticket_id, text, author_name)
+            # Get the adapter factory
+            from app.adapter_dependencies.deps import get_adapter_factory_instance
+            factory = get_adapter_factory_instance()
 
-            if system_name == "espocrm":
-                return await self._post_espo(crm_ticket_id, text, author_name)
+            # Create the adapter for this integration
+            adapter = await factory.create(integration_id)
+            async with adapter:
+                response = await adapter.push_comment(
+                    crm_ticket_id=crm_ticket_id,
+                    body=text,
+                    author_name=author_name,
+                )
 
-            raise HTTPException(
-                status_code=http_status.HTTP_400_BAD_REQUEST,
-                detail=f"Posting comments not supported for CRM: {system_name}",
-            )
+            return str(response.get("id") or f"local-{uuid.uuid4()}")
 
         except HTTPException:
             raise
 
-        except httpx.TimeoutException:
-            logger.warning(
-                "CRM timeout | crm=%s crm_ticket=%s", system_name, crm_ticket_id
+        except AdapterFactoryError as exc:
+            logger.error(
+                "Failed to create adapter for comment posting | "
+                "integration=%s error=%s",
+                integration_id,
+                exc,
             )
             raise HTTPException(
                 status_code=http_status.HTTP_502_BAD_GATEWAY,
-                detail=f"{system_name} timed out. Try again in a moment.",
+                detail=f"CRM connection failed: {exc}",
+            ) from exc
+
+        except httpx.TimeoutException:
+            logger.warning(
+                "CRM timeout posting comment | integration=%s crm_ticket=%s",
+                integration_id,
+                crm_ticket_id,
+            )
+            raise HTTPException(
+                status_code=http_status.HTTP_502_BAD_GATEWAY,
+                detail="CRM timed out. Try again in a moment.",
             )
 
         except httpx.HTTPStatusError as exc:
             logger.error(
-                "CRM HTTP error | crm=%s status=%s body=%.200s",
-                system_name,
+                "CRM HTTP error posting comment | "
+                "integration=%s status=%s body=%.200s",
+                integration_id,
                 exc.response.status_code,
                 exc.response.text,
             )
             raise HTTPException(
                 status_code=http_status.HTTP_502_BAD_GATEWAY,
-                detail=f"{system_name} rejected the comment (HTTP {exc.response.status_code}).",
+                detail=f"CRM rejected the comment (HTTP {exc.response.status_code}).",
             )
 
-        except Exception:
+        except Exception as exc:
             logger.exception(
-                "Unexpected CRM error | crm=%s crm_ticket=%s",
-                system_name,
+                "Unexpected error posting comment | "
+                "integration=%s crm_ticket=%s",
+                integration_id,
                 crm_ticket_id,
             )
             raise HTTPException(
                 status_code=http_status.HTTP_502_BAD_GATEWAY,
                 detail="Could not reach the CRM. The comment was not posted.",
-            )
-
-    async def _post_zammad(
-        self,
-        crm_ticket_id: str,
-        text: str,
-        author_name: str,
-    ) -> str:
-        from app.integrations.zammad.client import ZammadClient
-
-        async with ZammadClient() as client:
-            response = await client.post_comment(
-                crm_ticket_id=crm_ticket_id,
-                body=text,
-                author_name=author_name,
-            )
-        return str(response.get("id") or f"local-{uuid.uuid4()}")
-
-    async def _post_espo(
-        self,
-        crm_ticket_id: str,
-        text: str,
-        author_name: str,
-    ) -> str:
-        from app.integrations.espo.client import EspoClient
-
-        async with EspoClient() as client:
-            response = await client.post_comment(
-                crm_ticket_id=crm_ticket_id,
-                body=text,
-                author_name=author_name,
-            )
-        return str(response.get("id") or f"local-{uuid.uuid4()}")
+            ) from exc
 
     # ------------------------------------------------------------------
     # READ — paginated list for API
@@ -200,125 +250,133 @@ class CommentService:
         )
 
     # ------------------------------------------------------------------
-    # WRITE — sync comments from Zammad for one ticket
+    # WRITE — sync comments via adapter (adapter pattern)
     # ------------------------------------------------------------------
 
-    async def sync_zammad_comments(
+    async def sync_comments_for_ticket(
         self,
         ticket_id: uuid.UUID,
-        crm_ticket_id: str,
+        factory: CrmAdapterFactory | None = None,
     ) -> int:
-        from app.integrations.normalizer.comment_normalizer import extract_first_zammad_body
-        from app.integrations.zammad.client import ZammadClient
-
-        source_system_id = await self._get_source_system_id("zammad")
-
-        async with ZammadClient() as client:
-            raw = await client.get_comments_by_ticket(crm_ticket_id)
-
-        first_body = extract_first_zammad_body(raw)
-        if first_body:
-            ticket = await self._get_ticket_or_404(ticket_id)
-            ticket.description = first_body
-            self.db.add(ticket)
-            logger.info(
-                "Updated description for ticket %s from first Zammad article", ticket_id
-            )
-
-        normalized = normalize_zammad_comments(raw)
-
-        count = 0
-        for comment in normalized:
-            await self.repo.upsert(
-                ticket_id=ticket_id,
-                source_system_id=source_system_id,
-                crm_comment_id=comment.crm_comment_id,
-                body=comment.body,
-                comment_type=comment.comment_type,
-                author_name=comment.author_name,
-                author_email=comment.author_email,
-                is_internal=comment.is_internal,
-                crm_created_at=comment.crm_created_at,
-                crm_updated_at=comment.crm_updated_at,
-            )
-            count += 1
-
-        logger.info(
-            "Zammad comment sync: upserted %d comments for ticket %s",
-            count, ticket_id,
-        )
-        return count
-
-    # ------------------------------------------------------------------
-    # WRITE — sync comments from EspoCRM for one ticket
-    # ------------------------------------------------------------------
-
-    async def sync_espo_comments(
-        self,
-        ticket_id: uuid.UUID,
-        crm_ticket_id: str,
-    ) -> int:
-        from app.integrations.espo.client import EspoClient
-
-        source_system_id = await self._get_source_system_id("espocrm")
-
-        async with EspoClient() as client:
-            raw = await client.get_comments_by_ticket(crm_ticket_id)
-
-        normalized = normalize_espo_comments(raw)
-
-        count = 0
-        for comment in normalized:
-            await self.repo.upsert(
-                ticket_id=ticket_id,
-                source_system_id=source_system_id,
-                crm_comment_id=comment.crm_comment_id,
-                body=comment.body,
-                comment_type=comment.comment_type,
-                author_name=comment.author_name,
-                author_email=comment.author_email,
-                is_internal=comment.is_internal,
-                crm_created_at=comment.crm_created_at,
-                crm_updated_at=comment.crm_updated_at,
-            )
-            count += 1
-
-        logger.info(
-            "EspoCRM comment sync: upserted %d comments for ticket %s",
-            count, ticket_id,
-        )
-        return count
-
-    # ------------------------------------------------------------------
-    # WRITE — sync comments auto-detecting source from ticket
-    # ------------------------------------------------------------------
-
-    async def sync_comments_for_ticket(self, ticket_id: uuid.UUID) -> int:
         """
-        Fetch the ticket, determine its source system, then sync comments
-        from the correct CRM automatically.
+        Fetch comments from the ticket's source CRM via the adapter pattern
+        and upsert them into the DB.
+
+        Automatically detects the source system from the ticket record —
+        no CRM type needs to be passed by the caller.
+
+        Flow:
+            1. Load ticket → source system name + crm_ticket_id
+            2. Resolve integration_id via TenantSourceSystem
+               (tenant_id + source_system_id → integration_id)
+            3. factory.create(integration_id) → correct adapter
+            4. adapter.fetch_comments(crm_ticket_id) → List[UnifiedComment]
+            5. Zammad only: article with is_first_article=True updates
+               ticket.description (opening message) and is skipped as a
+               comment row — same behaviour as the old sync_zammad_comments
+            6. Remaining UnifiedComment items → repo.upsert
+
+        Args:
+            ticket_id: Internal UUID of the ticket to sync comments for.
+            factory:   CrmAdapterFactory instance. If None, a default
+                       factory is constructed from app DI dependencies.
+                       Pass explicitly from routes for testability.
 
         Returns:
-            Total number of comments upserted.
+            Total number of comment rows upserted.
+
+        Raises:
+            HTTP 404 — ticket not found or no active integration
+            HTTP 500 — ticket has no tenant_id
+            HTTP 502 — CRM unreachable or rejected the request
+            HTTP 400 — source system does not support comment sync
         """
         ticket = await self._get_ticket_or_404(ticket_id)
         source = await self._get_source_or_500(ticket.source_system_id)
 
-        if source.system_name == "zammad":
-            return await self.sync_zammad_comments(
-                ticket_id=ticket_id,
-                crm_ticket_id=ticket.crm_ticket_id,
-            )
-        if source.system_name == "espocrm":
-            return await self.sync_espo_comments(
-                ticket_id=ticket_id,
-                crm_ticket_id=ticket.crm_ticket_id,
+        # Unsupported source systems fail fast before hitting the network
+        supported = {"zammad", "espocrm"}
+        if source.system_name not in supported:
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                detail=f"Comment sync not supported for source: {source.system_name}",
             )
 
-        raise HTTPException(
-            status_code=http_status.HTTP_400_BAD_REQUEST,
-            detail=f"Comment sync not supported for source: {source.system_name}",
+        integration_id = await self._get_integration_id_for_ticket(ticket)
+
+        # Allow callers to inject a factory (e.g. from FastAPI DI or tests).
+        # If not provided, build one using the app's default DI wiring.
+        if factory is None:
+            from app.adapter_dependencies.deps import get_adapter_factory_instance
+            factory = get_adapter_factory_instance()
+
+        try:
+            adapter = await factory.create(integration_id)
+            async with adapter:
+                result = await adapter.fetch_comments(ticket.crm_ticket_id)
+        except AdapterFactoryError as exc:
+            raise HTTPException(
+                status_code=http_status.HTTP_502_BAD_GATEWAY,
+                detail=f"CRM connection failed: {exc}",
+            ) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Unexpected error fetching comments via adapter "
+                "ticket=%s integration=%s",
+                ticket_id,
+                integration_id,
+            )
+            raise HTTPException(
+                status_code=http_status.HTTP_502_BAD_GATEWAY,
+                detail=f"CRM connection failed: {exc}",
+            ) from exc
+
+        comments: list[UnifiedComment] = result.items
+
+        # Zammad: the oldest article is the ticket's opening message.
+        # Update ticket.description from it instead of storing it as a comment.
+        if source.system_name == "zammad":
+            first_body: str | None = next(
+                (c.body for c in comments if c.is_first_article),
+                None,
+            )
+            if first_body:
+                ticket.description = first_body
+                self.db.add(ticket)
+                logger.info(
+                    "Updated description for ticket %s from first Zammad article",
+                    ticket_id,
+                )
+
+        count = 0
+        for comment in comments:
+            # Skip the description article — already handled above
+            if comment.is_first_article:
+                continue
+
+            await self.repo.upsert(
+                ticket_id        = ticket_id,
+                source_system_id = source.id,
+                crm_comment_id   = comment.id,
+                body             = comment.body,
+                comment_type     = comment.comment_type,
+                author_name      = comment.author_name,
+                author_email     = comment.author_email,
+                is_internal      = comment.is_internal,
+                crm_created_at   = comment.created_at,
+                crm_updated_at   = comment.updated_at,
+            )
+            count += 1
+
+        logger.info(
+            "%s comment sync: upserted %d comment(s) for ticket %s",
+            source.system_name,
+            count,
+            ticket_id,
         )
+        return count
 
     # ------------------------------------------------------------------
     # WRITE — post a new comment from the dashboard to the CRM + DB
@@ -336,10 +394,11 @@ class CommentService:
 
         Flow:
             1. Load ticket → resolve crm_ticket_id + source system
-            2. POST to the correct CRM via _post_to_crm (all errors caught → 502)
-            3. Upsert the new comment into our DB
-            4. Re-fetch with joinedload to guarantee source_system is loaded
-            5. Return the saved TicketComment row
+            2. Resolve integration_id via TenantSourceSystem
+            3. POST to the correct CRM via adapter pattern (_post_to_crm)
+            4. Upsert the new comment into our DB
+            5. Re-fetch with joinedload to guarantee source_system is loaded
+            6. Return the saved TicketComment row
 
         Raises:
             404 – ticket not found
@@ -349,8 +408,10 @@ class CommentService:
         ticket = await self._get_ticket_or_404(ticket_id)
         source = await self._get_source_or_500(ticket.source_system_id)
 
+        integration_id = await self._get_integration_id_for_ticket(ticket)
+
         crm_comment_id = await self._post_to_crm(
-            system_name=source.system_name,
+            integration_id=integration_id,
             crm_ticket_id=ticket.crm_ticket_id,
             text=text,
             author_name=author_name,
@@ -358,19 +419,18 @@ class CommentService:
 
         now = datetime.now(timezone.utc)
         comment = await self.repo.upsert(
-            ticket_id=ticket_id,
-            source_system_id=source.id,
-            crm_comment_id=crm_comment_id,
-            body=text,
-            comment_type="note",
-            author_name=author_name,
-            author_email=author_email,
-            is_internal=False,
-            crm_created_at=now,
-            crm_updated_at=now,
+            ticket_id        = ticket_id,
+            source_system_id = source.id,
+            crm_comment_id   = crm_comment_id,
+            body             = text,
+            comment_type     = "note",
+            author_name      = author_name,
+            author_email     = author_email,
+            is_internal      = False,
+            crm_created_at   = now,
+            crm_updated_at   = now,
         )
 
-    
         comment.source_system = source
 
         logger.info(

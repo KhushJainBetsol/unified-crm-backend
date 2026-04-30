@@ -1,0 +1,130 @@
+# config/zammad/config.yaml
+# Zammad-specific adapter configuration.
+# Defines API endpoints, pagination behaviour, and schema field mappings
+# that translate raw Zammad JSON into our unified domain models.
+
+auth:
+  # Supported strategies: "api_token" | "oauth2" | "basic"
+  strategy: "api_token"
+  # Header name to inject the token into
+  token_header: "Authorization"
+  # Value template — {token} is replaced at runtime with the live credential
+  token_prefix: "Token token="
+
+http:
+  timeout_seconds: 30
+  max_retries: 3
+  # Exponential back-off base in seconds
+  backoff_base: 2
+  # HTTP status codes that should trigger a retry
+  retry_on_status: [429, 500, 502, 503, 504]
+
+pagination:
+  strategy: "page"          # "page" | "cursor" | "offset"
+  page_param: "page"
+  per_page_param: "per_page"
+  default_page_size: 100
+  # JSONPath to the array of items inside the response body
+  items_path: null          # Zammad returns a top-level array directly
+  # JSONPath to total count, used to decide when to stop
+  total_count_path: null    # Zammad uses empty array to signal end-of-pages
+
+endpoints:
+  tickets:
+    path: "/api/v1/tickets"
+    method: "GET"
+    # Static query params appended to every request
+    default_params:
+      expand: "true"
+
+  ticket_by_id:
+    path: "/api/v1/tickets/{ticket_id}"
+    method: "GET"
+    default_params:
+      expand: "true"
+
+  agents:
+    path: "/api/v1/users"
+    method: "GET"
+    default_params:
+      role: "Agent"
+
+  customers:
+    path: "/api/v1/users"
+    method: "GET"
+    default_params:
+      role: "Customer"
+
+  token-validation:
+    path: "/api/v1/user_access_token"
+    method: "GET"
+    default_params: {}
+
+  comments:
+    # Fetches all articles (comments) for a specific ticket.
+    path: "/api/v1/ticket_articles/by_ticket/{crm_ticket_id}"
+    method: "GET"
+    default_params: {}
+
+
+# ---------------------------------------------------------------------------
+# Schema field mappings
+# Format:  unified_field_name: "raw.json.path"
+# Dot-notation paths are resolved against the raw API response object.
+# A leading "?" marks the field as optional (missing key → None, no error).
+# ---------------------------------------------------------------------------
+field_mappings:
+  ticket:
+    id: "id"
+    title: "title"
+    status: "state.name"
+    priority: "priority_id"
+    created_at: "created_at"
+    updated_at: "updated_at"
+    assignee_id: "owner_id"
+    customer_id: "customer_id"
+    organization_id: "organization_id"
+    tags: "?tags"
+
+  agent:
+    id: "id"
+    email: "email"
+    first_name: "firstname"
+    last_name: "lastname"
+    active: "active"
+    role: "?role"
+    created_at: "created_at"
+    updated_at: "updated_at"
+
+  organization:
+    id: "id"
+    name: "name"
+    active: "active"
+    created_at: "created_at"
+    updated_at: "updated_at"
+
+# ---------------------------------------------------------------------------
+# Status normalisation — maps raw CRM status strings to our canonical values
+# Canonical set: open | pending | resolved | closed | on_hold
+# ---------------------------------------------------------------------------
+status_map:
+  "new": "open"
+  "open": "open"
+  "pending reminder": "pending"
+  "pending close": "pending"
+  "closed": "closed"
+  "merged": "closed"
+
+priority_map:
+  "1": "low"
+  "2": "normal"
+  "3": "high"
+  "4": "urgent"
+  "1 low"    : "low"
+  "2 normal" : "normal"
+  "3 high"   : "high"
+  "4 urgent" : "urgent"
+  "low"      : "low"
+  "normal"   : "normal"
+  "high"     : "high"
+  "urgent"   : "urgent"
