@@ -46,6 +46,7 @@ async def svc_create_tenant(
     db: AsyncSession,
     name: str,
     contact_email: str,
+    key_manager,                    # AsyncInfisicalCredentialManager — no hard import to avoid circulars
 ) -> dict:
     """
     Create a new tenant.
@@ -55,7 +56,9 @@ async def svc_create_tenant(
       2. Check slug uniqueness
       3. Insert tenant row
       4. Seed shared TenantRealm row (idempotent)
-      5. Return the new tenant
+      5. Commit
+      6. Generate + store per-tenant AES key in Infisical   ← NEW
+      7. Return the new tenant
     """
     try:
         # Step 1 — slug
@@ -88,6 +91,7 @@ async def svc_create_tenant(
             )
             db.add(realm)
 
+        # Step 5 — commit tenant to DB first so we have a real tenant.id
         await db.commit()
 
     except HTTPException:
@@ -100,6 +104,53 @@ async def svc_create_tenant(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Failed to create tenant due to an internal error.",
         ) from exc
+
+    # Step 6 — generate + store per-tenant AES key in Infisical
+    # This runs AFTER the DB commit so a key is never generated for a
+    # tenant that didn't make it into the DB.
+    # If Infisical is down here, the tenant exists in DB but has no key yet.
+    # The admin can retry by calling a separate /super-admin/tenants/{id}/regenerate-key
+    # endpoint (future work) or by re-running this step manually.
+    try:
+        await key_manager.generate_and_store_tenant_key(str(tenant.id))
+        logger.info(
+            "Per-tenant encryption key stored in Infisical for tenant_id='%s'.",
+            tenant.id,
+        )
+    except Exception as exc:
+        # Key generation failed — tenant is in DB but has no encryption key.
+        # Log loudly but don't roll back the tenant (DB and Infisical are
+        # separate systems; a partial rollback would leave Infisical with a
+        # key but no DB tenant, which is worse).
+        logger.error(
+            "CRITICAL: Tenant '%s' (id=%s) was created in DB but per-tenant "
+            "key generation in Infisical FAILED: %s. "
+            "The tenant cannot provision integrations until a key is stored "
+            "manually as TENANT_KEY_%s in Infisical.",
+            slug,
+            tenant.id,
+            exc,
+            tenant.id,
+        )
+        # Still return success to caller but include a warning field
+        return {
+            "tenant": {
+                "id": str(tenant.id),
+                "name": tenant.name,
+                "slug": tenant.slug,
+                "contact_email": tenant.contact_email,
+                "is_active": tenant.is_active,
+                "created_at": tenant.created_at,
+            },
+            "warning": (
+                f"Tenant created but encryption key could not be stored in Infisical: {exc}. "
+                f"Manually add secret TENANT_KEY_{tenant.id} before this tenant provisions integrations."
+            ),
+            "message": (
+                f"Tenant '{tenant.name}' created. "
+                "Use POST /super-admin/admins/invite to invite an admin."
+            ),
+        }
 
     logger.info("Created tenant '%s' (id=%s)", slug, tenant.id)
 

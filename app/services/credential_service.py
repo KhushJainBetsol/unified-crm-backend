@@ -94,7 +94,8 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from marshal import version
+from typing import Any, Dict, Optional,Tuple
 from uuid import UUID, uuid4
 
 import httpx
@@ -278,7 +279,7 @@ class CredentialProvisioningService:
         integration_id = uuid4()
 
         # ── 5. Fetch AES key ───────────────────────────────────────────────
-        version, raw_key = await self._key_manager.get_active_key_and_version()
+        version, raw_key = await self._get_key_for_tenant(tenant_id)
         enc_service = EncryptionService(raw_key=raw_key, key_version=version)
 
         # ── 6. Encrypt outbound credentials ───────────────────────────────
@@ -331,7 +332,7 @@ class CredentialProvisioningService:
                 "has_webhook_secrets": webhook_secrets_enc is not None,
             },
         )
-        return _to_status(row)
+        return self._to_status(row)
 
     # ── UPDATE (partial) ───────────────────────────────────────────────────
 
@@ -356,7 +357,7 @@ class CredentialProvisioningService:
 
         # ── Outbound credentials ──────────────────────────────────────────
         if request.credentials is not None:
-            version, raw_key = await self._key_manager.get_active_key_and_version()
+            version, raw_key = await self._get_key_for_tenant(row.tenant_id)
             enc_service = EncryptionService(raw_key=raw_key, key_version=version)
 
             secret_dict = request.credentials.to_secret_dict()
@@ -382,8 +383,7 @@ class CredentialProvisioningService:
 
         # ── Inbound webhook secrets (independent update) ───────────────────
         if request.has_webhook_updates():
-            ws_version = row.key_version
-            ws_raw_key = await self._key_manager.get_encryption_key(ws_version)
+            ws_version, ws_raw_key = await self._get_key_for_row(row)
             ws_enc = EncryptionService(raw_key=ws_raw_key, key_version=ws_version)
 
             ws_dict = request.build_webhook_secret_dict()
@@ -405,7 +405,7 @@ class CredentialProvisioningService:
             "Partially updated credentials",
             extra={"integration_id": str(integration_id)},
         )
-        return _to_status(row)
+        return self._to_status(row)
 
     # ── RETRIEVE (decrypt → envelope) ─────────────────────────────────────
 
@@ -423,8 +423,7 @@ class CredentialProvisioningService:
         if not row.credential_enc:
             raise CredentialNotFoundError(str(integration_id))
 
-        key_version = row.key_version
-        raw_key = await self._key_manager.get_encryption_key(key_version)
+        key_version, raw_key = await self._get_key_for_row(row)
         enc_service = EncryptionService(raw_key=raw_key, key_version=key_version)
 
         # ── Decrypt outbound credentials ──────────────────────────────────
@@ -486,9 +485,7 @@ class CredentialProvisioningService:
         if not row.credential_enc:
             raise CredentialNotFoundError(str(integration_id))
 
-        old_version = row.key_version
-
-        old_raw_key = await self._key_manager.get_encryption_key(old_version)
+        old_version, old_raw_key = await self._get_key_for_row(row)
         old_enc = EncryptionService(raw_key=old_raw_key, key_version=old_version)
 
         decrypted_cred = old_enc.decrypt_from_db(row.credential_enc)
@@ -497,7 +494,12 @@ class CredentialProvisioningService:
         if row.webhook_secrets_enc:
             decrypted_webhook = old_enc.decrypt_from_db(row.webhook_secrets_enc)
 
-        new_version, new_raw_key = await self._key_manager.get_active_key_and_version()
+        if old_version == "tenant":
+            # Tenant key rotation: same key, same version — nothing to rotate
+            # (tenant key rotation is a separate operation: regenerate-key endpoint)
+            new_version, new_raw_key = old_version, old_raw_key
+        else:
+            new_version, new_raw_key = await self._key_manager.get_active_key_and_version()
         new_enc = EncryptionService(raw_key=new_raw_key, key_version=new_version)
 
         row.credential_enc = new_enc.encrypt(decrypted_cred).to_db_string()
@@ -637,7 +639,7 @@ class CredentialProvisioningService:
             )
 
         url = base_url + endpoint_path
-        auth_headers = _build_auth_headers(crm_type, request)
+        auth_headers = self._build_auth_headers(crm_type, request)
 
         logger.info(
             "Checking CRM permissions for crm_type='%s' at '%s'",
@@ -699,6 +701,60 @@ class CredentialProvisioningService:
         logger.info(
             "Permission check passed for crm_type='%s'.", crm_type
         )
+
+    async def _get_key_for_tenant(
+        self,
+        tenant_id: UUID,
+    ) -> Tuple[str, str]:
+        """
+        Fetch the encryption key for this tenant.
+
+        Lookup order:
+        1. TENANT_KEY_<tenant_id> in Infisical  → per-tenant key (new tenants)
+        2. ACTIVE_KEY_VERSION + ENCRYPTION_KEY_<version>  → global key (old tenants)
+
+        Returns
+        -------
+        (version, raw_key)
+            version : key version tag stored in crm_integrations.key_version
+                    For tenant keys: "tenant"
+                    For global keys: "v1" / "v2" / etc.
+            raw_key : raw AES key string for EncryptionService
+        """
+        tenant_key = await self._key_manager.get_tenant_key(str(tenant_id))
+        if tenant_key is not None:
+            # Per-tenant key — version tag is fixed as "tenant" so
+            # get_envelope / rotate know to fetch TENANT_KEY_<tenant_id>
+            # rather than ENCRYPTION_KEY_<version>
+            return "tenant", tenant_key
+
+        # Fall back to global key for tenants that pre-date per-tenant rollout
+        version, raw_key = await self._key_manager.get_active_key_and_version()
+        return version, raw_key
+
+
+    async def _get_key_for_row(
+        self,
+        row: "CrmIntegration",
+    ) -> Tuple[str, str]:
+        """
+        Fetch the correct decryption key for an EXISTING integration row.
+
+        key_version == "tenant"  → fetch TENANT_KEY_<tenant_id>
+        anything else            → fetch ENCRYPTION_KEY_<key_version>  (global)
+        """
+        if row.key_version == "tenant":
+            tenant_key = await self._key_manager.get_tenant_key(str(row.tenant_id))
+            if tenant_key is None:
+                raise CredentialNotFoundError(
+                    f"Per-tenant key not found in Infisical for tenant_id={row.tenant_id}. "
+                    "The secret TENANT_KEY_{row.tenant_id} is missing."
+                )
+            return "tenant", tenant_key
+
+        # Global key path (legacy rows)
+        raw_key = await self._key_manager.get_encryption_key(row.key_version)
+        return row.key_version, raw_key
 
     async def _get_row(self, integration_id: UUID) -> Optional[CrmIntegration]:
         result = await self._db.execute(
@@ -764,112 +820,113 @@ class CredentialProvisioningService:
         return row
 
 
-# ---------------------------------------------------------------------------
-# Pure helper functions
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Pure helper functions
+    # ---------------------------------------------------------------------------
 
 
-def _build_auth_headers(
-    crm_type: str,
-    request: ProvisionCredentialsRequest,
-) -> Dict[str, str]:
-    """
-    Build the HTTP headers needed to authenticate the permission-check request
-    using the RAW (un-encrypted) credentials from the provision request.
+    def _build_auth_headers(
+        self, 
+        crm_type: str,
+        request: ProvisionCredentialsRequest,
+    ) -> Dict[str, str]:
+        """
+        Build the HTTP headers needed to authenticate the permission-check request
+        using the RAW (un-encrypted) credentials from the provision request.
 
-    Each CRM uses a different convention:
-      - EspoCRM  → "X-Api-Key: <token>"  (api_key auth)
-                   "Authorization: Basic <b64(user:pass)>"  (basic_auth)
-                   "Authorization: Bearer <token>"  (api_token / bearer)
-      - Zammad   → "Authorization: Token token=<token>"
+        Each CRM uses a different convention:
+        - EspoCRM  → "X-Api-Key: <token>"  (api_key auth)
+                    "Authorization: Basic <b64(user:pass)>"  (basic_auth)
+                    "Authorization: Bearer <token>"  (api_token / bearer)
+        - Zammad   → "Authorization: Token token=<token>"
 
-    Falls back to a Bearer header for unrecognised CRM types so the
-    permission endpoint can still be called rather than silently skipped.
-    """
-    import base64
+        Falls back to a Bearer header for unrecognised CRM types so the
+        permission endpoint can still be called rather than silently skipped.
+        """
+        import base64
 
-    secret_dict = request.credentials.to_secret_dict()
-    auth_type = request.credentials.auth_type
-    headers: Dict[str, str] = {"Content-Type": "application/json"}
+        secret_dict = request.credentials.to_secret_dict()
+        auth_type = request.credentials.auth_type
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
 
-    if crm_type == "espocrm":
-        if auth_type in ("api_key", "api_token", "access_token"):
+        if crm_type == "espocrm":
+            if auth_type in ("api_key", "api_token", "access_token"):
+                token = secret_dict.get("token", secret_dict.get("api_key", ""))
+                headers["X-Api-Key"] = token
+            elif auth_type == "basic_auth":
+                username = secret_dict.get("username", "")
+                password = secret_dict.get("password", "")
+                encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+                headers["Authorization"] = f"Basic {encoded}"
+            else:
+                token = secret_dict.get("token", "")
+                headers["Authorization"] = f"Bearer {token}"
+
+        elif crm_type == "zammad":
             token = secret_dict.get("token", secret_dict.get("api_key", ""))
-            headers["X-Api-Key"] = token
-        elif auth_type == "basic_auth":
-            username = secret_dict.get("username", "")
-            password = secret_dict.get("password", "")
-            encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
-            headers["Authorization"] = f"Basic {encoded}"
+            headers["Authorization"] = f"Token token={token}"
+
         else:
-            token = secret_dict.get("token", "")
+            # Generic fallback
+            token = secret_dict.get("token", secret_dict.get("api_key", ""))
             headers["Authorization"] = f"Bearer {token}"
 
-    elif crm_type == "zammad":
-        token = secret_dict.get("token", secret_dict.get("api_key", ""))
-        headers["Authorization"] = f"Token token={token}"
-
-    else:
-        # Generic fallback
-        token = secret_dict.get("token", secret_dict.get("api_key", ""))
-        headers["Authorization"] = f"Bearer {token}"
-
-    return headers
+        return headers
 
 
-def _to_status(row: CrmIntegration) -> CredentialStatusResponse:
-    """Map a CrmIntegration ORM row → CredentialStatusResponse. No secrets exposed."""
-    return CredentialStatusResponse(
-        integration_id=row.id,
-        crm_type=row.source_system.system_name,
-        auth_type=row.auth_type,
-        base_url=row.base_url or "",
-        key_version=row.key_version,
-        is_active=row.is_active,
-        has_credentials=row.has_credentials(),
-        has_webhook_secrets=row.has_webhook_secrets(),
-        webhook_uuid=row.webhook_uuid,
-        token_expires_at=row.token_expires_at,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-    )
+    def _to_status(self,row: CrmIntegration) -> CredentialStatusResponse:
+        """Map a CrmIntegration ORM row → CredentialStatusResponse. No secrets exposed."""
+        return CredentialStatusResponse(
+            integration_id=row.id,
+            crm_type=row.source_system.system_name,
+            auth_type=row.auth_type,
+            base_url=row.base_url or "",
+            key_version=row.key_version,
+            is_active=row.is_active,
+            has_credentials=row.has_credentials(),
+            has_webhook_secrets=row.has_webhook_secrets(),
+            webhook_uuid=row.webhook_uuid,
+            token_expires_at=row.token_expires_at,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
 
 
-def _secret_dict_to_envelope_creds(
-    auth_type: str,
-    secret_dict: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Convert the decrypted outbound secret dict into the standard
-    CrmCredentialEnvelope credentials format. Always includes a 'strategy'
-    key so adapters can switch on a single field.
-    """
-    if auth_type in ("api_token", "bearer_token", "access_token", "api_key"):
+    def _secret_dict_to_envelope_creds(
+        auth_type: str,
+        secret_dict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Convert the decrypted outbound secret dict into the standard
+        CrmCredentialEnvelope credentials format. Always includes a 'strategy'
+        key so adapters can switch on a single field.
+        """
+        if auth_type in ("api_token", "bearer_token", "access_token", "api_key"):
+            return {"strategy": "api_token", "token": secret_dict.get("token", "")}
+
+        if auth_type == "basic_auth":
+            return {
+                "strategy": "basic",
+                "username": secret_dict.get("username", ""),
+                "password": secret_dict.get("password", ""),
+            }
+
+        if auth_type == "oauth2":
+            return {
+                "strategy": "oauth2",
+                "access_token": secret_dict.get("access_token", ""),
+                "refresh_token": secret_dict.get("refresh_token"),
+                "token_type": secret_dict.get("token_type", "Bearer"),
+                "expires_at": secret_dict.get("expires_at"),
+            }
+
+        if auth_type == "hmac":
+            return {
+                "strategy": "api_token",
+                "token": secret_dict.get("api_token", ""),
+            }
+
+        logger.warning(
+            "Unrecognised auth_type '%s', falling back to api_token strategy", auth_type
+        )
         return {"strategy": "api_token", "token": secret_dict.get("token", "")}
-
-    if auth_type == "basic_auth":
-        return {
-            "strategy": "basic",
-            "username": secret_dict.get("username", ""),
-            "password": secret_dict.get("password", ""),
-        }
-
-    if auth_type == "oauth2":
-        return {
-            "strategy": "oauth2",
-            "access_token": secret_dict.get("access_token", ""),
-            "refresh_token": secret_dict.get("refresh_token"),
-            "token_type": secret_dict.get("token_type", "Bearer"),
-            "expires_at": secret_dict.get("expires_at"),
-        }
-
-    if auth_type == "hmac":
-        return {
-            "strategy": "api_token",
-            "token": secret_dict.get("api_token", ""),
-        }
-
-    logger.warning(
-        "Unrecognised auth_type '%s', falling back to api_token strategy", auth_type
-    )
-    return {"strategy": "api_token", "token": secret_dict.get("token", "")}

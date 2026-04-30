@@ -215,6 +215,45 @@ class AsyncInfisicalCredentialManager:
                 self._executor,
                 functools.partial(fn, *args),
             )
+        
+    async def generate_and_store_tenant_key(self, tenant_id: str) -> str:
+        """
+        Async version of ``InfisicalCredentialManager.generate_and_store_tenant_key``.
+
+        Generates a 256-bit random AES key and stores it in Infisical as
+        TENANT_KEY_<tenant_id>.  Called once when super admin creates a tenant.
+
+        Parameters
+        ----------
+        tenant_id:
+            The tenant's UUID string.
+
+        Returns
+        -------
+        str
+            The raw key hex string (for logging/testing only — never stored in DB).
+        """
+        return await self._run(
+            self._sync_manager.generate_and_store_tenant_key,  # type: ignore[union-attr]
+            tenant_id,
+        )
+
+    async def get_tenant_key(self, tenant_id: str) -> "Optional[str]":
+        """
+        Async version of ``InfisicalCredentialManager.get_tenant_key``.
+
+        Returns the raw key string for this tenant, or None if no
+        per-tenant key exists (old tenant — caller falls back to global key).
+
+        Parameters
+        ----------
+        tenant_id:
+            The tenant's UUID string.
+        """
+        return await self._run(
+            self._sync_manager.get_tenant_key,  # type: ignore[union-attr]
+            tenant_id,
+        )
 
     def _assert_ready(self) -> None:
         if self._sync_manager is None or self._executor is None:

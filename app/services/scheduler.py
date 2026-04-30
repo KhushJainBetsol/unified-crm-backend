@@ -640,19 +640,19 @@ async def _sync_one_tenant_source_system(
 
     except AdapterFactoryError as exc:
         logger.error(
-            "Adapter factory error for tenant=%s source=%s",
+            "Adapter factory error for tenant=%s source=%s: %s",  # ← add : %s
             tenant_id, source_system_name, exc,
         )
         return {"error": str(exc)}
     except CrmClientError as exc:
         logger.error(
-            "CRM client error for tenant=%s source=%s",
+            "CRM client error for tenant=%s source=%s: %s",       # ← add : %s
             tenant_id, source_system_name, exc,
         )
         return {"error": str(exc)}
     except Exception as exc:
         logger.exception(
-            "Unexpected error for tenant=%s source=%s",
+            "Unexpected error for tenant=%s source=%s: %s",       # ← add : %s
             tenant_id, source_system_name, exc,
         )
         return {"error": str(exc)}
