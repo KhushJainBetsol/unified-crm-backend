@@ -30,6 +30,7 @@ from app.models.source_system import SourceSystem
 from app.models.tenant import Tenant
 from app.models.tenant_realm import TenantRealm
 from app.models.tenant_source_systems import TenantSourceSystem
+from app.utils.email import send_invite_email          # ← NEW
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -133,7 +134,8 @@ async def svc_invite_admin(
       3. Split admin_name into first / last for Keycloak
       4. Create Keycloak user in the shared realm
       5. Generate one-time invite token (24 h expiry) and store it
-      6. Return the invite link
+      6. Send invite email via Resend
+      7. Return the invite link
     """
     try:
         # Step 1 — tenant must exist and be active
@@ -211,6 +213,14 @@ async def svc_invite_admin(
 
     invite_link = f"{settings.FRONTEND_URL}/invite?token={invite_token}"
     logger.info("Admin invite → '%s' for tenant '%s'", admin_email, tenant.slug)
+
+    # Step 6 — send invite email (after commit, non-blocking, won't raise)
+    await send_invite_email(
+        to_email=admin_email,
+        invite_link=invite_link,
+        tenant_name=tenant.name,
+        role="admin",
+    )
 
     return {
         "tenant": {"id": str(tenant.id), "name": tenant.name, "slug": tenant.slug},

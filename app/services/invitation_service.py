@@ -26,6 +26,7 @@ from app.models.invitation import Invitation
 from app.models.tenant import Tenant
 from app.models.user_agent_mapping import UserAgentMapping
 from app.models.agent import Agent
+from app.utils.email import send_invite_email          # ← NEW
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -141,7 +142,7 @@ async def svc_accept_invite(db: AsyncSession, token: str, password: str) -> dict
             is_active=True,
         )
         db.add(db_user)
-        await db.flush()  # flush so db_user.id is populated
+        await db.flush()
 
     await db.commit()
     return {
@@ -164,6 +165,7 @@ async def svc_invite_agent(
     Raises 404 if tenant not found, 409 if active invite exists,
     502 on Keycloak failure.
     """
+    logger.info("svc_invite_agent called: email=%s role=%s", email, role)
     tenant_id_str = current_user.require_tenant()
     t_uuid = uuid.UUID(tenant_id_str)
 
@@ -214,8 +216,18 @@ async def svc_invite_agent(
     db.add(invitation)
     await db.commit()
 
+    invite_link = f"{settings.FRONTEND_URL}/invite?token={invite_token}"
+
+    # Send invite email — non-blocking, failure won't break the response
+    await send_invite_email(
+        to_email=email,
+        invite_link=invite_link,
+        tenant_name=tenant.name,
+        role=role,
+    )
+
     return {
         "message": f"Invitation sent to {email}",
-        "invite_link": f"{settings.FRONTEND_URL}/invite?token={invite_token}",
+        "invite_link": invite_link,
         "role": role,
     }

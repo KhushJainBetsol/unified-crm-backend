@@ -82,7 +82,11 @@ class Settings(BaseSettings):
     # Adapter pattern (using adapter engine for all new operations)
     CRM_CONFIG_DIR: str = "app/config"
     CRM_ADAPTER_ENGINE: str = "new"  # Default to new adapter pattern
-
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = ""
     # ── Infisical ─────────────────────────────────────────────────────────────
     # No empty-string defaults — if these are missing pydantic raises a clear
     # ValidationError at startup rather than silently passing "" to the SDK.
