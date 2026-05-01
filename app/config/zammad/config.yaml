@@ -76,14 +76,14 @@ endpoints:
 field_mappings:
   ticket:
     id: "id"
-    title: "title"
-    status: "state.name"
-    priority: "priority_id"
-    created_at: "created_at"
-    updated_at: "updated_at"
-    assignee_id: "owner_id"
-    customer_id: "customer_id"
-    organization_id: "organization_id"
+    title: "?title"
+    status: "?state.name"
+    priority: "?priority_id"
+    created_at: "?created_at"
+    updated_at: "?updated_at"
+    assignee_id: "?owner_id"
+    customer_id: "?customer_id"
+    organization_id: "?organization_id"
     tags: "?tags"
 
   agent:

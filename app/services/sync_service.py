@@ -52,6 +52,7 @@ class SyncResult:
     created: int
     updated: int
     failed: int
+    deleted: int = 0
 
 
 class SyncService:
@@ -310,14 +311,17 @@ class SyncService:
         normalized_tickets: list[NormalizedTicket],
         source_system: str,
         tenant_id: uuid.UUID,
+        crm_ids_to_delete: set[str] | None = None,
     ) -> SyncResult:
         """
         Resolve all FK IDs and upsert a list of NormalizedTickets into the DB.
+        After upserting, soft-delete any tickets in crm_ids_to_delete.
 
         Args:
             normalized_tickets: Tickets pre-filtered for this tenant's org.
             source_system:      e.g. "zammad" or "espocrm".
             tenant_id:          The tenant these tickets belong to.
+            crm_ids_to_delete:  Optional set of CRM ticket IDs to soft-delete (tickets no longer in CRM).
 
         Resolution order per ticket:
           1. status_id    — from ticket_status table (required, falls back to open)
@@ -333,6 +337,7 @@ class SyncService:
             created       = 0,
             updated       = 0,
             failed        = 0,
+            deleted       = 0,
         )
 
         if not normalized_tickets:
@@ -399,8 +404,33 @@ class SyncService:
                 )
                 result.failed += 1
 
+        # ── Handle ticket deletions (tickets in DB but no longer in CRM) ────────────────
+        if crm_ids_to_delete:
+            for crm_id in crm_ids_to_delete:
+                try:
+                    existing = await self.repo.get_by_crm_id(
+                        crm_id, source_system_id, tenant_id=tenant_id
+                    )
+                    if existing and not existing.is_deleted:
+                        await self.repo.soft_delete(
+                            ticket=existing,
+                            deleted_by_id=None,
+                            is_deleted_by_crm=True,
+                        )
+                        result.deleted += 1
+                        logger.info(
+                            "Sync: soft-deleted orphaned ticket | crm_ticket_id=%s | no longer in %s",
+                            crm_id, source_system,
+                        )
+                except Exception as exc:
+                    await self.db.rollback()
+                    logger.error(
+                        "Failed to delete ticket %s tenant=%s: %s",
+                        crm_id, tenant_id, exc,
+                    )
+
         logger.info(
-            "Sync complete for %s tenant=%s — created: %d, updated: %d, failed: %d",
-            source_system, tenant_id, result.created, result.updated, result.failed,
+            "Sync complete for %s tenant=%s — created: %d, updated: %d, deleted: %d, failed: %d",
+            source_system, tenant_id, result.created, result.updated, result.deleted, result.failed,
         )
         return result

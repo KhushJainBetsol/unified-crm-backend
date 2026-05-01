@@ -420,6 +420,7 @@ from app.integrations.normalizer.schema import NormalizedTicket
 from app.models.source_system import SourceSystem
 from app.models.tenant import Tenant
 from app.models.tenant_source_systems import TenantSourceSystem
+from app.models.ticket import Ticket
 from app.services.entity_sync_service import EntitySyncService
 from app.services.sync_service import SyncService
 
@@ -558,6 +559,49 @@ async def _sync_entities_via_adapter(
             raise
 
 
+async def _detect_deleted_tickets(
+    tenant_id: uuid.UUID,
+    source_system_id: int,
+    crm_ticket_ids_from_fetch: set[str],
+) -> set[str]:
+    """
+    Find tickets in the DB that are active (not soft-deleted) but no longer
+    exist in the CRM fetch. These are orphaned and should be soft-deleted.
+
+    Args:
+        tenant_id: The tenant.
+        source_system_id: The source system (1 for Zammad, 2 for EspoCRM, etc).
+        crm_ticket_ids_from_fetch: Set of CRM ticket IDs returned by adapter.fetch_tickets().
+
+    Returns:
+        Set of CRM ticket IDs that exist in DB but not in CRM (should be deleted).
+    """
+    async with async_session_maker() as db:
+        try:
+            result = await db.execute(
+                select(Ticket.crm_ticket_id).where(
+                    Ticket.tenant_id == tenant_id,
+                    Ticket.source_system_id == source_system_id,
+                    Ticket.is_deleted == False,  # noqa: E712
+                )
+            )
+            db_crm_ids = set(result.scalars().all())
+            orphaned = db_crm_ids - crm_ticket_ids_from_fetch
+            if orphaned:
+                logger.info(
+                    "Deletion detection: found %d orphaned tickets in DB for "
+                    "tenant=%s source_system_id=%d",
+                    len(orphaned), tenant_id, source_system_id,
+                )
+            return orphaned
+        except Exception as exc:
+            logger.error(
+                "Failed to detect orphaned tickets for tenant=%s source_system_id=%d: %s",
+                tenant_id, source_system_id, exc,
+            )
+            return set()
+
+
 async def _sync_tickets_via_adapter(
     tenant_id: uuid.UUID,
     source_system_name: str,
@@ -566,7 +610,7 @@ async def _sync_tickets_via_adapter(
 ) -> object:
     """
     Fetch tickets from the CRM via the adapter, convert UnifiedTicket →
-    NormalizedTicket, and upsert into the DB.
+    NormalizedTicket, upsert into the DB, and detect/delete orphaned tickets.
     """
     adapter = await factory.create(str(tss.integration_id))
     async with adapter:
@@ -577,12 +621,21 @@ async def _sync_tickets_via_adapter(
         for t in tickets_result.items
     ]
 
+    # Extract CRM ticket IDs from the fetch for deletion detection
+    crm_ids_from_fetch = {t.crm_ticket_id for t in normalized}
+
+    # Detect tickets in DB that are no longer in CRM (orphaned)
+    orphaned_ids = await _detect_deleted_tickets(
+        tenant_id, tss.source_system_id, crm_ids_from_fetch
+    )
+
     async with async_session_maker() as db:
         try:
             result = await SyncService(db).sync_tickets(
                 normalized_tickets = normalized,
                 source_system      = source_system_name,
                 tenant_id          = tenant_id,
+                crm_ids_to_delete  = orphaned_ids if orphaned_ids else None,
             )
             await db.commit()
             return result
@@ -740,6 +793,7 @@ def _build_result(
             "total_fetched": ticket_result.total_fetched,
             "created":       ticket_result.created,
             "updated":       ticket_result.updated,
+            "deleted":       ticket_result.deleted,
             "failed":        ticket_result.failed,
         },
     }
