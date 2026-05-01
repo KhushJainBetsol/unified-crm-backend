@@ -25,7 +25,7 @@ without modification — it just passes the AdapterConfig through.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.config.models import AdapterConfig
@@ -151,6 +151,13 @@ def normalize_ticket(
 
     All field paths, status mappings, and priority mappings are read
     from *config* (the CRM's AdapterConfig loaded from its YAML file).
+    
+    For webhook updates, many fields may be missing. This function provides
+    graceful fallbacks:
+      - Missing timestamps default to current UTC datetime
+      - Missing title defaults to "No Title"
+      - Missing status defaults to "open"
+      - Missing relations (agent/customer/company) default to None
 
     Args:
         raw:           Raw ticket dict from the CRM API.
@@ -161,7 +168,7 @@ def normalize_ticket(
         NormalizedTicket
 
     Raises:
-        KeyError / ValueError: if required fields are missing in raw.
+        KeyError / ValueError: if REQUIRED fields (id) are missing in raw.
     """
     mappings = config.field_mappings.ticket
 
@@ -169,14 +176,17 @@ def normalize_ticket(
     crm_ticket_id = str(_map_field(raw, mappings["id"]))
 
     # ── Timestamps ────────────────────────────────────────────────────
-    created_at_raw = _map_field(raw, mappings["created_at"])
-    updated_at_raw = _map_field(raw, mappings["updated_at"])
-    created_at = datetime.fromisoformat(str(created_at_raw))
-    updated_at = datetime.fromisoformat(str(updated_at_raw))
+    # For webhook updates, timestamps may be missing. Use current UTC as fallback.
+    created_at_raw = _map_field(raw, mappings.get("created_at", "?created_at"))
+    updated_at_raw = _map_field(raw, mappings.get("updated_at", "?updated_at"))
+    
+    created_at = _parse_datetime(str(created_at_raw)) if created_at_raw else datetime.now(timezone.utc)
+    updated_at = _parse_datetime(str(updated_at_raw)) if updated_at_raw else datetime.now(timezone.utc)
 
     # ── Title ─────────────────────────────────────────────────────────
     title_path = mappings.get("title", "?title")
-    title = str(_map_field(raw, title_path) or DEFAULT_TITLE).strip()
+    title_raw = _map_field(raw, title_path)
+    title = str(title_raw or DEFAULT_TITLE).strip() or DEFAULT_TITLE
 
     # ── Description ───────────────────────────────────────────────────
     description = None
@@ -192,7 +202,8 @@ def normalize_ticket(
     # ── Status ────────────────────────────────────────────────────────
     raw_status = ""
     if "status" in mappings:
-        raw_status = str(_map_field(raw, mappings["status"]) or "").lower().strip()
+        status_raw = _map_field(raw, mappings["status"])
+        raw_status = str(status_raw or "").lower().strip() if status_raw else ""
 
     status = config.status_map.get(raw_status, "open")
     if raw_status and raw_status not in config.status_map:

@@ -290,17 +290,17 @@ async def _espo_update_ticket(
     tenant_id: uuid.UUID,
     sync: SyncService,
 ) -> None:
-    """EspoCRM Case.update — apply partial updates to an existing ticket."""
+    """EspoCRM Case.update — apply partial updates or create if ticket doesn't exist."""
     repo = TicketRepository(sync.db)
     existing = await repo.get_by_crm_id(
         crm_ticket_id, source_system_id, tenant_id=tenant_id
     )
     if not existing:
-        logger.warning(
-            "espocrm: Case.update | crm_ticket_id=%s not in DB — skipping "
-            "(full sync will create it)",
+        logger.info(
+            "espocrm: Case.update | crm_ticket_id=%s not in DB — creating from webhook payload",
             crm_ticket_id,
         )
+        await _espo_create_ticket(raw, source_system_id, tenant_id, sync)
         return
 
     incoming_ts = _parse_iso_timestamp(raw.get("modifiedAt"))
@@ -625,17 +625,17 @@ async def _zammad_update_ticket(
     tenant_id: uuid.UUID,
     sync: SyncService,
 ) -> None:
-    """Zammad update — apply partial updates to an existing ticket."""
+    """Zammad update — apply partial updates or create if ticket doesn't exist."""
     repo = TicketRepository(sync.db)
     existing = await repo.get_by_crm_id(
         crm_ticket_id, source_system_id, tenant_id=tenant_id
     )
     if not existing:
-        logger.warning(
-            "zammad: update | crm_ticket_id=%s not in DB — skipping "
-            "(full sync will create it)",
+        logger.info(
+            "zammad: update | crm_ticket_id=%s not in DB — creating from webhook payload",
             crm_ticket_id,
         )
+        await _zammad_create_ticket(raw, source_system_id, tenant_id, sync)
         return
 
     incoming_ts = _parse_iso_timestamp(raw.get("updated_at"))

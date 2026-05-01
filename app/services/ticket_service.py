@@ -307,11 +307,8 @@ class TicketService:
                 )
                 return
 
-            # Pass the ORM object so the factory doesn't need a second DB call
-            adapter = self.factory.create(
-                str(integration.id),
-                integration_obj=integration,   # ← the only change
-            )
+            # Create adapter via factory — it fetches credentials internally
+            adapter = await self.factory.create(str(integration.id))
 
             async with adapter:
                 await adapter.push_ticket_update(ticket.crm_ticket_id, payload)
