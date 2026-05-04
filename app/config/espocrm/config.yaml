@@ -118,6 +118,10 @@ field_mappings:
     created_at: "createdAt"
     updated_at: "modifiedAt"
 
+# Status mapping for Espo CRM
+# Keys are what Espo API returns/accepts (title case: "New", "Pending", "Closed", "Open", "Assigned", "Rejected")
+# Values are our unified canonical statuses (lowercase: open, pending, closed)
+# On PUT updates, adapters capitalize keys before sending to Espo API
 status_map:
   "new": "open"
   "assigned": "open"
@@ -125,6 +129,10 @@ status_map:
   "closed": "closed"
   "rejected": "closed"
 
+# Priority mapping for Espo CRM
+# Keys are what Espo API returns/accepts (title case: "Low", "Normal", "High", "Urgent")
+# Values are our unified canonical priorities (lowercase: low, normal, high, urgent)
+# On PUT updates, adapters capitalize keys before sending to Espo API
 priority_map:
   "low": "low"
   "normal": "normal"

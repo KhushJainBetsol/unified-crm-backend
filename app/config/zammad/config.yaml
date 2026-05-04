@@ -107,6 +107,10 @@ field_mappings:
 # Status normalisation — maps raw CRM status strings to our canonical values
 # Canonical set: open | pending | resolved | closed | on_hold
 # ---------------------------------------------------------------------------
+# Status mapping for Zammad CRM
+# Keys are what Zammad API returns/accepts (lowercase: "new", "open", "pending reminder", "pending close", "closed", "merged")
+# Values are our unified canonical statuses (lowercase: open, pending, closed)
+# On PUT updates, adapters send keys as-is (lowercase, unchanged) to Zammad API
 status_map:
   "new": "open"
   "open": "open"
@@ -115,15 +119,19 @@ status_map:
   "closed": "closed"
   "merged": "closed"
 
+# Priority mapping for Zammad CRM
+# Zammad API expects priority in format: "1 low", "2 normal", "3 high", "4 urgent"
+# Combined ID + name format (e.g., "3 high") must be used for PUT updates
+# Order matters: combined keys must come FIRST so reverse mapping finds them before plain IDs
 priority_map:
-  "1": "low"
-  "2": "normal"
-  "3": "high"
-  "4": "urgent"
   "1 low"    : "low"
   "2 normal" : "normal"
   "3 high"   : "high"
   "4 urgent" : "urgent"
+  "1"        : "low"
+  "2"        : "normal"
+  "3"        : "high"
+  "4"        : "urgent"
   "low"      : "low"
   "normal"   : "normal"
   "high"     : "high"

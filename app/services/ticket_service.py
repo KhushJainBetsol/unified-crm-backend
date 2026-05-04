@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
 from fastapi import status as http_status
@@ -249,15 +249,17 @@ class TicketService:
 
             # --- closed_at lifecycle ---
             if new_status == "closed" and ticket.closed_at is None:
-                update_data["closed_at"] = datetime.utcnow()
+                update_data["closed_at"] = datetime.now(timezone.utc)
             elif new_status != "closed" and ticket.closed_at is not None:
-                ticket.closed_at = None
+                update_data["closed_at"] = None
 
             # --- pending_until lifecycle ---
+            # Only keep pending_until when status is "pending"; clear it for other statuses
             if new_status == "pending":
                 update_data["pending_until"] = update.pending_until
             elif ticket.pending_until is not None:
-                ticket.pending_until = None
+                # Transitioning away from pending — clear the timestamp
+                update_data["pending_until"] = None
 
         if update.priority is not None:
             priority_obj = await self._resolve_priority(update.priority)
@@ -273,12 +275,72 @@ class TicketService:
                 detail="Request body contained no updatable fields",
             )
 
+        # IMPORTANT: Validate CRM-specific requirements BEFORE updating DB
+        # This ensures consistency: if validation fails, nothing changes (no DB/CRM mismatch)
+        await self._validate_pending_for_crm(ticket, update)
+
+        # Now safe to update DB
         updated_ticket = await self.repo.update(ticket, update_data)
 
         # Best-effort CRM push — never raises to the caller.
         await self._push_update_to_crm(updated_ticket, update)
 
         return updated_ticket
+
+    # ------------------------------------------------------------------
+    # CRM-specific validation for pending state
+    # ------------------------------------------------------------------
+
+    async def _validate_pending_for_crm(
+        self,
+        ticket: Ticket,
+        payload: TicketUpdateRequest,
+    ) -> None:
+        """
+        Enforce CRM-specific requirements for pending status before pushing to CRM.
+        
+        Zammad: requires pending_until timestamp when status is 'pending'
+        Espo: does not use pending_until timestamp (optional, will be ignored)
+        
+        Raises HTTPException 422 if a CRM requirement is violated.
+        """
+        if payload.status is None:
+            return  # No status change, no validation needed
+        
+        new_status = payload.status.lower()
+        if new_status != "pending":
+            return  # Not transitioning to pending, no timestamp validation needed
+        
+        # Fetch the source system to determine CRM type
+        crm_type_name = ticket.source_system.system_name.lower()
+        
+        if crm_type_name == "zammad":
+            if payload.pending_until is None:
+                raise HTTPException(
+                    status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        "Zammad requires a pending_until timestamp when status is set to 'pending'. "
+                        "Provide a future datetime indicating when the pending reminder should resolve."
+                    ),
+                )
+            # Validate that pending_until is in the future (timezone-aware comparison)
+            if payload.pending_until <= datetime.now(timezone.utc):
+                raise HTTPException(
+                    status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        "pending_until must be in the future. "
+                        "Zammad pending reminders require a future deadline."
+                    ),
+                )
+        elif crm_type_name == "espocrm":
+            # Espo doesn't use pending_until — it's optional
+            # If provided, log a warning that it will be ignored
+            if payload.pending_until is not None:
+                logger.info(
+                    "Ticket %s: pending_until was provided but will be ignored by Espo "
+                    "(Espo does not use pending reminder timestamps).",
+                    ticket.id,
+                )
 
     # ------------------------------------------------------------------
     # CRM push — dispatcher (MASSIVELY SIMPLIFIED)
