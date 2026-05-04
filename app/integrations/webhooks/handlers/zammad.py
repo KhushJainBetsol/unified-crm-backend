@@ -67,6 +67,15 @@ class ZammadWebhookHandler(BaseWebhookHandler):
                 status_code=400, detail="Expected a JSON object from Zammad"
             )
 
+        # --- Normalize Zammad ticket fields using config ---
+        from app.integrations.normalizer.registry import _get_adapter_config
+        if integration.source_system.system_name.lower() == "zammad":
+            config = _get_adapter_config("zammad")
+            payload = {
+                **payload,
+                "ticket": normalize_zammad_ticket_fields(payload.get("ticket", payload), config)
+            }
+
         return RawWebhookPayload(
             integration_id=integration.id,
             source_system_id=integration.source_system_id,
@@ -130,3 +139,44 @@ class ZammadWebhookHandler(BaseWebhookHandler):
             list(payload.keys()),
         )
         return "unknown"
+
+# --- Zammad normalization utility ---
+def normalize_zammad_ticket_fields(payload: dict, config) -> dict:
+    """
+    Normalizes Zammad ticket payload fields using config.yaml mapping.
+    Handles integer state_id and priority_id, mapping them to canonical names.
+    Returns a new dict with normalized fields.
+    """
+    ticket = payload.get("ticket", payload)
+    # Defensive: handle both root-level and nested ticket
+    normalized = dict(ticket)
+
+    # Normalize state/state_id
+    state_id = ticket.get("state_id")
+    if state_id is not None:
+        state_key = str(state_id)
+        mapped_state = config.status_map.get(state_key)
+        if mapped_state:
+            normalized["state"] = mapped_state
+    # If state is a string, map it as well
+    elif "state" in ticket:
+        state_val = ticket["state"]
+        mapped_state = config.status_map.get(str(state_val).lower())
+        if mapped_state:
+            normalized["state"] = mapped_state
+
+    # Normalize priority_id
+    priority_id = ticket.get("priority_id")
+    if priority_id is not None:
+        priority_key = str(priority_id)
+        mapped_priority = config.priority_map.get(priority_key)
+        if mapped_priority:
+            normalized["priority"] = mapped_priority
+    # If priority is a string, map it as well
+    elif "priority" in ticket:
+        priority_val = ticket["priority"]
+        mapped_priority = config.priority_map.get(str(priority_val).lower())
+        if mapped_priority:
+            normalized["priority"] = mapped_priority
+
+    return normalized
