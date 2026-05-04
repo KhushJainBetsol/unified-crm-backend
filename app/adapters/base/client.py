@@ -420,15 +420,23 @@ class BaseCrmClient:
         if code < 400:
             return
         url = str(response.url)
+        
+        # Try to extract error details from response body
+        try:
+            error_body = self._parse_response(response)
+            error_detail = f"HTTP {code}: {url} — Response: {json.dumps(error_body)}"
+        except Exception:
+            error_detail = f"HTTP {code}: {url} — Body: {response.text[:500]}"
+        
         if code in (401, 403):
-            raise CrmAuthError(f"Auth error {code} from {url}")
+            raise CrmAuthError(error_detail)
         if code == 404:
-            raise CrmNotFoundError(f"Resource not found (404): {url}")
+            raise CrmNotFoundError(error_detail)
         if code == 429:
-            raise CrmRateLimitError(f"Rate limit hit (429): {url}")
+            raise CrmRateLimitError(error_detail)
         if code >= 500:
-            raise CrmServerError(f"Server error {code}: {url}")
-        raise CrmClientError(f"Unexpected HTTP {code}: {url}")
+            raise CrmServerError(error_detail)
+        raise CrmClientError(error_detail)
 
     @staticmethod
     def _parse_response(response: httpx.Response) -> Any:

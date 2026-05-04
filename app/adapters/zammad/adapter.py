@@ -167,6 +167,19 @@ class ZammadAdapter(BaseCrmAdapter):
         return {"tokens": tokens, "count": len(tokens)}
 
     async def push_ticket_update(self, crm_ticket_id: str, update_payload: Any) -> None:
+        """
+        Push ticket update to Zammad.
+        
+        CRM Contract for Zammad:
+        - When state contains "pending" (e.g., "Pending" in Zammad):
+          → pending_time MUST be set to an ISO 8601 timestamp string
+        - For any other state (e.g., "New", "Open", "Closed"):
+          → pending_time MUST be cleared (set to null) to avoid blocking ticket lifecycle
+        
+        Service layer validation (_validate_pending_for_crm) enforces that
+        pending_until is provided when transitioning to pending, so this adapter
+        can trust that if status is pending, the timestamp exists.
+        """
         self._assert_authenticated()
         crm_data: dict = {}
 
@@ -177,14 +190,49 @@ class ZammadAdapter(BaseCrmAdapter):
                 None,
             )
             if mapped_status:
+                # Zammad API expects state values in lowercase as they appear in config
+                # e.g., "pending reminder", "closed", not "Pending reminder" or "Closed"
+                # Send mapped_status as-is (lowercase from config keys)
                 crm_data["state"] = mapped_status
-                if "pending" in mapped_status.lower() and update_payload.pending_until:
-                    pt_str = update_payload.pending_until.isoformat()
-                    if update_payload.pending_until.tzinfo is None:
-                        pt_str += "Z"
-                    crm_data["pending_time"] = pt_str
+                logger.debug(
+                    "[%s] Ticket %s: state mapped from unified '%s' to Zammad state '%s'",
+                    self.crm_type,
+                    crm_ticket_id,
+                    update_payload.status,
+                    mapped_status,
+                )
+                
+                # Zammad-specific: Handle pending_time based on pending status
+                if "pending" in mapped_status.lower():
+                    # Transitioning to pending state — timestamp must be set
+                    if update_payload.pending_until:
+                        pt_str = update_payload.pending_until.isoformat()
+                        if update_payload.pending_until.tzinfo is None:
+                            pt_str += "Z"  # Assume UTC if naive
+                        crm_data["pending_time"] = pt_str
+                        logger.info(
+                            "[%s] Ticket %s: pending_time set to %s",
+                            self.crm_type,
+                            crm_ticket_id,
+                            pt_str,
+                        )
+                    else:
+                        # This should not occur if service-layer validation works correctly
+                        logger.warning(
+                            "[%s] Ticket %s: transitioned to pending state but "
+                            "pending_until was None — setting pending_time to None",
+                            self.crm_type,
+                            crm_ticket_id,
+                        )
+                        crm_data["pending_time"] = None
                 else:
+                    # Not a pending state — clear pending_time to unblock ticket
                     crm_data["pending_time"] = None
+                    logger.debug(
+                        "[%s] Ticket %s: cleared pending_time (transitioning away from pending)",
+                        self.crm_type,
+                        crm_ticket_id,
+                    )
 
         if update_payload.priority is not None:
             mapped_priority = next(
@@ -193,14 +241,46 @@ class ZammadAdapter(BaseCrmAdapter):
                 None,
             )
             if mapped_priority:
+                # Zammad API expects priority values as-is from config
+                # Send mapped_priority as-is (could be integer ID or name)
                 crm_data["priority"] = mapped_priority
+                logger.debug(
+                    "[%s] Ticket %s: priority mapped from unified '%s' to Zammad priority '%s'",
+                    self.crm_type,
+                    crm_ticket_id,
+                    update_payload.priority,
+                    mapped_priority,
+                )
 
         if not crm_data:
+            logger.debug(
+                "[%s] Ticket %s: no mapped fields to update (status=%s, priority=%s)",
+                self.crm_type,
+                crm_ticket_id,
+                update_payload.status,
+                update_payload.priority,
+            )
             return
 
         path = self._get_endpoint("ticket_by_id").replace("{ticket_id}", crm_ticket_id)
-        await self._client.request("PUT", path, json_body=crm_data)
-        logger.info("[%s] Ticket %s updated: %s", self.crm_type, crm_ticket_id, crm_data)
+        logger.info(
+            "[%s] Ticket %s: sending update — payload=%s",
+            self.crm_type,
+            crm_ticket_id,
+            crm_data,
+        )
+        try:
+            await self._client.request("PUT", path, json_body=crm_data)
+            logger.info("[%s] Ticket %s updated successfully: %s", self.crm_type, crm_ticket_id, crm_data)
+        except Exception as exc:
+            logger.error(
+                "[%s] Ticket %s update failed with payload %s: %s",
+                self.crm_type,
+                crm_ticket_id,
+                crm_data,
+                exc,
+            )
+            raise
 
     async def fetch_comments(self, crm_ticket_id: str) -> PaginatedResult:
         """

@@ -275,6 +275,19 @@ class EspoCrmAdapter(BaseCrmAdapter):
         return result
 
     async def push_ticket_update(self, crm_ticket_id: str, update_payload: Any) -> None:
+        """
+        Push ticket update to EspoCRM.
+        
+        CRM Contract for Espo:
+        - Espo does NOT use pending_until timestamps for pending status
+        - Pending is a simple status transition with no deadline/reminder semantics
+        - If pending_until is provided in the payload, it is silently ignored
+        - Only status and priority fields are sent to Espo API
+        - Status values must be capitalized: "New", "Pending", "Closed", "Open", "Assigned", "Rejected"
+        
+        Note: pending_until may be stored in the dashboard database for tracking,
+        but it has no effect on Espo-side behavior.
+        """
         self._assert_authenticated()
         crm_data: dict = {}
 
@@ -285,7 +298,20 @@ class EspoCrmAdapter(BaseCrmAdapter):
                 None,
             )
             if mapped_status:
-                crm_data["status"] = mapped_status
+                # Espo API expects status values in title case (e.g., "Pending" not "pending")
+                espo_status = mapped_status.capitalize()
+                crm_data["status"] = espo_status
+                
+                # Espo-specific: Log if pending_until was provided (for observability)
+                if (update_payload.status.lower() == "pending" and 
+                    update_payload.pending_until is not None):
+                    logger.debug(
+                        "[%s] Ticket %s: pending_until was provided but will not be sent to Espo "
+                        "(Espo does not use pending reminders). "
+                        "Dashboard will store the timestamp for reference.",
+                        self.crm_type,
+                        crm_ticket_id,
+                    )
 
         if update_payload.priority is not None:
             mapped_priority = next(
@@ -294,14 +320,46 @@ class EspoCrmAdapter(BaseCrmAdapter):
                 None,
             )
             if mapped_priority:
-                crm_data["priority"] = mapped_priority
+                # Espo API expects priority values in title case (e.g., "High" not "high")
+                espo_priority = mapped_priority.capitalize()
+                crm_data["priority"] = espo_priority
+                logger.debug(
+                    "[%s] Case %s: priority mapped from unified '%s' to Espo priority '%s'",
+                    self.crm_type,
+                    crm_ticket_id,
+                    update_payload.priority,
+                    espo_priority,
+                )
 
         if not crm_data:
+            logger.debug(
+                "[%s] Case %s: no mapped fields to update (status=%s, priority=%s)",
+                self.crm_type,
+                crm_ticket_id,
+                update_payload.status,
+                update_payload.priority,
+            )
             return
 
         path = self._get_endpoint("ticket_by_id").replace("{ticket_id}", str(crm_ticket_id))
-        await self._client.request("PUT", path, json_body=crm_data)
-        logger.info("[%s] Case %s updated: %s", self.crm_type, crm_ticket_id, crm_data)
+        logger.info(
+            "[%s] Case %s: sending update — payload=%s",
+            self.crm_type,
+            crm_ticket_id,
+            crm_data,
+        )
+        try:
+            await self._client.request("PUT", path, json_body=crm_data)
+            logger.info("[%s] Case %s updated successfully: %s", self.crm_type, crm_ticket_id, crm_data)
+        except Exception as exc:
+            logger.error(
+                "[%s] Case %s update failed with payload %s: %s",
+                self.crm_type,
+                crm_ticket_id,
+                crm_data,
+                exc,
+            )
+            raise
 
     async def fetch_comments(self, crm_ticket_id: str) -> PaginatedResult:
         """

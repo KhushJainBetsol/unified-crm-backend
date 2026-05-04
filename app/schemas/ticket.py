@@ -113,26 +113,27 @@ class TicketUpdateRequest(BaseModel):
     pending_until: datetime | None = Field(
         default=None,
         description=(
-            "Required when status is 'pending'. "
-            "The deadline datetime for the pending state (timezone-aware recommended). "
-            "Must be omitted or null for all other statuses."
+            "Optional deadline datetime for pending state. "
+            "Zammad (requires timestamp) and Espo (ignores timestamp) have different requirements. "
+            "CRM-specific validation in the service layer enforces each CRM's contract. "
+            "If provided, status must be 'pending'; if omitted, all non-pending statuses are valid."
         ),
     )
 
     @model_validator(mode="after")
     def _validate_pending_contract(self) -> "TicketUpdateRequest":
         """
-        Enforce the pending state contract at the schema boundary so that
-        the service layer and CRM push logic can trust the payload is consistent.
+        Enforce pending_until contract at schema boundary:
+        - pending_until may only be set if status is 'pending'
+        - pending_until may be None when status is 'pending' (CRM-specific validation 
+          in service layer will enforce whether it's required)
+        
+        This allows the schema to be permissive across multiple CRMs that have 
+        different pending timestamp requirements.
         """
         status = self.status.lower() if self.status else None
 
-        if status == "pending" and self.pending_until is None:
-            raise ValueError(
-                "pending_until is required when status is 'pending'. "
-                "Provide a future datetime indicating when the pending period ends."
-            )
-
+        # Only enforce the constraint: timestamp only allowed with pending status
         if status != "pending" and self.pending_until is not None:
             raise ValueError(
                 f"pending_until may only be set when status is 'pending', "
