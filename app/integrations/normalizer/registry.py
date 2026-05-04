@@ -48,7 +48,7 @@ def _get_registry() -> AdapterRegistry:
     if _registry is None:
         from app.core.settings import get_settings
         settings = get_settings()
-        config_dir = Path(settings.CONFIG_DIR)  # e.g. Path("config")
+        config_dir = Path(settings.CRM_CONFIG_DIR)  # Use CRM_CONFIG_DIR from settings
         _registry = AdapterRegistry(config_base_dir=config_dir)
         _registry.initialise()
     return _registry
