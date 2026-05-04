@@ -56,29 +56,15 @@ logger = logging.getLogger(__name__)
 
 
 def _fetch_key_for_row(key_manager: InfisicalCredentialManager, row: Any) -> str:
-    """
-    Synchronous helper — fetch the correct AES key for a CrmIntegration row.
+    kv = row.key_version
 
-    key_version == "tenant"  → TENANT_KEY_<tenant_id>
-    anything else            → ENCRYPTION_KEY_<key_version>  (global/legacy)
-
-    Raises
-    ------
-    CredentialDecodeError-compatible Exception
-        Callers wrap this in CredentialDecodeError with integration context.
-    """
-    if row.key_version == "tenant":
-        raw_key = key_manager.get_tenant_key(str(row.tenant_id))
-        if raw_key is None:
-            raise ValueError(
-                f"Per-tenant key TENANT_KEY_{row.tenant_id} not found in Infisical. "
-                "Ensure the tenant was created via POST /super-admin/tenants "
-                "after the per-tenant key rollout, or manually add the secret."
-            )
+    # Try per-tenant key first
+    raw_key = key_manager.get_tenant_key(str(row.tenant_id), kv)
+    if raw_key is not None:
         return raw_key
 
-    # Global / legacy key path
-    return key_manager.get_encryption_key(row.key_version)
+    # Fall back to global key
+    return key_manager.get_encryption_key(kv)
 
 
 class DbBackedCredentialService:

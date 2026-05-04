@@ -15,78 +15,27 @@ Two-column secret model
   credential_enc      → outbound auth secrets (api token, password, OAuth tokens…)
   webhook_secrets_enc → inbound webhook HMAC secrets (nullable — always may be None)
 
-Both columns are encrypted independently with the same key version so a
-single rotate() call re-encrypts both atomically.
+Key versioning (v3)
+--------------------
+``crm_integrations.key_version`` stores the REAL version tag returned by
+Infisical (e.g. "v1", "v2") — never the opaque literal "tenant".
+
+Lookup table:
+  key_version == "v1"  →  TENANT_KEY_<tenant_id>_v1  (per-tenant versioned key)
+  key_version == "v2"  →  TENANT_KEY_<tenant_id>_v2  (per-tenant versioned key)
+  ...
+
+If no per-tenant key exists for the stored version, the service falls back to
+the global ENCRYPTION_KEY_<version> secret (legacy tenants created before
+the per-tenant key rollout).
+
+The rotation scheduler updates key_version on each row after re-encryption
+so this lookup always resolves correctly.
 
 Permission gate (PROVISION + CHECK-CONNECTION)
 ----------------------------------------------
 Before any encryption or DB write, provision() calls _check_permissions()
-which hits the CRM's permission-inspection endpoint and validates the
-response using the appropriate CrmPermissionValidator subclass.
-
-  Unknown crm_type          →  ValueError raised immediately with a list of
-                               supported types. Nothing is written to DB.
-
-  Permissions INSUFFICIENT  →  PermissionValidationError is raised immediately
-                               with a list of exactly which checks failed.
-                               Nothing is written to DB.
-
-  Permissions SUFFICIENT    →  normal encryption + DB write proceeds.
-
-Upsert logic (PROVISION)
---------------------------
-provision() now checks TenantSourceSystem before writing anything:
-
-  If a TenantSourceSystem row already exists for (tenant_id, source_system_id):
-      → permission check runs first (same as fresh provision)
-      → delegates to update() using the existing integration_id
-      → sets is_active=True on the row (re-activates if previously revoked)
-
-  If no row exists:
-      → normal create path (encrypt → insert CrmIntegration → insert TenantSourceSystem)
-
-This means the frontend can always call POST /integrations/ and the backend
-decides whether to create or update. The frontend never needs to know.
-
-Flow diagram (PROVISION — upsert)
-----------------------------------
-
-  Frontend / API
-       │
-       ▼  POST /integrations/  (always)
-  CredentialProvisioningService.provision()
-       │
-       ├─► Fetch tenant name
-       │
-       ├─► Resolve SourceSystem from crm_type
-       │       └─► ValueError if unknown crm_type  ◄─ STOPS HERE
-       │
-       ├─► Lookup TenantSourceSystem (tenant_id + source_system_id)
-       │       │
-       │  ┌────┴────┐
-       │  │         │
-       │ EXISTS   NOT FOUND
-       │  │         │
-       │  ▼         ▼
-       │ _check_permissions()   _check_permissions()
-       │  │                      │
-       │  ▼                      ▼
-       │ update(existing_id)    encrypt → insert CrmIntegration
-       │  └─► is_active=True    insert TenantSourceSystem
-       │
-       └─► return CredentialStatusResponse
-
-Architecture notes
-------------------
-- integration_id is ALWAYS generated server-side (uuid4). Callers never supply it.
-- Secrets NEVER leave this service as plaintext (only encrypted or inside envelope).
-- auth_type / key_version / base_url are plain columns — queryable without decryption.
-- crm_type is accessed via row.source_system.system_name (relationship, lazy=joined).
-- Both _enc columns are re-keyed together in rotate() for atomicity.
-- Permission check uses the raw credentials from the request (before encryption)
-  so no Infisical round-trip is needed at validation time.
-- update() always sets is_active=True when credentials are supplied so that
-  a previously revoked/wiped integration is re-activated on re-provision.
+which hits the CRM's permission-inspection endpoint.
 """
 
 from __future__ import annotations
@@ -94,8 +43,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from marshal import version
-from typing import Any, Dict, Optional,Tuple
+from typing import Any, Dict, Optional, Tuple
 from uuid import UUID, uuid4
 
 import httpx
@@ -126,23 +74,11 @@ from app.adapters.base.permission_validator import (
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# CRM permission-check endpoint registry
-#
-# Maps crm_type (lowercase, as stored in source_systems.system_name) to the
-# path that returns the permission/ACL payload for the authenticated user.
-# The full URL is assembled as:  base_url + path
-#
-# IMPORTANT: Any crm_type NOT present here will be REJECTED by
-# _check_permissions() with a ValueError. Add new CRM types here (and a
-# matching entry in _PERMISSION_VALIDATOR) before provisioning them.
-# ---------------------------------------------------------------------------
 _PERMISSION_ENDPOINT: Dict[str, str] = {
     "espocrm": "/api/v1/App/user",
     "zammad":  "/api/v1/user_access_token",
 }
 
-# Maps crm_type → validator class
 _PERMISSION_VALIDATOR = {
     "espocrm": EspoCrmPermissionValidator,
     "zammad":  ZammadPermissionValidator,
@@ -156,7 +92,7 @@ class CredentialProvisioningService:
     Parameters
     ----------
     key_manager:
-        Async Infisical manager that holds and retrieves AES keys.
+        Async Infisical manager.
     db:
         SQLAlchemy AsyncSession scoped to the current request.
     """
@@ -178,27 +114,6 @@ class CredentialProvisioningService:
     ) -> CredentialStatusResponse:
         """
         Upsert credentials for a CRM integration.
-
-        If the tenant already has an integration row for this CRM type
-        (determined by looking up TenantSourceSystem), the existing row is
-        updated (re-encrypted + is_active restored).  Otherwise a fresh
-        integration_id is generated and a new row is created.
-
-        In both cases the permission gate runs BEFORE any DB write.
-
-        Steps (create path)
-        -------------------
-        1. Fetch tenant name from DB.
-        2. Resolve SourceSystem — raises ValueError for unknown crm_type.
-        3. Check TenantSourceSystem for existing integration.
-           → If found: run permission check → delegate to update() → return.
-        4. Permission gate — raises on failure, nothing written.
-        5. Generate fresh integration_id (uuid4).
-        6. Fetch active AES key + version from Infisical.
-        7. Encrypt outbound secret dict → credential_enc.
-        8. Encrypt webhook secret dict → webhook_secrets_enc (or NULL).
-        9. Insert CrmIntegration row.
-        10. Fetch CRM org ID + insert TenantSourceSystem row.
         """
         crm_type = request.crm_type.strip().lower()
         base_url = str(request.base_url).rstrip("/")
@@ -210,9 +125,8 @@ class CredentialProvisioningService:
         tenant = tenant_result.scalars().first()
         if tenant is None:
             raise ValueError(f"Tenant with id={tenant_id} not found.")
-        tenant_name = tenant.name
 
-        # ── 2. Resolve SourceSystem (validates crm_type early) ─────────────
+        # ── 2. Resolve SourceSystem ────────────────────────────────────────
         ss_result = await self._db.execute(
             select(SourceSystem).where(SourceSystem.system_name == crm_type)
         )
@@ -223,7 +137,7 @@ class CredentialProvisioningService:
                 "Register it in the source_systems table before provisioning."
             )
 
-        # ── 3. Upsert check — does this tenant already have this CRM? ──────
+        # ── 3. Upsert check ────────────────────────────────────────────────
         tss_result = await self._db.execute(
             select(TenantSourceSystem).where(
                 TenantSourceSystem.tenant_id == tenant_id,
@@ -233,33 +147,17 @@ class CredentialProvisioningService:
         existing_tss = tss_result.scalars().first()
 
         if existing_tss is not None:
-            # ── Existing integration → run permission check then update ────
             logger.info(
                 "Integration already exists for tenant_id='%s' crm_type='%s' "
                 "(integration_id='%s'). Running upsert → update path.",
-                tenant_id,
-                crm_type,
-                existing_tss.integration_id,
+                tenant_id, crm_type, existing_tss.integration_id,
             )
+            await self._check_permissions(crm_type=crm_type, base_url=base_url, request=request)
 
-            # Permission gate still runs — we don't skip it on updates.
-            await self._check_permissions(
-                crm_type=crm_type,
-                base_url=base_url,
-                request=request,
-            )
-
-            # Build an UpdateCredentialsRequest from the provision payload.
-            # base_url and webhook fields are forwarded so nothing is lost.
             update_request = UpdateCredentialsRequest(
                 credentials=request.credentials,
                 base_url=request.base_url,
             )
-
-            # FIX: carry ALL webhook secret fields through to the update request.
-            # Previously only "webhook_secret" and "webhook_signing_secret" were
-            # forwarded — "per_event_secrets" was silently dropped, causing
-            # webhook_secrets_enc to never be written on the upsert path.
             for attr in ("webhook_secret", "webhook_signing_secret", "per_event_secrets"):
                 if hasattr(request, attr) and hasattr(update_request, attr):
                     setattr(update_request, attr, getattr(request, attr))
@@ -269,16 +167,12 @@ class CredentialProvisioningService:
                 request=update_request,
             )
 
-        # ── 4. Permission gate — nothing is written if this raises ─────────
-        await self._check_permissions(
-            crm_type=crm_type,
-            base_url=base_url,
-            request=request,
-        )
+        # ── 4. Permission gate ─────────────────────────────────────────────
+        await self._check_permissions(crm_type=crm_type, base_url=base_url, request=request)
 
         integration_id = uuid4()
 
-        # ── 5. Fetch AES key ───────────────────────────────────────────────
+        # ── 5. Fetch AES key (versioned per-tenant or global fallback) ──────
         version, raw_key = await self._get_key_for_tenant(tenant_id)
         enc_service = EncryptionService(raw_key=raw_key, key_version=version)
 
@@ -294,20 +188,19 @@ class CredentialProvisioningService:
                 json.dumps(webhook_secret_dict)
             ).to_db_string()
 
-        # ── 8. Resolve plain column values ─────────────────────────────────
         auth_type = request.credentials.auth_type
 
-        # ── 9. Insert CrmIntegration row ───────────────────────────────────
+        # ── 8. Insert CrmIntegration row ───────────────────────────────────
         row = await self._create_row(
             integration_id=integration_id,
             tenant_id=tenant_id,
             crm_type=crm_type,
             auth_type=auth_type,
-            key_version=version,
+            key_version=version,          # real version e.g. "v1"
             base_url=base_url,
             credential_enc=credential_enc,
             webhook_secrets_enc=webhook_secrets_enc,
-            source_system=source_system,          # already resolved — no second query
+            source_system=source_system,
         )
 
         tss_row = TenantSourceSystem(
@@ -341,21 +234,8 @@ class CredentialProvisioningService:
         integration_id: UUID,
         request: UpdateCredentialsRequest,
     ) -> CredentialStatusResponse:
-        """
-        Partially update credentials / metadata / webhook secrets on an
-        existing integration. Only supplied fields are changed.
-
-        Updating credentials re-encrypts with the current active key so the
-        row's key_version is also bumped. Webhook secrets can be updated
-        independently of outbound credentials and vice-versa.
-
-        When credentials are supplied, is_active is set to True so that a
-        previously revoked / wiped integration is cleanly re-activated on
-        re-provision (the upsert path in provision() delegates here).
-        """
         row = await self._get_row_or_raise(integration_id)
 
-        # ── Outbound credentials ──────────────────────────────────────────
         if request.credentials is not None:
             version, raw_key = await self._get_key_for_tenant(row.tenant_id)
             enc_service = EncryptionService(raw_key=raw_key, key_version=version)
@@ -363,14 +243,10 @@ class CredentialProvisioningService:
             secret_dict = request.credentials.to_secret_dict()
             row.credential_enc = enc_service.encrypt(json.dumps(secret_dict)).to_db_string()
             row.auth_type = request.credentials.auth_type
-            row.key_version = version
+            row.key_version = version     # update to latest version
 
-            # Re-activate in case this row was previously revoked or wiped.
-            # This is the key fix for the reset → re-provision flow:
-            # revoke(wipe=True) sets is_active=False; update() restores it.
             row.is_active = True
 
-            # If HMAC credentials also carry webhook secrets, update that column too.
             cred_ws = (
                 request.credentials.to_webhook_secret_dict()
                 if hasattr(request.credentials, "to_webhook_secret_dict")
@@ -381,20 +257,16 @@ class CredentialProvisioningService:
                     json.dumps(cred_ws)
                 ).to_db_string()
 
-        # ── Inbound webhook secrets (independent update) ───────────────────
         if request.has_webhook_updates():
             ws_version, ws_raw_key = await self._get_key_for_row(row)
             ws_enc = EncryptionService(raw_key=ws_raw_key, key_version=ws_version)
 
             ws_dict = request.build_webhook_secret_dict()
             if ws_dict:
-                row.webhook_secrets_enc = ws_enc.encrypt(
-                    json.dumps(ws_dict)
-                ).to_db_string()
+                row.webhook_secrets_enc = ws_enc.encrypt(json.dumps(ws_dict)).to_db_string()
             else:
                 row.webhook_secrets_enc = None
 
-        # ── Plain columns ─────────────────────────────────────────────────
         if request.base_url is not None:
             row.base_url = str(request.base_url).rstrip("/")
 
@@ -410,14 +282,6 @@ class CredentialProvisioningService:
     # ── RETRIEVE (decrypt → envelope) ─────────────────────────────────────
 
     async def get_envelope(self, integration_id: UUID) -> CrmCredentialEnvelope:
-        """
-        Decrypt outbound credentials and return a CrmCredentialEnvelope.
-        Used internally by the adapter factory to construct CRM clients.
-        Secrets never appear in logs or return values outside the envelope.
-
-        Webhook secrets (if present) are included in the envelope's metadata
-        so adapters can access them for inbound verification.
-        """
         row = await self._get_row_or_raise(integration_id)
 
         if not row.credential_enc:
@@ -426,14 +290,12 @@ class CredentialProvisioningService:
         key_version, raw_key = await self._get_key_for_row(row)
         enc_service = EncryptionService(raw_key=raw_key, key_version=key_version)
 
-        # ── Decrypt outbound credentials ──────────────────────────────────
         try:
             decrypted_json = enc_service.decrypt_from_db(row.credential_enc)
             secret_dict: Dict[str, Any] = json.loads(decrypted_json)
         except Exception as exc:
             raise CredentialDecodeError(str(integration_id), str(exc)) from exc
 
-        # ── Decrypt webhook secrets (nullable) ────────────────────────────
         webhook_secrets: Dict[str, Any] = {}
         if row.webhook_secrets_enc:
             try:
@@ -443,14 +305,12 @@ class CredentialProvisioningService:
             except Exception as exc:
                 logger.warning(
                     "Failed to decrypt webhook_secrets_enc for integration %s: %s",
-                    integration_id,
-                    exc,
+                    integration_id, exc,
                 )
 
         crm_type = row.source_system.system_name
         auth_type = row.auth_type
         base_url = row.base_url or ""
-
         credentials_dict = _secret_dict_to_envelope_creds(auth_type, secret_dict)
 
         return CrmCredentialEnvelope(
@@ -467,7 +327,6 @@ class CredentialProvisioningService:
     # ── STATUS ─────────────────────────────────────────────────────────────
 
     async def get_status(self, integration_id: UUID) -> CredentialStatusResponse:
-        """Return metadata/status without decrypting anything."""
         row = await self._get_row_or_raise(integration_id)
         return self._to_status(row)
 
@@ -475,10 +334,8 @@ class CredentialProvisioningService:
 
     async def rotate(self, integration_id: UUID) -> dict:
         """
-        Re-encrypt BOTH _enc columns with the current active Infisical key.
-
-        Call this on all active integrations after rotating the Infisical key
-        so that all rows migrate to the new key version atomically.
+        Re-encrypt BOTH _enc columns with the current active key for this tenant.
+        Updates key_version on the row to the new version.
         """
         row = await self._get_row_or_raise(integration_id)
 
@@ -494,12 +351,8 @@ class CredentialProvisioningService:
         if row.webhook_secrets_enc:
             decrypted_webhook = old_enc.decrypt_from_db(row.webhook_secrets_enc)
 
-        if old_version == "tenant":
-            # Tenant key rotation: same key, same version — nothing to rotate
-            # (tenant key rotation is a separate operation: regenerate-key endpoint)
-            new_version, new_raw_key = old_version, old_raw_key
-        else:
-            new_version, new_raw_key = await self._key_manager.get_active_key_and_version()
+        # Fetch the CURRENT active key (may differ from what's on the row)
+        new_version, new_raw_key = await self._get_key_for_tenant(row.tenant_id)
         new_enc = EncryptionService(raw_key=new_raw_key, key_version=new_version)
 
         row.credential_enc = new_enc.encrypt(decrypted_cred).to_db_string()
@@ -529,23 +382,6 @@ class CredentialProvisioningService:
     # ── REVOKE ─────────────────────────────────────────────────────────────
 
     async def revoke(self, integration_id: UUID, *, wipe: bool = False) -> None:
-        """
-        Soft-disable an integration (is_active=False).
-        Pass wipe=True to also null out BOTH _enc columns (hard delete of secrets).
-
-        Also hard-deletes the associated TenantSourceSystem row so that a
-        subsequent POST /integrations/ for the same tenant + crm_type will
-        go through the create path (fresh uuid4, fresh TenantSourceSystem row)
-        rather than the update path.
-
-        If you want to allow re-provisioning via the upsert path (update the
-        existing CrmIntegration row), keep the TenantSourceSystem row alive
-        and just wipe the credential columns — pass wipe=True and handle the
-        TenantSourceSystem deletion separately, or don't delete it here.
-
-        Current behaviour: TenantSourceSystem is always deleted on revoke so
-        the integration_id can be cleanly re-issued on next provision.
-        """
         row = await self._get_row_or_raise(integration_id)
         row.is_active = False
 
@@ -557,25 +393,21 @@ class CredentialProvisioningService:
                 extra={"integration_id": str(integration_id)},
             )
 
-        # ── Hard-delete TenantSourceSystem row ────────────────────────────
         tss_result = await self._db.execute(
             select(TenantSourceSystem).where(
                 TenantSourceSystem.integration_id == integration_id
             )
         )
         tss_row = tss_result.scalars().first()
-
         if tss_row is not None:
             await self._db.delete(tss_row)
         else:
             logger.warning(
-                "No TenantSourceSystem row found for integration_id='%s' — "
-                "nothing to delete.",
+                "No TenantSourceSystem row found for integration_id='%s'.",
                 str(integration_id),
             )
 
         await self._db.commit()
-
         logger.info(
             "Revoked integration",
             extra={"integration_id": str(integration_id), "wipe": wipe},
@@ -589,37 +421,6 @@ class CredentialProvisioningService:
         base_url: str,
         request: ProvisionCredentialsRequest,
     ) -> None:
-        """
-        Hit the CRM's permission-inspection endpoint using the caller's raw
-        credentials and validate the response.
-
-        This runs BEFORE any encryption or DB write.  If the token lacks the
-        required permissions a PermissionValidationError is raised — the caller
-        sees a clear list of exactly which checks failed and nothing is persisted.
-
-        An UNKNOWN crm_type raises ValueError instead of silently passing.
-        This prevents placeholder or mistyped crm_type values from slipping
-        through as false positives.
-
-        Parameters
-        ----------
-        crm_type:
-            Lowercase CRM identifier (e.g. "espocrm", "zammad").
-        base_url:
-            CRM base URL already stripped of trailing slash.
-        request:
-            The original provision request carrying the raw credentials.
-
-        Raises
-        ------
-        ValueError
-            crm_type is not in the known registry.
-        PermissionValidationError
-            One or more required permissions are missing.
-        RuntimeError
-            The HTTP call to the CRM's permission endpoint failed (network
-            error, non-2xx response, or unparseable body).
-        """
         supported = sorted(
             set(_PERMISSION_ENDPOINT.keys()) & set(_PERMISSION_VALIDATOR.keys())
         )
@@ -641,13 +442,8 @@ class CredentialProvisioningService:
         url = base_url + endpoint_path
         auth_headers = self._build_auth_headers(crm_type, request)
 
-        logger.info(
-            "Checking CRM permissions for crm_type='%s' at '%s'",
-            crm_type,
-            url,
-        )
+        logger.info("Checking CRM permissions for crm_type='%s' at '%s'", crm_type, url)
 
-        # ── HTTP call ─────────────────────────────────────────────────────
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(url, headers=auth_headers)
@@ -657,21 +453,16 @@ class CredentialProvisioningService:
             ) from exc
 
         if response.status_code == 401:
-            raise PermissionValidationError(
-                [
-                    f"Authentication failed (HTTP 401). "
-                    f"The supplied API token was rejected by {crm_type} at '{url}'. "
-                    "Please verify your token or API key."
-                ]
-            )
+            raise PermissionValidationError([
+                f"Authentication failed (HTTP 401). "
+                f"The supplied API token was rejected by {crm_type} at '{url}'."
+            ])
 
         if response.status_code == 403:
-            raise PermissionValidationError(
-                [
-                    f"Access denied (HTTP 403). "
-                    f"The API token does not have permission to call '{url}' on {crm_type}."
-                ]
-            )
+            raise PermissionValidationError([
+                f"Access denied (HTTP 403). "
+                f"The API token does not have permission to call '{url}' on {crm_type}."
+            ])
 
         if not (200 <= response.status_code < 300):
             raise RuntimeError(
@@ -686,75 +477,58 @@ class CredentialProvisioningService:
                 f"Permission endpoint '{url}' returned a non-JSON body: {exc}"
             ) from exc
 
-        # ── Validate parsed response ───────────────────────────────────────
         validator = ValidatorClass(body)
         result = validator.validate()
 
         if not result.ok:
             logger.warning(
                 "Permission check failed for crm_type='%s'. Failures: %s",
-                crm_type,
-                result.failures,
+                crm_type, result.failures,
             )
             raise PermissionValidationError(result.failures)
 
-        logger.info(
-            "Permission check passed for crm_type='%s'.", crm_type
-        )
+        logger.info("Permission check passed for crm_type='%s'.", crm_type)
 
-    async def _get_key_for_tenant(
-        self,
-        tenant_id: UUID,
-    ) -> Tuple[str, str]:
+    async def _get_key_for_tenant(self, tenant_id: UUID) -> Tuple[str, str]:
         """
-        Fetch the encryption key for this tenant.
+        Fetch the ACTIVE encryption key for a tenant.
 
         Lookup order:
-        1. TENANT_KEY_<tenant_id> in Infisical  → per-tenant key (new tenants)
-        2. ACTIVE_KEY_VERSION + ENCRYPTION_KEY_<version>  → global key (old tenants)
+        1. TENANT_ACTIVE_VERSION_<tenant_id> → TENANT_KEY_<tenant_id>_<version>
+           (per-tenant versioned key — all new tenants)
+        2. Global ACTIVE_KEY_VERSION → ENCRYPTION_KEY_<version>
+           (legacy tenants created before per-tenant key rollout)
 
         Returns
         -------
         (version, raw_key)
-            version : key version tag stored in crm_integrations.key_version
-                    For tenant keys: "tenant"
-                    For global keys: "v1" / "v2" / etc.
-            raw_key : raw AES key string for EncryptionService
         """
-        tenant_key = await self._key_manager.get_tenant_key(str(tenant_id))
-        if tenant_key is not None:
-            # Per-tenant key — version tag is fixed as "tenant" so
-            # get_envelope / rotate know to fetch TENANT_KEY_<tenant_id>
-            # rather than ENCRYPTION_KEY_<version>
-            return "tenant", tenant_key
+        result = await self._key_manager.get_active_tenant_key_and_version(str(tenant_id))
+        if result is not None:
+            return result
 
-        # Fall back to global key for tenants that pre-date per-tenant rollout
+        # Fallback to global key for legacy tenants
         version, raw_key = await self._key_manager.get_active_key_and_version()
         return version, raw_key
 
-
-    async def _get_key_for_row(
-        self,
-        row: "CrmIntegration",
-    ) -> Tuple[str, str]:
+    async def _get_key_for_row(self, row: "CrmIntegration") -> Tuple[str, str]:
         """
         Fetch the correct decryption key for an EXISTING integration row.
 
-        key_version == "tenant"  → fetch TENANT_KEY_<tenant_id>
-        anything else            → fetch ENCRYPTION_KEY_<key_version>  (global)
+        Try order:
+        1. TENANT_KEY_<tenant_id>_<key_version>  (per-tenant versioned key)
+        2. ENCRYPTION_KEY_<key_version>           (global/legacy key)
         """
-        if row.key_version == "tenant":
-            tenant_key = await self._key_manager.get_tenant_key(str(row.tenant_id))
-            if tenant_key is None:
-                raise CredentialNotFoundError(
-                    f"Per-tenant key not found in Infisical for tenant_id={row.tenant_id}. "
-                    "The secret TENANT_KEY_{row.tenant_id} is missing."
-                )
-            return "tenant", tenant_key
+        kv = row.key_version
 
-        # Global key path (legacy rows)
-        raw_key = await self._key_manager.get_encryption_key(row.key_version)
-        return row.key_version, raw_key
+        # Try per-tenant key first
+        raw_key = await self._key_manager.get_tenant_key(str(row.tenant_id), kv)
+        if raw_key is not None:
+            return kv, raw_key
+
+        # Fall back to global key
+        raw_key = await self._key_manager.get_encryption_key(kv)
+        return kv, raw_key
 
     async def _get_row(self, integration_id: UUID) -> Optional[CrmIntegration]:
         result = await self._db.execute(
@@ -780,24 +554,12 @@ class CredentialProvisioningService:
         webhook_secrets_enc: str | None,
         source_system: SourceSystem | None = None,
     ) -> CrmIntegration:
-        """
-        Insert a new CrmIntegration row.
-
-        Accepts an already-resolved ``source_system`` object to avoid a
-        redundant DB query when provision() has already fetched it.  If not
-        supplied, it is fetched here (backward-compatible).
-
-        All secret-bearing fields come pre-encrypted; this method never
-        handles plaintext.
-        """
         if source_system is None:
-            # Fallback — resolves source_system when called outside provision()
-            from app.models.source_system import SourceSystem as _SS  # avoid circular dep
+            from app.models.source_system import SourceSystem as _SS
             result = await self._db.execute(
                 select(_SS).where(_SS.system_name == crm_type)
             )
             source_system = result.scalar_one_or_none()
-
             if source_system is None:
                 raise ValueError(
                     f"Unknown crm_type '{crm_type}'. "
@@ -819,30 +581,11 @@ class CredentialProvisioningService:
         await self._db.flush()
         return row
 
-
-    # ---------------------------------------------------------------------------
-    # Pure helper functions
-    # ---------------------------------------------------------------------------
-
-
     def _build_auth_headers(
-        self, 
+        self,
         crm_type: str,
         request: ProvisionCredentialsRequest,
     ) -> Dict[str, str]:
-        """
-        Build the HTTP headers needed to authenticate the permission-check request
-        using the RAW (un-encrypted) credentials from the provision request.
-
-        Each CRM uses a different convention:
-        - EspoCRM  → "X-Api-Key: <token>"  (api_key auth)
-                    "Authorization: Basic <b64(user:pass)>"  (basic_auth)
-                    "Authorization: Bearer <token>"  (api_token / bearer)
-        - Zammad   → "Authorization: Token token=<token>"
-
-        Falls back to a Bearer header for unrecognised CRM types so the
-        permission endpoint can still be called rather than silently skipped.
-        """
         import base64
 
         secret_dict = request.credentials.to_secret_dict()
@@ -861,21 +604,16 @@ class CredentialProvisioningService:
             else:
                 token = secret_dict.get("token", "")
                 headers["Authorization"] = f"Bearer {token}"
-
         elif crm_type == "zammad":
             token = secret_dict.get("token", secret_dict.get("api_key", ""))
             headers["Authorization"] = f"Token token={token}"
-
         else:
-            # Generic fallback
             token = secret_dict.get("token", secret_dict.get("api_key", ""))
             headers["Authorization"] = f"Bearer {token}"
 
         return headers
 
-
-    def _to_status(self,row: CrmIntegration) -> CredentialStatusResponse:
-        """Map a CrmIntegration ORM row → CredentialStatusResponse. No secrets exposed."""
+    def _to_status(self, row: CrmIntegration) -> CredentialStatusResponse:
         return CredentialStatusResponse(
             integration_id=row.id,
             crm_type=row.source_system.system_name,
@@ -892,41 +630,40 @@ class CredentialProvisioningService:
         )
 
 
-    def _secret_dict_to_envelope_creds(
-        auth_type: str,
-        secret_dict: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        Convert the decrypted outbound secret dict into the standard
-        CrmCredentialEnvelope credentials format. Always includes a 'strategy'
-        key so adapters can switch on a single field.
-        """
-        if auth_type in ("api_token", "bearer_token", "access_token", "api_key"):
-            return {"strategy": "api_token", "token": secret_dict.get("token", "")}
+# ---------------------------------------------------------------------------
+# Pure helper
+# ---------------------------------------------------------------------------
 
-        if auth_type == "basic_auth":
-            return {
-                "strategy": "basic",
-                "username": secret_dict.get("username", ""),
-                "password": secret_dict.get("password", ""),
-            }
-
-        if auth_type == "oauth2":
-            return {
-                "strategy": "oauth2",
-                "access_token": secret_dict.get("access_token", ""),
-                "refresh_token": secret_dict.get("refresh_token"),
-                "token_type": secret_dict.get("token_type", "Bearer"),
-                "expires_at": secret_dict.get("expires_at"),
-            }
-
-        if auth_type == "hmac":
-            return {
-                "strategy": "api_token",
-                "token": secret_dict.get("api_token", ""),
-            }
-
-        logger.warning(
-            "Unrecognised auth_type '%s', falling back to api_token strategy", auth_type
-        )
+def _secret_dict_to_envelope_creds(
+    auth_type: str,
+    secret_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    if auth_type in ("api_token", "bearer_token", "access_token", "api_key"):
         return {"strategy": "api_token", "token": secret_dict.get("token", "")}
+
+    if auth_type == "basic_auth":
+        return {
+            "strategy": "basic",
+            "username": secret_dict.get("username", ""),
+            "password": secret_dict.get("password", ""),
+        }
+
+    if auth_type == "oauth2":
+        return {
+            "strategy": "oauth2",
+            "access_token": secret_dict.get("access_token", ""),
+            "refresh_token": secret_dict.get("refresh_token"),
+            "token_type": secret_dict.get("token_type", "Bearer"),
+            "expires_at": secret_dict.get("expires_at"),
+        }
+
+    if auth_type == "hmac":
+        return {
+            "strategy": "api_token",
+            "token": secret_dict.get("api_token", ""),
+        }
+
+    logger.warning(
+        "Unrecognised auth_type '%s', falling back to api_token strategy", auth_type
+    )
+    return {"strategy": "api_token", "token": secret_dict.get("token", "")}
