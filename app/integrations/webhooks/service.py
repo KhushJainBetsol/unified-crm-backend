@@ -31,6 +31,20 @@ Bugs fixed
    Fix: _get_adapter_config(source_system) now calls
        factory._registry.get_adapter_config(source_system)
    exactly as CrmAdapterFactory.create() does internally.
+
+5. EspoCRM Case.delete event_type defaulted to "unknown" when the
+   X-Webhook-Event header was absent. EspoCRM sends ONLY {"id": "..."}
+   for delete events — no "deleted" flag, no timestamps — so the previous
+   _infer_event_type() never matched and soft_delete() was never called.
+
+   Fix (two-layer defence):
+   Layer 1 — espo.py _infer_event_type() now detects the minimal payload
+             {"id": "..."} as Case.delete (no create/update fields present).
+   Layer 2 — _espo_attempt_delete_fallback() runs when event_type is still
+             "unknown" after parsing: it re-checks each record for the same
+             minimal pattern and calls _espo_delete_ticket() directly.
+             This catches deliveries where the header is absent AND inference
+             failed for any unforeseen reason.
 """
 
 from __future__ import annotations
@@ -55,6 +69,22 @@ from app.repositories.ticket_repository import TicketRepository
 from app.services.sync_service import SyncService
 
 logger = logging.getLogger(__name__)
+
+# Fields that are present on EspoCRM create/update payloads but absent from
+# delete payloads. Mirrors the constant in espo.py — duplicated here so
+# service.py has no import dependency on the handler layer.
+_ESPO_CREATE_UPDATE_INDICATOR_FIELDS = frozenset(
+    {
+        "createdAt",
+        "modifiedAt",
+        "name",
+        "status",
+        "parentType",
+        "description",
+        "assignedUserId",
+        "accountId",
+    }
+)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -128,11 +158,30 @@ async def _handle_espo(
       Case.delete    → soft delete ticket
       Note.create    → fetch + persist comments
       Comment.create → alias for Note.create (forward-compat)
+      unknown        → attempt delete fallback before warning
+
+    Unknown-event fallback
+    ----------------------
+    When event_type is "unknown" (header absent + inference failed),
+    _espo_attempt_delete_fallback() is called. It checks each record for
+    the EspoCRM delete payload signature — {"id": "..."} with no create/update
+    fields — and soft-deletes any matches. This is a safety net for the
+    case where both the X-Webhook-Event header and payload inference fail.
     """
     sync = SyncService(session)
     source_system_id = payload.source_system_id
     tenant_id = payload.tenant_id
 
+    # ── Unknown-event fallback (runs before the per-record loop) ──────────
+    # When event_type could not be resolved, attempt a delete based on payload
+    # shape before giving up. This handles the case where the X-Webhook-Event
+    # header is absent AND _infer_event_type() returned None (e.g. an entirely
+    # empty record, or a shape we haven't seen before).
+    if payload.event_type == "unknown":
+        await _espo_attempt_delete_fallback(payload, session)
+        return
+
+    # ── Per-record processing for all other known event types ─────────────
     for raw in payload.records:
         crm_ticket_id = _extract_record_id(raw, source="espocrm")
         if crm_ticket_id is None:
@@ -162,7 +211,7 @@ async def _handle_espo(
                 )
             else:
                 logger.warning(
-                    "espocrm: unknown event_type=%s | webhook_uuid=%s",
+                    "espocrm: unhandled event_type=%s | webhook_uuid=%s",
                     payload.event_type,
                     payload.webhook_uuid,
                 )
@@ -187,6 +236,120 @@ async def _handle_espo(
                 crm_ticket_id, payload.event_type, payload.webhook_uuid,
                 exc_info=exc,
             )
+
+
+async def _espo_attempt_delete_fallback(
+    payload: RawWebhookPayload,
+    session: AsyncSession,
+) -> None:
+    """
+    Fallback delete handler for EspoCRM payloads where event_type is "unknown".
+
+    When EspoCRM sends a Case.delete webhook WITHOUT the X-Webhook-Event
+    header and _infer_event_type() also fails (e.g. the parser ran before
+    this fix was deployed, or a future EspoCRM version changes the shape),
+    this function provides a last line of defence.
+
+    Detection logic
+    ---------------
+    A record is treated as a delete candidate when:
+      - It has an "id" field (required to look up the ticket in our DB), AND
+      - It has NONE of the fields that always appear on create/update payloads
+        (createdAt, modifiedAt, name, status, parentType, description,
+         assignedUserId, accountId).
+
+    This matches the confirmed EspoCRM delete payload shape:
+        {"id": "69f504798ae7eff4b"}
+
+    Non-delete records (create/update payloads arriving as "unknown") will
+    have at least one of the indicator fields and will NOT be soft-deleted,
+    so this fallback is safe to run even on ambiguous deliveries.
+
+    Outcomes
+    --------
+    - Delete candidate found + ticket exists in DB  → soft_delete() called,
+      INFO log with crm_ticket_id.
+    - Delete candidate found + ticket not in DB     → warning logged (already
+      handled by _espo_delete_ticket).
+    - No delete candidates found in payload         → WARNING logged with
+      record keys so engineers can diagnose the unexpected shape.
+    - Per-record delete error                       → ERROR logged, other
+      records in the same delivery continue processing.
+    """
+    source_system_id = payload.source_system_id
+    tenant_id = payload.tenant_id
+    deleted_count = 0
+    candidate_count = 0
+
+    for raw in payload.records:
+        record_keys = set(raw.keys())
+
+        # Detect minimal delete payload: has "id", lacks all create/update fields.
+        is_delete_candidate = (
+            "id" in record_keys
+            and not record_keys.intersection(_ESPO_CREATE_UPDATE_INDICATOR_FIELDS)
+        )
+
+        if not is_delete_candidate:
+            logger.warning(
+                "espocrm: fallback | record not a delete candidate | "
+                "record_keys=%s | webhook_uuid=%s | "
+                "this delivery may be a create/update with a missing header — "
+                "add X-Webhook-Event in EspoCRM webhook config to fix permanently",
+                sorted(record_keys),
+                payload.webhook_uuid,
+            )
+            continue
+
+        candidate_count += 1
+        crm_ticket_id = _extract_record_id(raw, source="espocrm")
+        if not crm_ticket_id:
+            continue
+
+        logger.info(
+            "espocrm: fallback delete triggered | crm_ticket_id=%s | "
+            "record_keys=%s | webhook_uuid=%s | integration_id=%s",
+            crm_ticket_id,
+            sorted(record_keys),
+            payload.webhook_uuid,
+            payload.integration_id,
+        )
+
+        try:
+            await _espo_delete_ticket(
+                crm_ticket_id, source_system_id, tenant_id, session
+            )
+            deleted_count += 1
+        except WebhookSyncError as exc:
+            logger.error(
+                "espocrm: fallback delete failed | crm_ticket_id=%s | "
+                "webhook_uuid=%s | reason=%s",
+                crm_ticket_id,
+                payload.webhook_uuid,
+                exc,
+            )
+
+    # Summary log — always emit so monitoring alerts can key on this line.
+    if candidate_count == 0:
+        logger.warning(
+            "espocrm: fallback found no delete candidates | "
+            "webhook_uuid=%s | integration_id=%s | "
+            "total_records=%d | all record_keys=%s | "
+            "delivery dropped — add X-Webhook-Event header to prevent this",
+            payload.webhook_uuid,
+            payload.integration_id,
+            len(payload.records),
+            [sorted(r.keys()) for r in payload.records if isinstance(r, dict)],
+        )
+    else:
+        logger.info(
+            "espocrm: fallback complete | candidates=%d | soft_deleted=%d | "
+            "webhook_uuid=%s | integration_id=%s",
+            candidate_count,
+            deleted_count,
+            payload.webhook_uuid,
+            payload.integration_id,
+        )
 
 
 async def _espo_create_ticket(
@@ -367,7 +530,14 @@ async def _espo_delete_ticket(
     tenant_id: uuid.UUID,
     session: AsyncSession,
 ) -> None:
-    """EspoCRM Case.delete — soft delete."""
+    """
+    EspoCRM Case.delete — soft delete.
+
+    Called from two paths:
+      1. Direct: payload.event_type == "Case.delete" (header present or inferred)
+      2. Fallback: _espo_attempt_delete_fallback() when event_type == "unknown"
+    Both paths are idempotent — calling this on an already-deleted ticket is safe.
+    """
     repo = TicketRepository(session)
     existing = await repo.get_by_crm_id(
         crm_ticket_id, source_system_id, tenant_id=tenant_id
