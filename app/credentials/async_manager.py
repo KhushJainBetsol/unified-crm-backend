@@ -1,45 +1,29 @@
 """
 app/credentials/async_manager.py
 ==================================
-AsyncInfisicalKeyManager
-------------------------
-Non-blocking async wrapper around ``InfisicalKeyManager``.
+AsyncInfisicalCredentialManager  (v3 — versioned tenant keys)
+--------------------------------------------------------------
+Non-blocking async wrapper around ``InfisicalCredentialManager``.
 
 The Infisical Python SDK is fully synchronous (uses ``requests`` internally).
 Running it directly inside a FastAPI route blocks the event loop.
-This wrapper offloads every SDK call to a thread-pool executor so
-the interface is async-compatible without rewriting the underlying manager.
+This wrapper offloads every SDK call to a thread-pool executor.
 
-Usage
------
-    # At startup (lifespan hook)
-    key_manager = await AsyncInfisicalKeyManager.create()
+Per-tenant key API changes (v3)
+--------------------------------
+- ``generate_and_store_tenant_key(tenant_id)``
+    Returns ``(version, raw_key)`` — the caller stores ``version`` in
+    ``crm_integrations.key_version`` (e.g. "v1") instead of the literal "tenant".
 
-    # In a route / service — encrypt a new credential
-    version, raw_key = await key_manager.get_active_key_and_version()
-    svc     = EncryptionService(raw_key=raw_key, key_version=version)
-    payload = svc.encrypt(api_token)
-    row.credential_enc = payload.to_db_string()
-    row.key_version    = version
+- ``get_tenant_key(tenant_id, version)``
+    Requires explicit version. Fetches TENANT_KEY_<tenant_id>_<version>.
 
-    # In a route / service — decrypt an existing credential
-    raw_key = await key_manager.get_encryption_key(row.key_version)
-    svc     = EncryptionService(raw_key=raw_key, key_version=row.key_version)
-    token   = svc.decrypt_from_db(row.credential_enc)
+- ``get_active_tenant_key_and_version(tenant_id)``
+    Reads TENANT_ACTIVE_VERSION_<tenant_id> then fetches the key for that version.
 
-Shutdown
---------
-    await key_manager.close()      # in FastAPI shutdown lifespan hook
-    # or use as async context manager:
-    async with AsyncInfisicalKeyManager.create() as key_manager:
-        ...
-
-Thread-safety
--------------
-The underlying SDK client is not documented as thread-safe, so every call
-acquires a single ``asyncio.Lock`` before dispatching to the thread pool.
-Conservative but correct — replace with per-call clients if profiling shows
-lock contention under heavy load.
+- ``delete_tenant_key(tenant_id, version)``
+    Used by the rotation scheduler to purge old keys from Infisical after
+    all DB rows have been re-encrypted.
 """
 
 from __future__ import annotations
@@ -60,16 +44,14 @@ T = TypeVar("T")
 
 class AsyncInfisicalCredentialManager:
     """
-    Async façade over ``InfisicalKeyManager``.
+    Async façade over ``InfisicalCredentialManager``.
 
     Parameters
     ----------
     settings:
-        Infisical configuration.  Use ``InfisicalSettings.from_env()`` for
-        production; inject a test double in unit tests.
+        Infisical configuration.
     max_workers:
-        Size of the dedicated thread pool.  Default 4 is sufficient for
-        low-to-medium load.
+        Thread pool size.
     """
 
     def __init__(
@@ -84,7 +66,7 @@ class AsyncInfisicalCredentialManager:
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
-    # Async constructor / factory
+    # Factory / lifecycle
     # ------------------------------------------------------------------
 
     @classmethod
@@ -92,22 +74,9 @@ class AsyncInfisicalCredentialManager:
         cls,
         settings: Optional[InfisicalSettings] = None,
         max_workers: int = 4,
-    ) -> "AsyncInfisicalKeyManager":
-        """
-        Preferred factory method.
-
-        Reads settings from env if not provided, constructs the sync manager
-        in a thread (so SDK auth I/O doesn't block the event loop), and
-        returns a ready-to-use instance.
-
-        Raises
-        ------
-        InfisicalConfigError
-            If environment variables are missing or SDK auth fails.
-        """
+    ) -> "AsyncInfisicalCredentialManager":
         if settings is None:
             settings = InfisicalSettings.from_env()
-
         instance = cls(settings=settings, max_workers=max_workers)
         await instance._initialise()
         return instance
@@ -124,90 +93,102 @@ class AsyncInfisicalCredentialManager:
             lambda: InfisicalCredentialManager(self._settings),
         )
         logger.info(
-            "AsyncInfisicalKeyManager ready (workers=%d).",
+            "AsyncInfisicalCredentialManager ready (workers=%d).",
             self._max_workers,
         )
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     async def close(self) -> None:
-        """Shut down the thread pool.  Call in your FastAPI shutdown hook."""
         if self._executor:
             self._executor.shutdown(wait=True)
             self._executor = None
-            logger.info("AsyncInfisicalKeyManager thread pool shut down.")
+            logger.info("AsyncInfisicalCredentialManager thread pool shut down.")
 
-    async def __aenter__(self) -> "AsyncInfisicalKeyManager":
+    async def __aenter__(self) -> "AsyncInfisicalCredentialManager":
         return self
 
     async def __aexit__(self, *_: Any) -> None:
         await self.close()
 
     # ------------------------------------------------------------------
-    # Public async API — mirrors InfisicalKeyManager exactly
+    # Global AES key methods (legacy)
     # ------------------------------------------------------------------
 
     async def get_active_key_version(self) -> str:
-        """
-        Async version of ``InfisicalKeyManager.get_active_key_version``.
-
-        Returns the active version tag (e.g. ``"v1"``).
-        """
-        return await self._run(
-            self._sync_manager.get_active_key_version,  # type: ignore[union-attr]
-        )
+        return await self._run(self._sync_manager.get_active_key_version)  # type: ignore[union-attr]
 
     async def get_encryption_key(self, version: str) -> str:
-        """
-        Async version of ``InfisicalKeyManager.get_encryption_key``.
-
-        Parameters
-        ----------
-        version:
-            Key version tag from a DB row's ``key_version`` column, e.g. ``"v1"``.
-
-        Returns
-        -------
-        str
-            Raw key string for use in ``EncryptionService``.
-        """
-        return await self._run(
-            self._sync_manager.get_encryption_key,  # type: ignore[union-attr]
-            version,
-        )
+        return await self._run(self._sync_manager.get_encryption_key, version)  # type: ignore[union-attr]
 
     async def get_active_key_and_version(self) -> Tuple[str, str]:
+        return await self._run(self._sync_manager.get_active_key_and_version)  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # Per-tenant versioned key methods
+    # ------------------------------------------------------------------
+
+    async def generate_and_store_tenant_key(self, tenant_id: str) -> Tuple[str, str]:
         """
-        Async version of ``InfisicalKeyManager.get_active_key_and_version``.
+        Generate a new versioned AES key for the tenant.
 
         Returns
         -------
         (version, raw_key)
-            Ready to pass directly into ``EncryptionService``.
-
-        Example
-        -------
-            version, raw_key = await key_manager.get_active_key_and_version()
-            svc = EncryptionService(raw_key=raw_key, key_version=version)
-            payload = svc.encrypt(api_token)
-            row.credential_enc = payload.to_db_string()
-            row.key_version    = version
+            ``version`` should be stored in ``crm_integrations.key_version``
+            (e.g. "v1", "v2") so the rotation scheduler can identify which
+            Infisical secret to fetch for each row.
         """
         return await self._run(
-            self._sync_manager.get_active_key_and_version,  # type: ignore[union-attr]
+            self._sync_manager.generate_and_store_tenant_key,  # type: ignore[union-attr]
+            tenant_id,
+        )
+
+    async def get_tenant_key(self, tenant_id: str, version: str) -> Optional[str]:
+        """
+        Fetch the raw AES key for a specific tenant + version.
+
+        Returns None if the secret does not exist.
+        """
+        return await self._run(
+            self._sync_manager.get_tenant_key,  # type: ignore[union-attr]
+            tenant_id,
+            version,
+        )
+
+    async def get_active_tenant_key_and_version(
+        self, tenant_id: str
+    ) -> Optional[Tuple[str, str]]:
+        """
+        Fetch (version, raw_key) for the tenant's currently active key.
+        Returns None if no per-tenant key exists yet (legacy/old tenant).
+        """
+        return await self._run(
+            self._sync_manager.get_active_tenant_key_and_version,  # type: ignore[union-attr]
+            tenant_id,
+        )
+
+    async def get_tenant_active_version(self, tenant_id: str) -> Optional[str]:
+        """Return the active version string ("v1", "v2", …) or None."""
+        return await self._run(
+            self._sync_manager.get_tenant_active_version,  # type: ignore[union-attr]
+            tenant_id,
+        )
+
+    async def delete_tenant_key(self, tenant_id: str, version: str) -> None:
+        """
+        Delete TENANT_KEY_<tenant_id>_<version> from Infisical.
+        Called by the rotation scheduler after re-encryption is confirmed.
+        """
+        return await self._run(
+            self._sync_manager.delete_tenant_key,  # type: ignore[union-attr]
+            tenant_id,
+            version,
         )
 
     # ------------------------------------------------------------------
-    # Thread-pool dispatch helper
+    # Thread-pool dispatch
     # ------------------------------------------------------------------
 
     async def _run(self, fn: Callable[..., T], *args: Any) -> T:
-        """
-        Execute *fn(*args)* in the thread pool under the serialisation lock.
-        Propagates any exception raised by *fn* unchanged.
-        """
         self._assert_ready()
         loop = asyncio.get_event_loop()
         async with self._lock:
@@ -215,49 +196,10 @@ class AsyncInfisicalCredentialManager:
                 self._executor,
                 functools.partial(fn, *args),
             )
-        
-    async def generate_and_store_tenant_key(self, tenant_id: str) -> str:
-        """
-        Async version of ``InfisicalCredentialManager.generate_and_store_tenant_key``.
-
-        Generates a 256-bit random AES key and stores it in Infisical as
-        TENANT_KEY_<tenant_id>.  Called once when super admin creates a tenant.
-
-        Parameters
-        ----------
-        tenant_id:
-            The tenant's UUID string.
-
-        Returns
-        -------
-        str
-            The raw key hex string (for logging/testing only — never stored in DB).
-        """
-        return await self._run(
-            self._sync_manager.generate_and_store_tenant_key,  # type: ignore[union-attr]
-            tenant_id,
-        )
-
-    async def get_tenant_key(self, tenant_id: str) -> "Optional[str]":
-        """
-        Async version of ``InfisicalCredentialManager.get_tenant_key``.
-
-        Returns the raw key string for this tenant, or None if no
-        per-tenant key exists (old tenant — caller falls back to global key).
-
-        Parameters
-        ----------
-        tenant_id:
-            The tenant's UUID string.
-        """
-        return await self._run(
-            self._sync_manager.get_tenant_key,  # type: ignore[union-attr]
-            tenant_id,
-        )
 
     def _assert_ready(self) -> None:
         if self._sync_manager is None or self._executor is None:
             raise RuntimeError(
-                "AsyncInfisicalKeyManager is not initialised. "
-                "Use `await AsyncInfisicalKeyManager.create()` first."
+                "AsyncInfisicalCredentialManager is not initialised. "
+                "Use `await AsyncInfisicalCredentialManager.create()` first."
             )

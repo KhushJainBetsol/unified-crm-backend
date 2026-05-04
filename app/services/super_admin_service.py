@@ -3,7 +3,7 @@ app/services/super_admin_service.py
 
 Business logic for Super Admin operations:
   - list_source_systems
-  - create_tenant          ← now fetches & stores crm_org_id per source system
+  - create_tenant          ← generates versioned per-tenant AES key (v1) in Infisical
   - invite_admin
   - list_tenants
   - list_admins
@@ -30,7 +30,7 @@ from app.models.source_system import SourceSystem
 from app.models.tenant import Tenant
 from app.models.tenant_realm import TenantRealm
 from app.models.tenant_source_systems import TenantSourceSystem
-from app.utils.email import send_invite_email          # ← NEW
+from app.utils.email import send_invite_email
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -46,19 +46,24 @@ async def svc_create_tenant(
     db: AsyncSession,
     name: str,
     contact_email: str,
-    key_manager,                    # AsyncInfisicalCredentialManager — no hard import to avoid circulars
+    key_manager,   # AsyncInfisicalCredentialManager — no hard import to avoid circulars
 ) -> dict:
     """
     Create a new tenant.
 
     Steps:
-      1. Generate URL-friendly slug from tenant name
-      2. Check slug uniqueness
-      3. Insert tenant row
-      4. Seed shared TenantRealm row (idempotent)
-      5. Commit
-      6. Generate + store per-tenant AES key in Infisical   ← NEW
-      7. Return the new tenant
+      1. Generate URL-friendly slug from tenant name.
+      2. Check slug uniqueness.
+      3. Insert tenant row.
+      4. Seed shared TenantRealm row (idempotent).
+      5. Commit.
+      6. Generate + store per-tenant versioned AES key in Infisical.
+         ``generate_and_store_tenant_key`` returns ``(version, raw_key)``
+         e.g. ``("v1", "<hex>")`` for a brand-new tenant.
+         The version is logged for auditing; neither the key nor the version
+         is stored in the DB at the tenant level (the version is stored per
+         CrmIntegration row when the tenant provisions a CRM).
+      7. Return the new tenant.
     """
     try:
         # Step 1 — slug
@@ -91,7 +96,7 @@ async def svc_create_tenant(
             )
             db.add(realm)
 
-        # Step 5 — commit tenant to DB first so we have a real tenant.id
+        # Step 5 — commit
         await db.commit()
 
     except HTTPException:
@@ -105,34 +110,24 @@ async def svc_create_tenant(
             "Failed to create tenant due to an internal error.",
         ) from exc
 
-    # Step 6 — generate + store per-tenant AES key in Infisical
-    # This runs AFTER the DB commit so a key is never generated for a
-    # tenant that didn't make it into the DB.
-    # If Infisical is down here, the tenant exists in DB but has no key yet.
-    # The admin can retry by calling a separate /super-admin/tenants/{id}/regenerate-key
-    # endpoint (future work) or by re-running this step manually.
+    # Step 6 — generate + store per-tenant versioned AES key in Infisical.
+    # generate_and_store_tenant_key returns (version, raw_key), e.g. ("v1", "<hex>").
+    # We only log the version — the key material is never stored in the DB.
     try:
-        await key_manager.generate_and_store_tenant_key(str(tenant.id))
+        key_version, _ = await key_manager.generate_and_store_tenant_key(str(tenant.id))
         logger.info(
-            "Per-tenant encryption key stored in Infisical for tenant_id='%s'.",
+            "Per-tenant encryption key stored in Infisical for tenant_id='%s' (version=%s).",
             tenant.id,
+            key_version,
         )
     except Exception as exc:
-        # Key generation failed — tenant is in DB but has no encryption key.
-        # Log loudly but don't roll back the tenant (DB and Infisical are
-        # separate systems; a partial rollback would leave Infisical with a
-        # key but no DB tenant, which is worse).
         logger.error(
             "CRITICAL: Tenant '%s' (id=%s) was created in DB but per-tenant "
             "key generation in Infisical FAILED: %s. "
             "The tenant cannot provision integrations until a key is stored "
-            "manually as TENANT_KEY_%s in Infisical.",
-            slug,
-            tenant.id,
-            exc,
-            tenant.id,
+            "manually as TENANT_KEY_%s_v1 in Infisical.",
+            slug, tenant.id, exc, tenant.id,
         )
-        # Still return success to caller but include a warning field
         return {
             "tenant": {
                 "id": str(tenant.id),
@@ -144,7 +139,8 @@ async def svc_create_tenant(
             },
             "warning": (
                 f"Tenant created but encryption key could not be stored in Infisical: {exc}. "
-                f"Manually add secret TENANT_KEY_{tenant.id} before this tenant provisions integrations."
+                f"Manually add secret TENANT_KEY_{tenant.id}_v1 and "
+                f"TENANT_ACTIVE_VERSION_{tenant.id}=v1 before this tenant provisions integrations."
             ),
             "message": (
                 f"Tenant '{tenant.name}' created. "
@@ -178,32 +174,17 @@ async def svc_invite_admin(
 ) -> dict:
     """
     Invite an admin to an already-existing tenant.
-
-    Steps:
-      1. Verify tenant exists and is active
-      2. Check no duplicate active (pending + non-expired) invite
-      3. Split admin_name into first / last for Keycloak
-      4. Create Keycloak user in the shared realm
-      5. Generate one-time invite token (24 h expiry) and store it
-      6. Send invite email via Resend
-      7. Return the invite link
     """
     try:
-        # Step 1 — tenant must exist and be active
         tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
         tenant = tenant_result.scalars().first()
         if not tenant:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                f"Tenant '{tenant_id}' not found",
-            )
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"Tenant '{tenant_id}' not found")
         if not tenant.is_active:
             raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                f"Tenant '{tenant.name}' is not active",
+                status.HTTP_409_CONFLICT, f"Tenant '{tenant.name}' is not active"
             )
 
-        # Step 2 — no duplicate active invite
         dup = await db.execute(
             select(Invitation)
             .where(Invitation.email == admin_email)
@@ -217,12 +198,10 @@ async def svc_invite_admin(
                 f"An active invite already exists for '{admin_email}' in this tenant",
             )
 
-        # Step 3 — split full name into first / last for Keycloak
         name_parts = admin_name.strip().split(" ", 1)
         first_name = name_parts[0]
         last_name = name_parts[1] if len(name_parts) > 1 else ""
 
-        # Step 4 — create Keycloak user
         try:
             await create_keycloak_user(
                 email=admin_email,
@@ -237,7 +216,6 @@ async def svc_invite_admin(
         except Exception as e:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Keycloak error: {e}")
 
-        # Step 5 — invite token
         invite_token = secrets.token_urlsafe(32)
         invitation = Invitation(
             tenant_id=tenant.id,
@@ -265,7 +243,6 @@ async def svc_invite_admin(
     invite_link = f"{settings.FRONTEND_URL}/invite?token={invite_token}"
     logger.info("Admin invite → '%s' for tenant '%s'", admin_email, tenant.slug)
 
-    # Step 6 — send invite email (after commit, non-blocking, won't raise)
     await send_invite_email(
         to_email=admin_email,
         invite_link=invite_link,
@@ -277,12 +254,11 @@ async def svc_invite_admin(
         "tenant": {"id": str(tenant.id), "name": tenant.name, "slug": tenant.slug},
         "admin_email": admin_email,
         "invite_link": invite_link,
-        "message": (f"Invitation sent to {admin_email}. " "Link expires in 24 hours."),
+        "message": f"Invitation sent to {admin_email}. Link expires in 24 hours.",
     }
 
 
 async def svc_list_tenants(db: AsyncSession) -> list[dict]:
-    """Return all tenants."""
     result = await db.execute(select(Tenant))
     return [
         {
@@ -297,7 +273,6 @@ async def svc_list_tenants(db: AsyncSession) -> list[dict]:
 
 
 async def svc_list_admins(db: AsyncSession) -> list[dict]:
-    """Return all admin-role dashboard users across all tenants."""
     result = await db.execute(
         select(DashboardUser, Tenant.name.label("tenant_name"))
         .join(Tenant, Tenant.id == DashboardUser.tenant_id, isouter=True)
@@ -319,7 +294,6 @@ async def svc_list_admins(db: AsyncSession) -> list[dict]:
 
 
 async def svc_list_all_users(db: AsyncSession) -> list[dict]:
-    """Return all dashboard users across all tenants."""
     result = await db.execute(select(DashboardUser))
     return [
         {
