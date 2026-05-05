@@ -345,7 +345,7 @@ async def sync_comments(
 ):
     tenant_id = current_user.require_tenant()  # NEW
     await service.get_ticket_or_404(ticket_id, tenant_id=uuid.UUID(tenant_id))
-    result = await CommentService(db).sync_comments(ticket_id=ticket_id)
+    result = await CommentService(db).sync_comments_for_ticket(ticket_id=ticket_id)
     return success("Comments synced", result)
 
 # ---------------------------------------------------------------------------
