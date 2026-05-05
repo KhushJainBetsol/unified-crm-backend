@@ -80,6 +80,11 @@ endpoints:
     method: "GET"
     default_params: {}
 
+  post_comment:
+    path: "/api/v1/Note"
+    method: "POST"
+    default_params: {}
+
 field_mappings:
   ticket:
     id: "id"

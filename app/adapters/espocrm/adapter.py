@@ -424,17 +424,40 @@ class EspoCrmAdapter(BaseCrmAdapter):
         crm_ticket_id: str,
         body: str,
         author_name: str,
+        author_email: Optional[str] = None,  # ignored by EspoCRM
     ) -> dict:
         """
-        Post a new comment (stream Post) to a Case in EspoCRM.
+        Post a new stream Post to an EspoCRM Case.
 
-        Returns a dict with at least an 'id' key, or a synthesized local ID
-        if the CRM doesn't return one.
+        EspoCRM contract (confirmed from image 3):
+        - Endpoint: POST /api/v1/Note  (from config: post_comment)
+        - Body: type, parentId, parentType: "Case", post
+        - author_email is not used — EspoCRM identifies the caller
+          from the API token, not a header.
         """
         self._assert_authenticated()
+
+        path = self._get_endpoint("post_comment")
+
+        json_body = {
+            "type":       "Post",
+            "parentId":   crm_ticket_id,
+            "parentType": "Case",
+            "post":       body,
+        }
+
+        logger.info(
+            "[%s] push_comment: posting to Case %s as %s",
+            self.crm_type,
+            crm_ticket_id,
+            author_name,
+        )
 
         return await self._client.post_comment(
             crm_ticket_id=crm_ticket_id,
             body=body,
             author_name=author_name,
+            json_body=json_body,
+            path=path,
+            extra_headers=None,  # EspoCRM needs no extra headers
         )

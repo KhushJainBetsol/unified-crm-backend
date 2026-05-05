@@ -331,17 +331,54 @@ class ZammadAdapter(BaseCrmAdapter):
         crm_ticket_id: str,
         body: str,
         author_name: str,
+        author_email: Optional[str] = None,
     ) -> dict:
         """
-        Post a new comment (article) to a ticket in Zammad.
+        Post a new article to a Zammad ticket.
 
-        Returns a dict with at least an 'id' key, or a synthesized local ID
-        if the CRM doesn't return one.
+        Zammad contract:
+        - Endpoint: POST /api/v1/ticket_articles  (from config: post_comment)
+        - X-On-Behalf-Of header: agent's email from JWT (current_user.email)
+          This makes the article appear as written by the logged-in agent,
+          not the API token owner. Required for correct audit trail.
+        - Body fields: ticket_id (int), body, content_type, type, internal
         """
         self._assert_authenticated()
+
+        path = self._get_endpoint("post_comment")
+
+        json_body = {
+            "ticket_id": int(crm_ticket_id),
+            "body":         body,
+            "content_type": "text/plain",
+            "type":         "note",
+            "internal":     False,
+        }
+
+        # X-On-Behalf-Of is Zammad-specific: makes the article appear as
+        # written by the agent whose email is in the JWT, not the token owner.
+        extra_headers: dict = {}
+        if author_email:
+            extra_headers["X-On-Behalf-Of"] = author_email
+            logger.info(
+                "[%s] push_comment: posting on behalf of %s for ticket %s",
+                self.crm_type,
+                author_email,
+                crm_ticket_id,
+            )
+        else:
+            logger.warning(
+                "[%s] push_comment: no author_email provided for ticket %s "
+                "— X-On-Behalf-Of will not be set",
+                self.crm_type,
+                crm_ticket_id,
+            )
 
         return await self._client.post_comment(
             crm_ticket_id=crm_ticket_id,
             body=body,
             author_name=author_name,
+            json_body=json_body,
+            path=path,
+            extra_headers=extra_headers or None,
         )

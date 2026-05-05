@@ -211,6 +211,22 @@ class BaseCrmAdapter(ABC):
             TimeoutError: If the CRM doesn't respond in time
         """
 
+    @abstractmethod
+    async def push_comment(
+        self,
+        crm_ticket_id: str,
+        body: str,
+        author_name: str,
+        author_email: Optional[str] = None,  # NEW — used by Zammad for X-On-Behalf-Of
+    ) -> dict:
+        """
+        Post a new comment to a ticket in the CRM.
+
+        author_email is used by Zammad as the X-On-Behalf-Of header value,
+        so the article appears as posted by the logged-in agent.
+        EspoCRM ignores it.
+        """
+
     # ------------------------------------------------------------------
     # Concrete helpers available to all subclasses
     # ------------------------------------------------------------------

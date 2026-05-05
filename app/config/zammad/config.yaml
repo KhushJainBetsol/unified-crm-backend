@@ -66,6 +66,10 @@ endpoints:
     method: "GET"
     default_params: {}
 
+  post_comment:
+    path: "/api/v1/ticket_articles"
+    method: "POST"
+    default_params: {}
 
 # ---------------------------------------------------------------------------
 # Schema field mappings

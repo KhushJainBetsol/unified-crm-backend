@@ -474,3 +474,55 @@ class TicketService:
             "by_status":     by_status,
             "by_priority":   by_priority,
         }
+
+    async def post_comment(
+        self,
+        ticket_id: uuid.UUID,
+        body: str,
+        author_name: str,
+        author_email: Optional[str],
+        tenant_id: uuid.UUID | None = None,
+    ) -> dict:
+        """
+        Validate ticket belongs to tenant, then push comment to CRM.
+
+        author_email comes from current_user.email (JWT) — it is used by
+        Zammad as X-On-Behalf-Of so the article appears under the agent's
+        name. EspoCRM ignores it.
+        """
+        ticket = await self.get_ticket_or_404(ticket_id, tenant_id=tenant_id)
+
+        result = await self.db.execute(
+            select(CrmIntegration).where(
+                CrmIntegration.tenant_id == ticket.tenant_id,
+                CrmIntegration.source_system_id == ticket.source_system_id,
+                CrmIntegration.is_active == True,
+            )
+        )
+        integration = result.scalars().first()
+
+        if not integration:
+            raise HTTPException(
+                status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"No active CRM integration found for this ticket's source system "
+                    f"({ticket.source_system.system_name}). Cannot post comment."
+                ),
+            )
+
+        adapter = await self.factory.create(str(integration.id))
+
+        async with adapter:
+            crm_result = await adapter.push_comment(
+                crm_ticket_id=ticket.crm_ticket_id,
+                body=body,
+                author_name=author_name,
+                author_email=author_email,
+            )
+
+        logger.info(
+            "Comment posted for ticket %s → CRM id=%s",
+            ticket_id,
+            crm_result.get("id"),
+        )
+        return crm_result

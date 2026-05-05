@@ -347,3 +347,33 @@ async def sync_comments(
     await service.get_ticket_or_404(ticket_id, tenant_id=uuid.UUID(tenant_id))
     result = await CommentService(db).sync_comments(ticket_id=ticket_id)
     return success("Comments synced", result)
+
+# ---------------------------------------------------------------------------
+# POST /tickets/{ticket_id}/comments
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{ticket_id}/comments", summary="Post a comment to a ticket")
+async def post_comment(
+    ticket_id: uuid.UUID,
+    body: AddCommentRequest,
+    service: TicketService = Depends(get_ticket_service),
+    current_user: CurrentUser = Depends(require_agent),
+):
+    """
+    Post a comment to a ticket. The comment is pushed to the CRM that owns
+    the ticket (Zammad or EspoCRM) using the adapter pattern.
+
+    For Zammad: current_user.email is sent as X-On-Behalf-Of so the article
+    appears under the agent's name, not the API token owner.
+    For EspoCRM: the comment is posted as a stream Post on the Case.
+    """
+    tenant_id = current_user.require_tenant()
+    result = await service.post_comment(
+        ticket_id=ticket_id,
+        body=body.text,
+        author_name=body.author_name,
+        author_email=current_user.email,  # from JWT — dynamic, never hardcoded
+        tenant_id=uuid.UUID(tenant_id),
+    )
+    return success("Comment posted successfully", result)
