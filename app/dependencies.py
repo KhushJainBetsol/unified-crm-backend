@@ -1,7 +1,8 @@
 """
 app/dependencies/database_dependency.py
 
-FastAPI dependency that provides an async DB session per request.
+FastAPI dependency that provides an async DB session per request,
+and a shared AsyncInfisicalCredentialManager from app.state.
 """
 
 from __future__ import annotations
@@ -9,10 +10,12 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncGenerator
 
+from fastapi import Request
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import async_session_maker
+from app.credentials.async_manager import AsyncInfisicalCredentialManager
 
 logger = logging.getLogger(__name__)
 
@@ -46,3 +49,25 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             raise
         finally:
             await session.close()
+
+
+def get_key_manager(request: Request) -> AsyncInfisicalCredentialManager:
+    """
+    Return the shared AsyncInfisicalCredentialManager stored on app.state.
+
+    The manager is initialised once at application startup (see main.py)
+    and reused across all requests — it owns the Infisical thread pool.
+
+    Usage in a route:
+        key_manager: AsyncInfisicalCredentialManager = Depends(get_key_manager)
+
+    Requires in main.py:
+        @app.on_event("startup")
+        async def startup():
+            app.state.key_manager = await AsyncInfisicalCredentialManager.create()
+
+        @app.on_event("shutdown")
+        async def shutdown():
+            await app.state.key_manager.close()
+    """
+    return request.app.state.key_manager
