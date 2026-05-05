@@ -67,6 +67,7 @@ from app.integrations.webhooks.errors import (
 from app.integrations.webhooks.models import RawWebhookPayload
 from app.repositories.ticket_repository import TicketRepository
 from app.services.sync_service import SyncService
+from app.utils.retry import retry_on_conflict
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +362,8 @@ async def _espo_create_ticket(
     """
     EspoCRM Case.create — normalize raw webhook payload and persist via SyncService.
 
+    Safety check: if ticket exists but is soft-deleted, skip to prevent resurrection.
+
     Normalization uses the AdapterConfig fetched from factory._registry
     (the same config object injected into BaseCrmAdapter and SchemaMapper),
     so status_map / priority_map / field mappings are always consistent
@@ -373,6 +376,24 @@ async def _espo_create_ticket(
     3. Resolve status / priority / agent / customer / company IDs via SyncService
     4. repo.upsert() — INSERT or UPDATE depending on crm_ticket_id presence
     """
+    # ── Safety: check if ticket already exists (even if soft-deleted) ────────
+    crm_ticket_id_check = str(raw.get("id", "")).strip() or None
+    if crm_ticket_id_check:
+        repo_check = TicketRepository(sync.db)
+        existing_check = await repo_check.get_by_crm_id(
+            crm_ticket_id_check,
+            source_system_id,
+            tenant_id=tenant_id,
+            include_deleted=True,
+        )
+        if existing_check and existing_check.is_deleted:
+            logger.warning(
+                "espocrm: Case.create | crm_ticket_id=%s is soft-deleted — "
+                "skipping to prevent resurrection",
+                crm_ticket_id_check,
+            )
+            return
+
     # ── Step 1 & 2: normalize ─────────────────────────────────────────────
     try:
         config = _get_adapter_config("espocrm")
@@ -414,7 +435,8 @@ async def _espo_create_ticket(
     # ── Step 4: upsert ────────────────────────────────────────────────────
     try:
         repo = TicketRepository(sync.db)
-        _, created = await repo.upsert(
+        _, created = await retry_on_conflict(
+            repo.upsert,
             crm_ticket_id=normalized.crm_ticket_id,
             source_system_id=source_system_id,
             tenant_id=tenant_id,
@@ -453,17 +475,31 @@ async def _espo_update_ticket(
     tenant_id: uuid.UUID,
     sync: SyncService,
 ) -> None:
-    """EspoCRM Case.update — apply partial updates or create if ticket doesn't exist."""
+    """
+    EspoCRM Case.update — apply partial updates or create if ticket doesn't exist.
+    
+    Safety: if ticket is soft-deleted, skip update to prevent resurrection.
+    """
     repo = TicketRepository(sync.db)
     existing = await repo.get_by_crm_id(
-        crm_ticket_id, source_system_id, tenant_id=tenant_id
+        crm_ticket_id, source_system_id, tenant_id=tenant_id, include_deleted=True
     )
+    
     if not existing:
         logger.info(
             "espocrm: Case.update | crm_ticket_id=%s not in DB — creating from webhook payload",
             crm_ticket_id,
         )
         await _espo_create_ticket(raw, source_system_id, tenant_id, sync)
+        return
+    
+    # ── Safety: skip if ticket is soft-deleted ────────────────────────────
+    if existing.is_deleted:
+        logger.warning(
+            "espocrm: Case.update | crm_ticket_id=%s is soft-deleted — "
+            "skipping to prevent resurrection",
+            crm_ticket_id,
+        )
         return
 
     incoming_ts = _parse_iso_timestamp(raw.get("modifiedAt"))
@@ -704,6 +740,8 @@ async def _zammad_create_ticket(
     """
     Zammad create — normalize raw webhook payload and persist via SyncService.
 
+    Safety check: if ticket exists but is soft-deleted, skip to prevent resurrection.
+
     Zammad sends state as a nested object {"name": "open"} (expand=true)
     or as a plain string/integer otherwise. normalize_ticket() resolves
     both forms via AdapterConfig.status_map from crm_adapters.yaml —
@@ -715,6 +753,24 @@ async def _zammad_create_ticket(
     3. Resolve FK IDs via SyncService
     4. repo.upsert()
     """
+    # ── Safety: check if ticket already exists (even if soft-deleted) ────────
+    crm_ticket_id_check = str(raw.get("id", "")).strip() or None
+    if crm_ticket_id_check:
+        repo_check = TicketRepository(sync.db)
+        existing_check = await repo_check.get_by_crm_id(
+            crm_ticket_id_check,
+            source_system_id,
+            tenant_id=tenant_id,
+            include_deleted=True,
+        )
+        if existing_check and existing_check.is_deleted:
+            logger.warning(
+                "zammad: create | crm_ticket_id=%s is soft-deleted — "
+                "skipping to prevent resurrection",
+                crm_ticket_id_check,
+            )
+            return
+
     # ── Step 1 & 2: normalize ─────────────────────────────────────────────
     try:
         config = _get_adapter_config("zammad")
@@ -756,7 +812,8 @@ async def _zammad_create_ticket(
     # ── Step 4: upsert ────────────────────────────────────────────────────
     try:
         repo = TicketRepository(sync.db)
-        _, created = await repo.upsert(
+        _, created = await retry_on_conflict(
+            repo.upsert,
             crm_ticket_id=normalized.crm_ticket_id,
             source_system_id=source_system_id,
             tenant_id=tenant_id,
@@ -795,17 +852,31 @@ async def _zammad_update_ticket(
     tenant_id: uuid.UUID,
     sync: SyncService,
 ) -> None:
-    """Zammad update — apply partial updates or create if ticket doesn't exist."""
+    """
+    Zammad update — apply partial updates or create if ticket doesn't exist.
+    
+    Safety: if ticket is soft-deleted, skip update to prevent resurrection.
+    """
     repo = TicketRepository(sync.db)
     existing = await repo.get_by_crm_id(
-        crm_ticket_id, source_system_id, tenant_id=tenant_id
+        crm_ticket_id, source_system_id, tenant_id=tenant_id, include_deleted=True
     )
+    
     if not existing:
         logger.info(
             "zammad: update | crm_ticket_id=%s not in DB — creating from webhook payload",
             crm_ticket_id,
         )
         await _zammad_create_ticket(raw, source_system_id, tenant_id, sync)
+        return
+    
+    # ── Safety: skip if ticket is soft-deleted ────────────────────────────
+    if existing.is_deleted:
+        logger.warning(
+            "zammad: update | crm_ticket_id=%s is soft-deleted — "
+            "skipping to prevent resurrection",
+            crm_ticket_id,
+        )
         return
 
     incoming_ts = _parse_iso_timestamp(raw.get("updated_at"))

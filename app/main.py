@@ -40,6 +40,8 @@ from app.services.key_rotation_scheduler import (          # ← NEW
     stop_key_rotation_scheduler,
 )
 from app.utils.exceptions import register_exception_handlers
+from app.utils.adapter_exception_handlers import register_adapter_exception_handlers
+from app.middleware.request_limits import register_request_limit_middleware
 from app.integrations.webhooks.router import router as webhook_router
 from app.integrations.webhooks.seeder import seed_crm_integrations
 
@@ -227,7 +229,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Register middleware (before exception handlers)
+register_request_limit_middleware(app)
+
+# Register exception handlers
 register_exception_handlers(app)
+register_adapter_exception_handlers(app)
 
 app.add_middleware(
     CORSMiddleware,
