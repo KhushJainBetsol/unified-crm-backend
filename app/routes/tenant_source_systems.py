@@ -1,9 +1,17 @@
 """
-Router — tenant_source_systems check.
+Router — tenant_source_systems.
 
-Exposes two routes for flexibility:
-  POST /tenant-source-systems/check   — body-based (preferred for programmatic use)
-  GET  /tenant-source-systems/check   — query-param-based (handy for quick browser/curl checks)
+Routes
+------
+  GET /tenant-source-systems/check
+      Check if a (tenant_id, source_system_id) mapping exists.
+
+  GET /tenant-source-systems/active
+      List all active source-system IDs for a tenant.
+
+  GET /tenant-source-systems/integration-detail          ← NEW
+      Resolve the integration from (tenant_id, source_system_id),
+      decrypt its credentials, and return the full detail JSON.
 """
 
 from __future__ import annotations
@@ -13,18 +21,25 @@ import uuid
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_db  # your existing async session dependency
+from app.dependencies import get_db, get_key_manager          # add get_key_manager here
+from app.credentials.async_manager import AsyncInfisicalCredentialManager
 from app.schemas.tenant_source_systems import (
     TenantSourceSystemCheckRequest,
     TenantSourceSystemCheckResponse,
-    TenantActiveIntegrationsResponse
+    TenantActiveIntegrationsResponse,
+    TenantIntegrationDetailResponse,
 )
-from app.services.tenant_source_systems import check_tenant_source_system,get_active_integrations
+from app.services.tenant_source_systems import (
+    check_tenant_source_system,
+    get_active_integrations,
+    get_integration_detail,
+)
 
 router = APIRouter(
     prefix="/tenant-source-systems",
     tags=["Tenant Source Systems"],
 )
+
 
 # --------------------------------------------------------------------------- #
 # GET /tenant-source-systems/check                                              #
@@ -41,22 +56,15 @@ async def check_mapping_get(
     source_system_id: int = Query(..., description="Integer ID of the source system."),
     db: AsyncSession = Depends(get_db),
 ) -> TenantSourceSystemCheckResponse:
-    """
-    Same logic as the POST variant but accepts inputs as **query parameters**,
-    making it easy to test directly from a browser or curl:
-
-    ```
-    GET /tenant-source-systems/check?tenant_id=<uuid>&source_system_id=1
-    ```
-    """
     request = TenantSourceSystemCheckRequest(
         tenant_id=tenant_id,
         source_system_id=source_system_id,
     )
     return await check_tenant_source_system(request, db)
 
+
 # --------------------------------------------------------------------------- #
-# GET /tenant-source-systems/active  (NEW)                                      #
+# GET /tenant-source-systems/active                                             #
 # --------------------------------------------------------------------------- #
 
 @router.get(
@@ -72,8 +80,67 @@ async def get_active_integrations_for_tenant(
     tenant_id: uuid.UUID = Query(..., description="UUID of the tenant."),
     db: AsyncSession = Depends(get_db),
 ) -> TenantActiveIntegrationsResponse:
-    # request = TenantActiveIntegrationsResponse(
-    #     tenant_id=tenant_id,
-    # )
     return await get_active_integrations(tenant_id, db)
+
+
+# --------------------------------------------------------------------------- #
+# GET /tenant-source-systems/integration-detail       ← NEW                    #
+# --------------------------------------------------------------------------- #
+
+@router.get(
+    "/integration-detail",
+    response_model=TenantIntegrationDetailResponse,
+    summary="Get full integration detail with decrypted credentials",
+    response_description=(
+        "Resolves the crm_integration for (tenant_id, source_system_id), "
+        "decrypts credentials and webhook secrets, and returns the full JSON."
+    ),
+)
+async def get_integration_detail_endpoint(
+    tenant_id: uuid.UUID = Query(..., description="UUID of the tenant."),
+    source_system_id: int = Query(..., description="Integer ID of the source system."),
+    db: AsyncSession = Depends(get_db),
+    key_manager: AsyncInfisicalCredentialManager = Depends(get_key_manager),
+) -> TenantIntegrationDetailResponse:
+    """
+    Full resolution flow:
+
+    1. `tenant_source_systems` → `integration_id`
+    2. `crm_integrations` row  → encrypted blobs + metadata
+    3. Infisical               → AES key (tenant-versioned or global fallback)
+    4. AES-256-CBC decrypt     → plaintext credentials + webhook secrets
+    5. Return structured JSON
+
+    Example response:
+    ```json
+    {
+      "integration_id": "3fc6c469-...",
+      "tenant_id": "e921a37f-...",
+      "source_system_id": 2,
+      "crm_type": "freshdesk",
+      "auth_type": "api_key",
+      "key_version": "v1",
+      "base_url": "http://192.168.80.229:9091",
+      "webhook_uuid": "5b57a3cd-...",
+      "is_active": true,
+      "credentials": {
+        "strategy": "api_token",
+        "token": "your-decrypted-api-key"
+      },
+      "webhook_secrets": {
+        "Case.create": "secret1",
+        "Case.update": "secret2"
+      },
+      "token_expires_at": null,
+      "created_at": "2026-05-04T06:06:05.135924-04:00",
+      "updated_at": "2026-05-04T06:06:05.135924-04:00"
+    }
+    ```
+    """
+    return await get_integration_detail(
+        tenant_id=tenant_id,
+        source_system_id=source_system_id,
+        db=db,
+        key_manager=key_manager,
+    )
     
