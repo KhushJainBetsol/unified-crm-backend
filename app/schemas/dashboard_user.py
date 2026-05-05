@@ -86,20 +86,38 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class DashboardUserCreate(BaseModel):
     tenant_id: UUID
-    keycloak_sub: str
+    keycloak_sub: str = Field(..., min_length=1, description="Keycloak user subject ID")
     email: EmailStr
-    role: str
+    role: str = Field(..., description="User role: admin, agent, or superadmin")
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        valid_roles = {"admin", "agent", "superadmin"}
+        if v not in valid_roles:
+            raise ValueError(f"role must be one of {valid_roles}, got '{v}'")
+        return v
 
 
 class DashboardUserUpdate(BaseModel):
     email: EmailStr | None = None
-    role: str | None = None
+    role: str | None = Field(default=None, description="User role: admin, agent, or superadmin")
     is_active: bool | None = None
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        valid_roles = {"admin", "agent", "superadmin"}
+        if v not in valid_roles:
+            raise ValueError(f"role must be one of {valid_roles}, got '{v}'")
+        return v
 
 
 class DashboardUserResponse(BaseModel):

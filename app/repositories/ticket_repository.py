@@ -248,13 +248,15 @@ class TicketRepository:
         self,
         ticket_id: uuid.UUID,
         tenant_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
     ) -> Ticket | None:
         """
         Fetch a single ticket by internal UUID, scoped to tenant.
 
         Args:
-            ticket_id: Internal UUID of the ticket.
-            tenant_id: Scope to this tenant. Always pass this.
+            ticket_id:       Internal UUID of the ticket.
+            tenant_id:       Scope to this tenant. Always pass this.
+            include_deleted: If False (default) excludes soft-deleted tickets.
 
         Returns:
             Ticket ORM object or None if not found (or belongs to another tenant).
@@ -262,6 +264,8 @@ class TicketRepository:
         query = _base_query().where(Ticket.id == ticket_id)
         if tenant_id is not None:
             query = query.where(Ticket.tenant_id == tenant_id)
+        if not include_deleted:
+            query = query.where(Ticket.is_deleted == False)  # noqa: E712
         result = await self.db.execute(query)
         return result.scalars().first()
 
@@ -270,6 +274,7 @@ class TicketRepository:
         crm_ticket_id: str,
         source_system_id: int,
         tenant_id: uuid.UUID | None = None,
+        include_deleted: bool = False,
     ) -> Ticket | None:
         """
         Fetch a ticket by its original CRM ID + source system.
@@ -280,6 +285,7 @@ class TicketRepository:
             crm_ticket_id:    Original ticket ID from the CRM.
             source_system_id: FK id of the source system.
             tenant_id:        Scope to this tenant. Always pass this.
+            include_deleted:  If False (default) excludes soft-deleted tickets.
 
         Returns:
             Ticket ORM object or None.
@@ -290,6 +296,8 @@ class TicketRepository:
         )
         if tenant_id is not None:
             query = query.where(Ticket.tenant_id == tenant_id)
+        if not include_deleted:
+            query = query.where(Ticket.is_deleted == False)  # noqa: E712
         result = await self.db.execute(query)
         return result.scalars().first()
 
