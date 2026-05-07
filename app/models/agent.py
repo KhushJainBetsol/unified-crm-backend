@@ -11,6 +11,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -34,7 +35,16 @@ class Agent(Base):
             "source_system_id",
             name="uq_agent_tenant_crm_source",
         ),
+        CheckConstraint(
+            "(is_deleted = FALSE AND deleted_at IS NULL) "
+            "OR (is_deleted = TRUE AND deleted_at IS NOT NULL)",
+            name="ck_agent_soft_delete_consistency",
+        ),
         Index("idx_agents_tenant", "tenant_id"),
+        Index(
+            "idx_agents_not_deleted", "tenant_id",
+            postgresql_where="is_deleted = FALSE",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -60,6 +70,14 @@ class Agent(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # ------------------------------------------------------------------
+    # Soft-delete
+    # ------------------------------------------------------------------
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

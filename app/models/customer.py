@@ -9,7 +9,16 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, UniqueConstraint, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -23,8 +32,17 @@ class Customer(Base):
             "tenant_id", "crm_customer_id", "source_system_id",
             name="uq_customer_tenant_crm_source",
         ),
+        CheckConstraint(
+            "(is_deleted = FALSE AND deleted_at IS NULL) "
+            "OR (is_deleted = TRUE AND deleted_at IS NOT NULL)",
+            name="ck_customer_soft_delete_consistency",
+        ),
         Index("idx_customers_tenant", "tenant_id"),
         Index("idx_customers_company", "company_id"),
+        Index(
+            "idx_customers_not_deleted", "tenant_id",
+            postgresql_where="is_deleted = FALSE",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -48,13 +66,20 @@ class Customer(Base):
         nullable=True, default=None,
     )
 
-    # first_name + last_name merged into single name field
     name: Mapped[str] = mapped_column(
         String(200), nullable=False,
         comment="Full name of the customer",
     )
     email: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
     phone: Mapped[str | None] = mapped_column(String(50), nullable=True, default=None)
+
+    # ------------------------------------------------------------------
+    # Soft-delete
+    # ------------------------------------------------------------------
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),

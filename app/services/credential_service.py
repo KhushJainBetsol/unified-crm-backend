@@ -9,6 +9,8 @@ Orchestrates the full lifecycle of CRM credentials:
   RETRIEVE   — DB lookup → Infisical key fetch → AES decrypt → envelope
   ROTATE     — re-encrypt BOTH _enc columns with current active key
   REVOKE     — soft-delete (is_active=False) or wipe both _enc columns
+               + cascade soft-delete all Ticket/Agent/Customer/Company rows
+                 owned by the disconnected (tenant_id, source_system_id)
 
 Two-column secret model
 -----------------------
@@ -36,6 +38,23 @@ Permission gate (PROVISION + CHECK-CONNECTION)
 ----------------------------------------------
 Before any encryption or DB write, provision() calls _check_permissions()
 which hits the CRM's permission-inspection endpoint.
+
+Cascade soft-delete (REVOKE)
+-----------------------------
+When an integration is revoked, all Ticket, Agent, Customer, and Company
+rows belonging to (tenant_id, source_system_id) are bulk soft-deleted in
+the same transaction.
+
+Ticket rows require special handling: the ck_ticket_deletion_source CHECK
+constraint requires that is_deleted=TRUE be accompanied by either
+deleted_by_id IS NOT NULL (dashboard deletion) or is_deleted_by_crm=TRUE
+(CRM-side deletion). Integration disconnect sets is_deleted_by_crm=True.
+
+Cascade restore (PROVISION upsert)
+------------------------------------
+When the same CRM is re-provisioned for a tenant that previously disconnected
+it, all soft-deleted rows are restored before the fresh sync runs.
+Ticket rows also have is_deleted_by_crm reset to False on restore.
 """
 
 from __future__ import annotations
@@ -47,7 +66,7 @@ from typing import Any, Dict, Optional, Tuple
 from uuid import UUID, uuid4
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.credentials.async_manager import AsyncInfisicalCredentialManager
@@ -57,7 +76,10 @@ from app.credentials.exceptions import (
     CredentialNotFoundError,
 )
 from app.credentials.models import CrmCredentialEnvelope
+from app.models.agent import Agent
 from app.models.crm_integration import CrmIntegration
+from app.models.customer import Customer
+from app.models.ticket import Ticket
 from app.models.tenant_source_systems import TenantSourceSystem
 from app.models.tenant import Tenant
 from app.models.source_system import SourceSystem
@@ -83,6 +105,11 @@ _PERMISSION_VALIDATOR = {
     "espocrm": EspoCrmPermissionValidator,
     "zammad":  ZammadPermissionValidator,
 }
+
+# Models that participate in the generic cascade soft-delete / restore cycle.
+# Ticket is handled separately due to the ck_ticket_deletion_source CHECK
+# constraint that requires is_deleted_by_crm=True when deleted via integration.
+_CASCADE_MODELS = (Agent, Customer)
 
 
 class CredentialProvisioningService:
@@ -114,6 +141,19 @@ class CredentialProvisioningService:
     ) -> CredentialStatusResponse:
         """
         Upsert credentials for a CRM integration.
+
+        Steps
+        -----
+        1. Fetch tenant row — raises ValueError if not found.
+        2. Resolve SourceSystem by crm_type name.
+        3. Check for an existing TenantSourceSystem row (upsert guard).
+           If found → permission check → cascade restore → update path.
+        4. Permission gate — validate CRM permissions before any DB write.
+        5. Fetch AES key (versioned per-tenant or global fallback).
+        6. Encrypt outbound credentials.
+        7. Encrypt inbound webhook secrets (nullable).
+        8. Insert CrmIntegration + TenantSourceSystem rows.
+        9. Commit and trigger background full sync.
         """
         crm_type = request.crm_type.strip().lower()
         base_url = str(request.base_url).rstrip("/")
@@ -153,6 +193,14 @@ class CredentialProvisioningService:
                 tenant_id, crm_type, existing_tss.integration_id,
             )
             await self._check_permissions(crm_type=crm_type, base_url=base_url, request=request)
+
+            # Restore any rows that were soft-deleted when this integration
+            # was previously disconnected so the fresh sync re-populates
+            # on top of restored rows rather than creating duplicates.
+            await self._cascade_restore(
+                tenant_id=tenant_id,
+                source_system_id=existing_tss.source_system_id,
+            )
 
             update_request = UpdateCredentialsRequest(
                 credentials=request.credentials,
@@ -196,7 +244,7 @@ class CredentialProvisioningService:
             tenant_id=tenant_id,
             crm_type=crm_type,
             auth_type=auth_type,
-            key_version=version,          # real version e.g. "v1"
+            key_version=version,
             base_url=base_url,
             credential_enc=credential_enc,
             webhook_secrets_enc=webhook_secrets_enc,
@@ -226,6 +274,7 @@ class CredentialProvisioningService:
             },
         )
 
+        # ── 9. Trigger background full sync ────────────────────────────────
         import asyncio
         from app.services import scheduler as _scheduler
 
@@ -247,6 +296,13 @@ class CredentialProvisioningService:
         integration_id: UUID,
         request: UpdateCredentialsRequest,
     ) -> CredentialStatusResponse:
+        """
+        Partially update credentials and/or metadata for an existing integration.
+
+        Only fields present in the request body are written. New credentials
+        are re-encrypted with the current active key and the row's key_version
+        is updated accordingly.
+        """
         row = await self._get_row_or_raise(integration_id)
 
         if request.credentials is not None:
@@ -256,7 +312,7 @@ class CredentialProvisioningService:
             secret_dict = request.credentials.to_secret_dict()
             row.credential_enc = enc_service.encrypt(json.dumps(secret_dict)).to_db_string()
             row.auth_type = request.credentials.auth_type
-            row.key_version = version     # update to latest version
+            row.key_version = version
 
             row.is_active = True
 
@@ -295,6 +351,11 @@ class CredentialProvisioningService:
     # ── RETRIEVE (decrypt → envelope) ─────────────────────────────────────
 
     async def get_envelope(self, integration_id: UUID) -> CrmCredentialEnvelope:
+        """
+        Decrypt stored credentials and return a typed envelope for adapter use.
+        Secrets are never surfaced through API responses — only through this
+        internal method consumed by the adapter layer.
+        """
         row = await self._get_row_or_raise(integration_id)
 
         if not row.credential_enc:
@@ -349,6 +410,9 @@ class CredentialProvisioningService:
         """
         Re-encrypt BOTH _enc columns with the current active key for this tenant.
         Updates key_version on the row to the new version.
+
+        Safe to call even if key_version hasn't changed — decrypt with old key,
+        re-encrypt with new key, update the version tag atomically.
         """
         row = await self._get_row_or_raise(integration_id)
 
@@ -395,9 +459,31 @@ class CredentialProvisioningService:
     # ── REVOKE ─────────────────────────────────────────────────────────────
 
     async def revoke(self, integration_id: UUID, *, wipe: bool = False) -> None:
+        """
+        Soft-disable the integration and cascade soft-delete all data that
+        belongs to it.
+
+        Steps
+        -----
+        1. Mark the integration row as is_active=False.
+        2. Optionally wipe encrypted credential blobs (wipe=True).
+        3. Delete the TenantSourceSystem mapping row.
+        4. Bulk soft-delete all Ticket, Agent, Customer, Company rows
+           matching (tenant_id, source_system_id) — same transaction.
+           Tickets additionally get is_deleted_by_crm=True to satisfy the
+           ck_ticket_deletion_source CHECK constraint.
+        5. Commit atomically.
+        """
         row = await self._get_row_or_raise(integration_id)
+
+        # Capture before any mutation so the cascade uses the correct values.
+        source_system_id: int = row.source_system_id
+        tenant_id: UUID = row.tenant_id
+
+        # ── 1. Disable integration ─────────────────────────────────────────
         row.is_active = False
 
+        # ── 2. Optional credential wipe ────────────────────────────────────
         if wipe:
             row.credential_enc = None
             row.webhook_secrets_enc = None
@@ -406,6 +492,7 @@ class CredentialProvisioningService:
                 extra={"integration_id": str(integration_id)},
             )
 
+        # ── 3. Remove TenantSourceSystem mapping ───────────────────────────
         tss_result = await self._db.execute(
             select(TenantSourceSystem).where(
                 TenantSourceSystem.integration_id == integration_id
@@ -420,7 +507,15 @@ class CredentialProvisioningService:
                 str(integration_id),
             )
 
+        # ── 4. Cascade soft-delete all owned data ──────────────────────────
+        await self._cascade_soft_delete(
+            tenant_id=tenant_id,
+            source_system_id=source_system_id,
+        )
+
+        # ── 5. Commit atomically ───────────────────────────────────────────
         await self._db.commit()
+
         logger.info(
             "Revoked integration",
             extra={"integration_id": str(integration_id), "wipe": wipe},
@@ -428,12 +523,158 @@ class CredentialProvisioningService:
 
     # ── Private helpers ────────────────────────────────────────────────────
 
+    async def _cascade_soft_delete(
+        self,
+        tenant_id: UUID,
+        source_system_id: int,
+    ) -> None:
+        """
+        Bulk soft-delete every Ticket, Agent, Customer, and Company row
+        that belongs to the given (tenant_id, source_system_id) pair.
+
+        Ticket rows are handled separately from the other models because of
+        the ck_ticket_deletion_source CHECK constraint on the tickets table:
+
+            (is_deleted = TRUE AND is_deleted_by_crm = TRUE  AND deleted_by_id IS NULL)
+            OR
+            (is_deleted = TRUE AND is_deleted_by_crm = FALSE AND deleted_by_id IS NOT NULL)
+
+        Integration disconnect is a CRM-side event so we set
+        is_deleted_by_crm=True and leave deleted_by_id=NULL, which satisfies
+        the second branch of the constraint.
+
+        Agent, Customer, Company have no such constraint and are updated with
+        a simple is_deleted=True / deleted_at=now() pair.
+
+        Runs inside the caller's transaction — do not commit here.
+        Only rows where is_deleted=False are touched so repeated calls
+        are idempotent and deleted_at is not overwritten unnecessarily.
+        """
+        now = datetime.now(timezone.utc)
+
+        # ── Tickets — must satisfy ck_ticket_deletion_source ──────────────
+        ticket_result = await self._db.execute(
+            update(Ticket)
+            .where(
+                Ticket.tenant_id == tenant_id,
+                Ticket.source_system_id == source_system_id,
+                Ticket.is_deleted == False,  # noqa: E712
+            )
+            .values(
+                is_deleted=True,
+                deleted_at=now,
+                is_deleted_by_crm=True,
+            )
+            .execution_options(synchronize_session="fetch")
+        )
+        logger.info(
+            "Soft-deleted %s rows in 'tickets' for tenant_id='%s' source_system_id=%s",
+            ticket_result.rowcount,
+            tenant_id,
+            source_system_id,
+        )
+
+        # ── Agent, Customer, Company — no deletion-source constraint ───────
+        for Model in _CASCADE_MODELS:
+            result = await self._db.execute(
+                update(Model)
+                .where(
+                    Model.tenant_id == tenant_id,
+                    Model.source_system_id == source_system_id,
+                    Model.is_deleted == False,  # noqa: E712
+                )
+                .values(is_deleted=True, deleted_at=now)
+                .execution_options(synchronize_session="fetch")
+            )
+            logger.info(
+                "Soft-deleted %s rows in '%s' for tenant_id='%s' source_system_id=%s",
+                result.rowcount,
+                Model.__tablename__,
+                tenant_id,
+                source_system_id,
+            )
+
+    async def _cascade_restore(
+        self,
+        tenant_id: UUID,
+        source_system_id: int,
+    ) -> None:
+        """
+        Reverse a previous cascade soft-delete when the same integration is
+        re-provisioned.
+
+        Sets is_deleted=False / deleted_at=NULL on all rows that match
+        (tenant_id, source_system_id) and are currently soft-deleted.
+
+        Ticket rows additionally have is_deleted_by_crm reset to False so
+        restored tickets don't appear as CRM-deleted after reconnect.
+
+        The subsequent full sync will overwrite any stale field values so
+        restored rows will be current after the sync completes.
+
+        Runs inside the caller's transaction — do not commit here.
+        """
+        # ── Tickets — also reset is_deleted_by_crm ────────────────────────
+        ticket_result = await self._db.execute(
+            update(Ticket)
+            .where(
+                Ticket.tenant_id == tenant_id,
+                Ticket.source_system_id == source_system_id,
+                Ticket.is_deleted == True,  # noqa: E712
+            )
+            .values(
+                is_deleted=False,
+                deleted_at=None,
+                is_deleted_by_crm=False,
+            )
+            .execution_options(synchronize_session="fetch")
+        )
+        logger.info(
+            "Restored %s rows in 'tickets' for tenant_id='%s' source_system_id=%s",
+            ticket_result.rowcount,
+            tenant_id,
+            source_system_id,
+        )
+
+        # ── Agent, Customer, Company ──────────────────────────────────────
+        for Model in _CASCADE_MODELS:
+            result = await self._db.execute(
+                update(Model)
+                .where(
+                    Model.tenant_id == tenant_id,
+                    Model.source_system_id == source_system_id,
+                    Model.is_deleted == True,  # noqa: E712
+                )
+                .values(is_deleted=False, deleted_at=None)
+                .execution_options(synchronize_session="fetch")
+            )
+            logger.info(
+                "Restored %s rows in '%s' for tenant_id='%s' source_system_id=%s",
+                result.rowcount,
+                Model.__tablename__,
+                tenant_id,
+                source_system_id,
+            )
+
     async def _check_permissions(
         self,
         crm_type: str,
         base_url: str,
         request: ProvisionCredentialsRequest,
     ) -> None:
+        """
+        Hit the CRM's permission-inspection endpoint with the supplied raw
+        credentials and validate the response.
+
+        Raises
+        ------
+        ValueError
+            If crm_type has no registered endpoint or validator.
+        PermissionValidationError
+            If the token is rejected (401/403) or lacks required permissions.
+        RuntimeError
+            If the CRM endpoint is unreachable or returns an unexpected status.
+        """
         supported = sorted(
             set(_PERMISSION_ENDPOINT.keys()) & set(_PERMISSION_VALIDATOR.keys())
         )
@@ -524,7 +765,7 @@ class CredentialProvisioningService:
         version, raw_key = await self._key_manager.get_active_key_and_version()
         return version, raw_key
 
-    async def _get_key_for_row(self, row: "CrmIntegration") -> Tuple[str, str]:
+    async def _get_key_for_row(self, row: CrmIntegration) -> Tuple[str, str]:
         """
         Fetch the correct decryption key for an EXISTING integration row.
 
@@ -534,12 +775,10 @@ class CredentialProvisioningService:
         """
         kv = row.key_version
 
-        # Try per-tenant key first
         raw_key = await self._key_manager.get_tenant_key(str(row.tenant_id), kv)
         if raw_key is not None:
             return kv, raw_key
 
-        # Fall back to global key
         raw_key = await self._key_manager.get_encryption_key(kv)
         return kv, raw_key
 
