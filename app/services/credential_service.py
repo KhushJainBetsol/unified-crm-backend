@@ -225,6 +225,19 @@ class CredentialProvisioningService:
                 "has_webhook_secrets": webhook_secrets_enc is not None,
             },
         )
+
+        import asyncio
+        from app.services import scheduler as _scheduler
+
+        asyncio.ensure_future(
+            _scheduler.run_tenant_full_sync(tenant_id=tenant_id)
+        )
+        logger.info(
+            "Triggered background sync for newly provisioned tenant_id='%s' crm_type='%s'.",
+            tenant_id,
+            crm_type,
+        )
+
         return self._to_status(row)
 
     # ── UPDATE (partial) ───────────────────────────────────────────────────
