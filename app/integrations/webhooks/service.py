@@ -25,26 +25,23 @@ Bugs fixed
      self._adapter_registry), and exposes the config via:
          self._registry.get_adapter_config(crm_type)
      The old helper called factory._adapter_registry which raised
-     AttributeError on every Case.create / Zammad create, causing every
-     ticket creation webhook to be silently discarded.
+     AttributeError on every Case.create / Zammad create.
 
    Fix: _get_adapter_config(source_system) now calls
        factory._registry.get_adapter_config(source_system)
-   exactly as CrmAdapterFactory.create() does internally.
 
 5. EspoCRM Case.delete event_type defaulted to "unknown" when the
-   X-Webhook-Event header was absent. EspoCRM sends ONLY {"id": "..."}
-   for delete events — no "deleted" flag, no timestamps — so the previous
-   _infer_event_type() never matched and soft_delete() was never called.
+   X-Webhook-Event header was absent. Fix (two-layer defence):
+   Layer 1 — espo.py _infer_event_type() uses record_keys == {"id"} (exact
+             match) to detect delete, and id + any other fields → Case.update
+             (handles partial updates with no timestamps).
+   Layer 2 — _espo_attempt_delete_fallback() uses the same exact-{"id"} check
+             as a last resort for any "unknown" events that still slip through.
 
-   Fix (two-layer defence):
-   Layer 1 — espo.py _infer_event_type() now detects the minimal payload
-             {"id": "..."} as Case.delete (no create/update fields present).
-   Layer 2 — _espo_attempt_delete_fallback() runs when event_type is still
-             "unknown" after parsing: it re-checks each record for the same
-             minimal pattern and calls _espo_delete_ticket() directly.
-             This catches deliveries where the header is absent AND inference
-             failed for any unforeseen reason.
+6. Partial Case.update payloads dropped — EspoCRM sends only changed fields
+   (e.g. {"id": "...", "status": "Pending", "priority": "High"}). These had
+   no createdAt/modifiedAt so the old inference returned None → "unknown".
+   Fix is in espo.py _infer_event_type() (see point 5 / Layer 1 above).
 """
 
 from __future__ import annotations
@@ -70,22 +67,6 @@ from app.services.sync_service import SyncService
 from app.utils.retry import retry_on_conflict
 
 logger = logging.getLogger(__name__)
-
-# Fields that are present on EspoCRM create/update payloads but absent from
-# delete payloads. Mirrors the constant in espo.py — duplicated here so
-# service.py has no import dependency on the handler layer.
-_ESPO_CREATE_UPDATE_INDICATOR_FIELDS = frozenset(
-    {
-        "createdAt",
-        "modifiedAt",
-        "name",
-        "status",
-        "parentType",
-        "description",
-        "assignedUserId",
-        "accountId",
-    }
-)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -155,7 +136,7 @@ async def _handle_espo(
 
     Supported event types:
       Case.create    → upsert ticket
-      Case.update    → partial update ticket
+      Case.update    → partial update ticket (handles no-timestamp payloads)
       Case.delete    → soft delete ticket
       Note.create    → fetch + persist comments
       Comment.create → alias for Note.create (forward-compat)
@@ -164,20 +145,15 @@ async def _handle_espo(
     Unknown-event fallback
     ----------------------
     When event_type is "unknown" (header absent + inference failed),
-    _espo_attempt_delete_fallback() is called. It checks each record for
-    the EspoCRM delete payload signature — {"id": "..."} with no create/update
-    fields — and soft-deletes any matches. This is a safety net for the
-    case where both the X-Webhook-Event header and payload inference fail.
+    _espo_attempt_delete_fallback() is called as a last resort. It checks
+    each record for the exact delete signature (record_keys == {"id"}) and
+    soft-deletes any matches.
     """
     sync = SyncService(session)
     source_system_id = payload.source_system_id
     tenant_id = payload.tenant_id
 
     # ── Unknown-event fallback (runs before the per-record loop) ──────────
-    # When event_type could not be resolved, attempt a delete based on payload
-    # shape before giving up. This handles the case where the X-Webhook-Event
-    # header is absent AND _infer_event_type() returned None (e.g. an entirely
-    # empty record, or a shape we haven't seen before).
     if payload.event_type == "unknown":
         await _espo_attempt_delete_fallback(payload, session)
         return
@@ -246,36 +222,18 @@ async def _espo_attempt_delete_fallback(
     """
     Fallback delete handler for EspoCRM payloads where event_type is "unknown".
 
-    When EspoCRM sends a Case.delete webhook WITHOUT the X-Webhook-Event
-    header and _infer_event_type() also fails (e.g. the parser ran before
-    this fix was deployed, or a future EspoCRM version changes the shape),
-    this function provides a last line of defence.
+    This is a last-resort safety net. In normal operation, _infer_event_type()
+    in espo.py should resolve deletes before we reach this point. This function
+    handles any edge case where both the header and inference fail.
 
     Detection logic
     ---------------
-    A record is treated as a delete candidate when:
-      - It has an "id" field (required to look up the ticket in our DB), AND
-      - It has NONE of the fields that always appear on create/update payloads
-        (createdAt, modifiedAt, name, status, parentType, description,
-         assignedUserId, accountId).
+    A record is a delete candidate when record_keys == {"id"} exactly.
+    This mirrors the primary detection in _infer_event_type().
 
-    This matches the confirmed EspoCRM delete payload shape:
-        {"id": "69f504798ae7eff4b"}
-
-    Non-delete records (create/update payloads arriving as "unknown") will
-    have at least one of the indicator fields and will NOT be soft-deleted,
-    so this fallback is safe to run even on ambiguous deliveries.
-
-    Outcomes
-    --------
-    - Delete candidate found + ticket exists in DB  → soft_delete() called,
-      INFO log with crm_ticket_id.
-    - Delete candidate found + ticket not in DB     → warning logged (already
-      handled by _espo_delete_ticket).
-    - No delete candidates found in payload         → WARNING logged with
-      record keys so engineers can diagnose the unexpected shape.
-    - Per-record delete error                       → ERROR logged, other
-      records in the same delivery continue processing.
+    Any record with additional fields (status, priority, name, etc.) is NOT
+    a delete — it's a create or update that arrived without a header and
+    couldn't be inferred. These are logged as warnings.
     """
     source_system_id = payload.source_system_id
     tenant_id = payload.tenant_id
@@ -285,18 +243,16 @@ async def _espo_attempt_delete_fallback(
     for raw in payload.records:
         record_keys = set(raw.keys())
 
-        # Detect minimal delete payload: has "id", lacks all create/update fields.
-        is_delete_candidate = (
-            "id" in record_keys
-            and not record_keys.intersection(_ESPO_CREATE_UPDATE_INDICATOR_FIELDS)
-        )
+        # Exact delete detection: ONLY the id field, nothing else.
+        is_delete_candidate = record_keys == {"id"}
 
         if not is_delete_candidate:
             logger.warning(
                 "espocrm: fallback | record not a delete candidate | "
                 "record_keys=%s | webhook_uuid=%s | "
-                "this delivery may be a create/update with a missing header — "
-                "add X-Webhook-Event in EspoCRM webhook config to fix permanently",
+                "this is likely a create/update with a missing X-Webhook-Event "
+                "header that could not be inferred — payload will be dropped. "
+                "Upgrade EspoCRM or add a proxy to inject the header.",
                 sorted(record_keys),
                 payload.webhook_uuid,
             )
@@ -309,9 +265,8 @@ async def _espo_attempt_delete_fallback(
 
         logger.info(
             "espocrm: fallback delete triggered | crm_ticket_id=%s | "
-            "record_keys=%s | webhook_uuid=%s | integration_id=%s",
+            "webhook_uuid=%s | integration_id=%s",
             crm_ticket_id,
-            sorted(record_keys),
             payload.webhook_uuid,
             payload.integration_id,
         )
@@ -330,13 +285,12 @@ async def _espo_attempt_delete_fallback(
                 exc,
             )
 
-    # Summary log — always emit so monitoring alerts can key on this line.
     if candidate_count == 0:
         logger.warning(
             "espocrm: fallback found no delete candidates | "
             "webhook_uuid=%s | integration_id=%s | "
             "total_records=%d | all record_keys=%s | "
-            "delivery dropped — add X-Webhook-Event header to prevent this",
+            "delivery dropped",
             payload.webhook_uuid,
             payload.integration_id,
             len(payload.records),
@@ -363,20 +317,8 @@ async def _espo_create_ticket(
     EspoCRM Case.create — normalize raw webhook payload and persist via SyncService.
 
     Safety check: if ticket exists but is soft-deleted, skip to prevent resurrection.
-
-    Normalization uses the AdapterConfig fetched from factory._registry
-    (the same config object injected into BaseCrmAdapter and SchemaMapper),
-    so status_map / priority_map / field mappings are always consistent
-    with the adapter layer.
-
-    Flow
-    ----
-    1. _get_adapter_config("espocrm") → AdapterConfig  (from factory._registry)
-    2. normalize_ticket(raw, "espocrm", config) → NormalizedTicket
-    3. Resolve status / priority / agent / customer / company IDs via SyncService
-    4. repo.upsert() — INSERT or UPDATE depending on crm_ticket_id presence
+    If ticket already exists and is NOT deleted, treat as upsert (idempotent).
     """
-    # ── Safety: check if ticket already exists (even if soft-deleted) ────────
     crm_ticket_id_check = str(raw.get("id", "")).strip() or None
     if crm_ticket_id_check:
         repo_check = TicketRepository(sync.db)
@@ -394,7 +336,6 @@ async def _espo_create_ticket(
             )
             return
 
-    # ── Step 1 & 2: normalize ─────────────────────────────────────────────
     try:
         config = _get_adapter_config("espocrm")
         normalized = normalize_ticket(raw, "espocrm", config)
@@ -405,7 +346,6 @@ async def _espo_create_ticket(
             f"Failed to normalize EspoCRM ticket id={raw.get('id')!r}: {exc}"
         ) from exc
 
-    # ── Step 3: resolve FK IDs ────────────────────────────────────────────
     try:
         status_id = await sync._get_status_id(normalized.status)
         if not status_id:
@@ -432,7 +372,6 @@ async def _espo_create_ticket(
             f"{normalized.crm_ticket_id!r}: {exc}"
         ) from exc
 
-    # ── Step 4: upsert ────────────────────────────────────────────────────
     try:
         repo = TicketRepository(sync.db)
         _, created = await retry_on_conflict(
@@ -477,14 +416,18 @@ async def _espo_update_ticket(
 ) -> None:
     """
     EspoCRM Case.update — apply partial updates or create if ticket doesn't exist.
-    
+
+    Handles both full update payloads (with timestamps) and partial update
+    payloads (only changed fields, no createdAt/modifiedAt). The stale-check
+    is skipped when modifiedAt is absent — partial updates are always applied.
+
     Safety: if ticket is soft-deleted, skip update to prevent resurrection.
     """
     repo = TicketRepository(sync.db)
     existing = await repo.get_by_crm_id(
         crm_ticket_id, source_system_id, tenant_id=tenant_id, include_deleted=True
     )
-    
+
     if not existing:
         logger.info(
             "espocrm: Case.update | crm_ticket_id=%s not in DB — creating from webhook payload",
@@ -492,8 +435,7 @@ async def _espo_update_ticket(
         )
         await _espo_create_ticket(raw, source_system_id, tenant_id, sync)
         return
-    
-    # ── Safety: skip if ticket is soft-deleted ────────────────────────────
+
     if existing.is_deleted:
         logger.warning(
             "espocrm: Case.update | crm_ticket_id=%s is soft-deleted — "
@@ -502,6 +444,8 @@ async def _espo_update_ticket(
         )
         return
 
+    # Stale check: only apply when modifiedAt is present in the payload.
+    # Partial updates (no timestamps) are always applied.
     incoming_ts = _parse_iso_timestamp(raw.get("modifiedAt"))
     if incoming_ts and existing.updated_at and incoming_ts <= existing.updated_at:
         logger.info(
@@ -570,7 +514,7 @@ async def _espo_delete_ticket(
     EspoCRM Case.delete — soft delete.
 
     Called from two paths:
-      1. Direct: payload.event_type == "Case.delete" (header present or inferred)
+      1. Direct: payload.event_type == "Case.delete" (inferred or explicit)
       2. Fallback: _espo_attempt_delete_fallback() when event_type == "unknown"
     Both paths are idempotent — calling this on an already-deleted ticket is safe.
     """
@@ -688,7 +632,6 @@ async def _handle_zammad(
     tenant_id = payload.tenant_id
 
     for raw in payload.records:
-        # Zammad wraps ticket data under a "ticket" key; fall back to root.
         ticket_raw = raw.get("ticket", raw)
         crm_ticket_id = _extract_record_id(ticket_raw, source="zammad")
         if crm_ticket_id is None:
@@ -737,23 +680,7 @@ async def _zammad_create_ticket(
     tenant_id: uuid.UUID,
     sync: SyncService,
 ) -> None:
-    """
-    Zammad create — normalize raw webhook payload and persist via SyncService.
-
-    Safety check: if ticket exists but is soft-deleted, skip to prevent resurrection.
-
-    Zammad sends state as a nested object {"name": "open"} (expand=true)
-    or as a plain string/integer otherwise. normalize_ticket() resolves
-    both forms via AdapterConfig.status_map from crm_adapters.yaml —
-    the same config the ZammadAdapter uses at full-sync time.
-
-    Flow mirrors _espo_create_ticket exactly:
-    1. _get_adapter_config("zammad") → AdapterConfig  (from factory._registry)
-    2. normalize_ticket(raw, "zammad", config) → NormalizedTicket
-    3. Resolve FK IDs via SyncService
-    4. repo.upsert()
-    """
-    # ── Safety: check if ticket already exists (even if soft-deleted) ────────
+    """Zammad create — normalize raw webhook payload and persist via SyncService."""
     crm_ticket_id_check = str(raw.get("id", "")).strip() or None
     if crm_ticket_id_check:
         repo_check = TicketRepository(sync.db)
@@ -771,7 +698,6 @@ async def _zammad_create_ticket(
             )
             return
 
-    # ── Step 1 & 2: normalize ─────────────────────────────────────────────
     try:
         config = _get_adapter_config("zammad")
         normalized = normalize_ticket(raw, "zammad", config)
@@ -782,7 +708,6 @@ async def _zammad_create_ticket(
             f"Failed to normalize Zammad ticket id={raw.get('id')!r}: {exc}"
         ) from exc
 
-    # ── Step 3: resolve FK IDs ────────────────────────────────────────────
     try:
         status_id = await sync._get_status_id(normalized.status)
         if not status_id:
@@ -809,7 +734,6 @@ async def _zammad_create_ticket(
             f"{normalized.crm_ticket_id!r}: {exc}"
         ) from exc
 
-    # ── Step 4: upsert ────────────────────────────────────────────────────
     try:
         repo = TicketRepository(sync.db)
         _, created = await retry_on_conflict(
@@ -852,16 +776,12 @@ async def _zammad_update_ticket(
     tenant_id: uuid.UUID,
     sync: SyncService,
 ) -> None:
-    """
-    Zammad update — apply partial updates or create if ticket doesn't exist.
-    
-    Safety: if ticket is soft-deleted, skip update to prevent resurrection.
-    """
+    """Zammad update — apply partial updates or create if ticket doesn't exist."""
     repo = TicketRepository(sync.db)
     existing = await repo.get_by_crm_id(
         crm_ticket_id, source_system_id, tenant_id=tenant_id, include_deleted=True
     )
-    
+
     if not existing:
         logger.info(
             "zammad: update | crm_ticket_id=%s not in DB — creating from webhook payload",
@@ -869,8 +789,7 @@ async def _zammad_update_ticket(
         )
         await _zammad_create_ticket(raw, source_system_id, tenant_id, sync)
         return
-    
-    # ── Safety: skip if ticket is soft-deleted ────────────────────────────
+
     if existing.is_deleted:
         logger.warning(
             "zammad: update | crm_ticket_id=%s is soft-deleted — "
@@ -896,7 +815,6 @@ async def _zammad_update_ticket(
         if ts:
             updates["updated_at"] = ts
 
-    # Zammad sends state as nested {"name": "open"} (expand=true) or plain string.
     state_raw = raw.get("state")
     if state_raw is not None:
         state_str = (
@@ -915,7 +833,6 @@ async def _zammad_update_ticket(
                 elif existing.status_id != status_id:
                     updates["closed_at"] = None
 
-    # Zammad sends priority as nested {"name": "2 normal"} (expand=true) or plain string.
     priority_raw = raw.get("priority")
     if priority_raw is not None:
         priority_str = (
@@ -1023,28 +940,8 @@ def _get_adapter_config(source_system: str) -> Any:
     """
     Fetch the AdapterConfig for the given CRM from the global factory registry.
 
-    Why this is correct (cross-referenced with adapter_factory.py)
-    --------------------------------------------------------------
-    CrmAdapterFactory.__init__ stores the registry as ``self._registry``
-    (an AdapterRegistry instance).  Internally, CrmAdapterFactory.create()
-    fetches the config with:
-
-        config = self._registry.get_adapter_config(crm_type)   # line in factory
-
-    So the correct external call is:
-
-        factory._registry.get_adapter_config(source_system)
-
-    The previous helper (_get_adapter_registry) tried ``factory._adapter_registry``
-    — an attribute that does not exist → AttributeError on every create event.
-
-    The returned AdapterConfig is the same object injected into:
-      - BaseCrmAdapter.__init__(config=...)
-      - SchemaMapper(config=...)
-      - normalize_ticket(raw, source_system, config)
-
-    So status_map, priority_map and field mappings are always consistent
-    between full-sync and webhook paths.
+    CrmAdapterFactory.__init__ stores the registry as ``self._registry``.
+    The correct external call is: factory._registry.get_adapter_config(source_system)
 
     Raises
     ------
@@ -1062,9 +959,6 @@ def _get_adapter_config(source_system: str) -> Any:
         ) from exc
 
     try:
-        # factory._registry is AdapterRegistry — confirmed in adapter_factory.py:
-        #   self._registry = registry   (line in __init__)
-        #   config = self._registry.get_adapter_config(crm_type)  (line in create())
         return factory._registry.get_adapter_config(source_system)
     except Exception as exc:
         raise WebhookAdapterError(
@@ -1082,9 +976,7 @@ async def _create_adapter(source_system: str, integration_id: str) -> Any:
     source_system:
         CRM name used only for log context (e.g. "espocrm").
     integration_id:
-        The CrmIntegration UUID string — passed directly to factory.create()
-        which fetches credentials from the DB / Infisical internally.
-        Must be the UUID string, NOT a credentials dict.
+        The CrmIntegration UUID string — passed directly to factory.create().
     """
     try:
         from app.adapter_dependencies.deps import get_adapter_factory_instance

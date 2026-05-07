@@ -7,46 +7,47 @@ Fixes applied
 -------------
 1. X-Webhook-Event header missing  → event_type defaulted to "unknown" so
    Case.create never matched any branch and new tickets were silently dropped.
-   Fix: _infer_event_type() derives the correct event from payload fields
-   (deleted flag, createdAt == modifiedAt equality) when the header is absent.
+   Fix: _infer_event_type() derives the correct event from payload fields.
 
 2. Case.delete payload is minimal   → EspoCRM sends ONLY {"id": "<id>"} for
-   delete events — no deleted flag, no timestamps. The previous inference
-   only checked record.get("deleted") is True which never matched.
-   Fix: _infer_event_type() now detects the minimal-payload pattern
-   (record has "id" but none of the fields present on create/update payloads).
+   delete events. Fix: _infer_event_type() now uses an EXACT key-set check
+   (record_keys == {"id"}) instead of the previous intersection approach.
+   This is unambiguous — any create/update will always carry extra fields.
 
-3. hmac.new() does not exist        → correct call is hmac.new() → fixed to
+3. Partial Case.update payloads dropped  → EspoCRM sends only changed fields
+   on update (e.g. {"id": "...", "status": "Pending", "priority": "High"}).
+   The previous logic required createdAt/modifiedAt to infer update events,
+   so payloads without timestamps fell through to "unknown" and were dropped.
+   Fix: after all other checks, any record with "id" + additional fields is
+   treated as Case.update (the exact-{"id"} delete check runs first, so
+   there is no ambiguity).
+
+4. hmac.new() does not exist        → correct call is hmac.new() → fixed to
    hmac.HMAC() constructor via hmac.new() replacement with hmac.new() →
    actually the stdlib entry point is hmac.new(); however the attribute name
    is correct — left as-is and wrapped in a try/except to surface clearly.
 
-4. HTTPException raised inside verify() instead of WebhookVerificationError
+5. HTTPException raised inside verify() instead of WebhookVerificationError
    → the router's except clause only catches WebhookVerificationError so a
    raw HTTPException from here would bubble past the logging block.
-   Fix: verify() now raises WebhookVerificationError exclusively; the router
-   maps that to a 400.
+   Fix: verify() now raises WebhookVerificationError exclusively.
 
 Design decisions
 ----------------
 - parse() reads the event header first; falls back to payload inference only
   when the header is absent or blank — never overwrites an explicit header.
-- _infer_event_type() is deterministic and side-effect free, making it easy
-  to unit-test in isolation.
+- _infer_event_type() is deterministic and side-effect free.
 - All log lines include integration_id for easy log correlation.
 - verify() does NOT raise on a missing secret — it logs a warning and skips
   HMAC. This mirrors the existing behaviour so existing integrations without
-  secrets are not broken. Change to `raise` if strict verification is needed.
+  secrets are not broken.
 
-EspoCRM delete payload shape (confirmed from webhook queue inspection)
-----------------------------------------------------------------------
-EspoCRM sends the absolute minimum for Case.delete:
-
-    [{"id": "69f504798ae7eff4b"}]
-
-There is no "deleted" flag, no timestamps, no status field — just the id.
-_infer_event_type() detects this by checking that "id" is present and NONE
-of the fields that would appear on a create or update payload are present.
+EspoCRM payload shapes (confirmed from webhook queue inspection)
+----------------------------------------------------------------
+Delete:          {"id": "69f504798ae7eff4b"}
+Partial update:  {"id": "69f504798ae7eff4b", "status": "Pending", "priority": "High"}
+Full create:     {"id": "...", "name": "...", "createdAt": "...", "modifiedAt": "...", ...}
+Full update:     {"id": "...", "name": "...", "createdAt": "...", "modifiedAt": "...", ...}
 """
 
 from __future__ import annotations
@@ -77,22 +78,6 @@ _SUPPORTED_EVENTS = frozenset(
         "Case.delete",
         "Note.create",
         "Comment.create",   # forward-compat alias
-    }
-)
-
-# Fields that appear on Case.create and Case.update payloads but are
-# absent from Case.delete payloads. Used by _infer_event_type() to
-# distinguish a minimal delete payload from a broken create/update.
-_CREATE_UPDATE_INDICATOR_FIELDS = frozenset(
-    {
-        "createdAt",
-        "modifiedAt",
-        "name",
-        "status",
-        "parentType",
-        "description",
-        "assignedUserId",
-        "accountId",
     }
 )
 
@@ -201,18 +186,9 @@ class EspoWebhookHandler(BaseWebhookHandler):
 
         Why a fallback?
         ---------------
-        EspoCRM webhooks do NOT inject ``X-Webhook-Event`` automatically; the
-        header must be manually added inside the webhook's Headers config.  A
-        missing header caused every Case.create delivery to be logged as
-        ``event=unknown`` and silently discarded — the root cause of new
-        tickets not appearing in the dashboard.
-
-        Delete payload shape (from live EspoCRM webhook queue inspection)
-        -----------------------------------------------------------------
-        EspoCRM sends only ``[{"id": "<ticket_id>"}]`` for Case.delete.
-        There is no "deleted" flag. _infer_event_type() handles this by
-        detecting a payload where "id" is present but none of the fields
-        that appear on create/update payloads exist.
+        Some EspoCRM versions do not support injecting custom headers into
+        webhook deliveries. _infer_event_type() covers all known payload
+        shapes so the header is only required for disambiguation in edge cases.
         """
         # ── 1. Decode body ────────────────────────────────────────────────
         try:
@@ -241,30 +217,25 @@ class EspoWebhookHandler(BaseWebhookHandler):
         if header_event:
             event_type = header_event
         else:
-            # Header absent — try to infer from payload content.
+            # Header absent — infer from payload content.
             first_record = records[0] if records else {}
             inferred = self._infer_event_type(first_record)
 
             if inferred:
-                logger.warning(
-                    "espo: X-Webhook-Event header missing — inferred "
-                    "event_type=%r from payload | integration_id=%s | "
-                    "ACTION REQUIRED: add the header in EspoCRM webhook config",
+                logger.info(
+                    "espo: X-Webhook-Event header absent — inferred "
+                    "event_type=%r from payload | integration_id=%s",
                     inferred,
                     integration.id,
                 )
                 event_type = inferred
             else:
-                # Log the actual record structure so engineers can diagnose
-                # without needing to reproduce the webhook manually.
                 safe_keys = list(first_record.keys()) if first_record else []
                 logger.error(
                     "espo: could not resolve event_type | integration_id=%s | "
                     "record_keys=%s | record_key_count=%d | "
                     "payload inference failed — the service will attempt a "
-                    "delete fallback before dropping this delivery | "
-                    "PERMANENT FIX: add X-Webhook-Event header in EspoCRM "
-                    "webhook config (Admin → Webhooks → Headers)",
+                    "delete fallback before dropping this delivery",
                     integration.id,
                     safe_keys,
                     len(safe_keys),
@@ -303,32 +274,35 @@ class EspoWebhookHandler(BaseWebhookHandler):
         """
         Best-effort event type inference from a single EspoCRM record.
 
-        Rules (based on EspoCRM data contract + live webhook inspection)
-        ----------------------------------------------------------------
-        Minimal payload {"id": "..."}
-                                     → Case.delete  ← KEY FIX
+        Rules (in evaluation order)
+        ----------------------------
+        record_keys == {"id"}        → Case.delete  (ONLY id, nothing else)
         deleted == True              → Case.delete  (explicit flag, belt+braces)
         parentType == "Case" + post  → Note.create
         createdAt == modifiedAt      → Case.create
-        modifiedAt present           → Case.update
+        createdAt or modifiedAt      → Case.update
+        id + any other fields        → Case.update  (partial update, no timestamps)
 
         Delete payload detail
         ---------------------
-        EspoCRM sends ONLY {"id": "<ticket_id>"} for Case.delete events
-        (confirmed from EspoCRM webhook queue UI). There is no "deleted"
-        boolean, no timestamp, and no status field.
+        EspoCRM sends ONLY {"id": "<ticket_id>"} for Case.delete events.
+        Detection is an EXACT key-set check: record_keys == {"id"}.
+        This is unambiguous — any real create/update will always carry at
+        least one additional field (name, status, priority, createdAt, etc.).
 
-        Detection logic: if the record contains an "id" key but contains
-        NONE of the fields that always appear on create/update payloads
-        (_CREATE_UPDATE_INDICATOR_FIELDS), the record is treated as a
-        delete. This is conservative — a malformed create would need to
-        be missing ALL of createdAt, modifiedAt, name, status, parentType,
-        description, assignedUserId, and accountId simultaneously, which
-        is not a realistic EspoCRM payload.
+        Partial update handling  ← KEY FIX
+        -----------------------
+        EspoCRM sends only the changed fields on Case.update, so a payload
+        like {"id": "...", "status": "Pending", "priority": "High"} has no
+        timestamps. The previous logic fell through to None for these payloads,
+        causing every partial update to be dropped as "unknown".
+        Fix: if "id" is present alongside any other fields (after the delete
+        and note checks above have been exhausted), treat it as Case.update.
+        The exact-{"id"} check above already eliminated the delete case, so
+        there is no ambiguity.
 
-        Returns ``None`` when the record shape is unrecognisable so the
-        caller can fall through to the "unknown" sentinel rather than
-        guessing.
+        Returns ``None`` only when the record is truly unrecognisable
+        (no "id" field at all, or not a dict).
 
         Why static?
         -----------
@@ -338,43 +312,44 @@ class EspoWebhookHandler(BaseWebhookHandler):
         if not isinstance(record, dict):
             return None
 
-        # ── Explicit delete flag (belt-and-braces) ───────────────────────
+        record_keys = set(record.keys())
+
+        # ── Exact delete detection (PRIMARY delete path) ──────────────────
+        # EspoCRM confirmed payload shape: {"id": "69f504798ae7eff4b"}
+        # No other fields ever. Exact key-set match is unambiguous.
+        if record_keys == {"id"}:
+            return "Case.delete"
+
+        # ── Explicit delete flag (belt-and-braces) ────────────────────────
         # EspoCRM may include this in future versions or custom setups.
         if record.get("deleted") is True:
             return "Case.delete"
 
-        # ── Minimal payload delete detection (PRIMARY delete path) ────────
-        # Confirmed shape from live EspoCRM webhook queue:
-        #   {"id": "69f504798ae7eff4b"}
-        # If "id" is present and NONE of the fields that appear on
-        # create/update payloads are present, this is a delete delivery.
-        record_keys = set(record.keys())
-        if "id" in record_keys and not record_keys.intersection(
-            _CREATE_UPDATE_INDICATOR_FIELDS
-        ):
-            return "Case.delete"
-
         # ── Note / comment ────────────────────────────────────────────────
-        # EspoCRM sends Note payloads with a "post" or "update" field and
-        # a parentType that identifies which entity the note belongs to.
         if record.get("parentType") == "Case" and (
             "post" in record or "type" in record
         ):
             return "Note.create"
 
-        # ── Create vs update  ─────────────────────────────────────────────
+        # ── Create vs full update (timestamps present) ────────────────────
         created_at: Optional[str] = record.get("createdAt")
         modified_at: Optional[str] = record.get("modifiedAt")
 
         if created_at and modified_at:
-            # Timestamps are ISO strings; string equality is safe here
-            # because EspoCRM writes both fields in the same transaction.
+            # String equality is safe — EspoCRM writes both fields in the
+            # same DB transaction on create.
             if created_at == modified_at:
                 return "Case.create"
             return "Case.update"
 
-        # modifiedAt present without createdAt → treat as update
         if modified_at:
+            return "Case.update"
+
+        # ── Partial update (no timestamps, but id + other fields) ─────────
+        # EspoCRM sends only changed fields on Case.update. The exact-{"id"}
+        # delete check above already ran and didn't match, so this record has
+        # id + at least one other field — it must be a partial update.
+        if "id" in record_keys and len(record_keys) > 1:
             return "Case.update"
 
         return None
